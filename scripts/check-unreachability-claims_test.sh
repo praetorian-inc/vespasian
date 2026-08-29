@@ -399,6 +399,23 @@ printf 'package a\n\n// New is new. This can never happen.\nfunc New() {}\n' >"$
 git -C "$repo" add -A && git -C "$repo" commit -qm new-file
 assert_changed "a new file's claims are all in scope" 1 "pkg/b.go" "$repo"
 
+# 16. A selection of zero Go files announces itself instead of passing silently.
+# This is the ordinary case for a docs/CI/devcontainer PR: --changed selects only
+# *.go, so the run examines nothing and exits 0 — indistinguishable from a clean
+# run unless it says so. The notice is not a failure; a Go-free PR legitimately
+# has nothing for this check to do.
+repo="$(new_ratchet_repo)" || exit 2
+printf 'hello\n' >"$repo/README.md"
+git -C "$repo" add -A && git -C "$repo" commit -qm docs-only
+assert_changed "a Go-free change announces that nothing was checked" 0 "no Go files in scope; nothing checked" "$repo"
+
+# 17. ...and the notice must NOT fire when Go files ARE in scope, or it would be
+# noise on every real run rather than a signal.
+repo="$(new_ratchet_repo)" || exit 2
+printf 'package a\n\nfunc Added() {}\n' >"$repo/pkg/b.go"
+git -C "$repo" add -A && git -C "$repo" commit -qm go-change
+assert_changed "the vacuity notice stays quiet when Go files are in scope" 0 "!nothing checked" "$repo"
+
 # ---------------------------------------------------------------------------
 echo
 if [ "$failures" -ne 0 ]; then

@@ -105,6 +105,10 @@ fi
 
 status=0
 
+# Counts what the loop below actually examined, so a selection of zero can be
+# reported rather than mistaken for a clean run. See the note at the loop's end.
+files_checked=0
+
 # SCOPE_BY_LINE is 1 only when a real base ref gives us a diff to read; otherwise
 # (--all, or a missing base) every comment block in the listed files is in scope.
 #
@@ -273,7 +277,19 @@ while IFS= read -r file; do
     }
     END { flush(); exit (found > 0 ? 1 : 0) }
     ' "$file" || status=1
+  files_checked=$((files_checked + 1))
 done < <(list_files)
+
+# A selection of zero is not a pass, it is a run that checked nothing, and it
+# reported success identically. In --changed mode the selection is the changed
+# *.go files, so any PR that touches no Go at all — a docs, CI or devcontainer
+# PR — got a green `make lint-comments` that had examined not one comment. Same
+# courtesy the empty-test-corpus guard above extends: say so rather than let the
+# exit code imply coverage. Not a failure: a Go-free PR legitimately has nothing
+# for this check to do.
+if [ "$files_checked" -eq 0 ]; then
+  echo "check-unreachability-claims: no Go files in scope; nothing checked (this run asserts nothing)" >&2
+fi
 
 if [ "$status" -ne 0 ]; then
   cat <<'MSG'
