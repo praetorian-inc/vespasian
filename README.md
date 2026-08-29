@@ -11,6 +11,7 @@
 <p align="center">
   <a href="https://github.com/praetorian-inc/vespasian/actions/workflows/ci.yml"><img src="https://github.com/praetorian-inc/vespasian/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://goreportcard.com/report/github.com/praetorian-inc/vespasian"><img src="https://goreportcard.com/badge/github.com/praetorian-inc/vespasian" alt="Go Report Card"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/praetorian-inc/vespasian"><img src="https://api.scorecard.dev/projects/github.com/praetorian-inc/vespasian/badge" alt="OpenSSF Scorecard"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
 </p>
 

@@ -1,0 +1,71 @@
+// Development container for vespasian.
+//
+// Deliberately minimal: it provisions what the test suite needs to run and
+// nothing else. No extension list, no forwarded ports, no mounts — those would
+// be unreviewed opinions imposed on every contributor, and nothing in the
+// suite needs them.
+{
+  "name": "vespasian",
+
+  // context is ".." rather than the default (this directory) because the
+  // Dockerfile copies test/install-chrome.sh and test/common.sh out of the
+  // repo. With the default context those paths are not visible to COPY and the
+  // build fails.
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+
+  "containerEnv": {
+    // Retires the manual `export` that test/README.md used to tell readers to
+    // run, and matches what the integration-tests and test jobs already set.
+    //
+    // State the trade-off rather than only the mechanism: this disables Chrome's
+    // OS-level sandbox (seccomp-bpf + namespaces) for every crawl run in this
+    // container, and the crawler's job is to visit third-party targets. A
+    // renderer exploit therefore lands in the container with no Chrome sandbox
+    // to break out of first — Docker's own namespace boundary and `remoteUser`
+    // below are what remain.
+    //
+    // It is set anyway, and setting it is not what creates that exposure.
+    // go-rod's launcher already passes --no-sandbox whenever it detects a
+    // container (LAB-4994), which is why the pkg/crawl integration tests pass
+    // with this unset, so the sandbox was already off in any containerised run.
+    // What this changes is that the decision becomes vespasian's own, visible
+    // and greppable through pkg/crawl/browser.go's vespasianEnablesNoSandbox,
+    // instead of an implicit side effect of a library heuristic. Anyone wanting
+    // the sandbox back has to change Chrome's launch flags, not this line.
+    "VESPASIAN_NO_SANDBOX": "true"
+  },
+
+  // Chrome's renderers use /dev/shm for shared memory and Docker's default is
+  // 64MB. Precautionary rather than proven by a test in this repo — nothing
+  // here documents or implements a sizing requirement — but exhausting a 64MB
+  // /dev/shm is the standard Chrome-in-container failure mode, and the crawler
+  // is the whole reason this image exists.
+  "runArgs": ["--shm-size=1g"],
+
+  // The base image's own devcontainer.metadata label already declares this, so
+  // it is redundant today. Kept as a deliberate pin: if the FROM is ever
+  // repointed at an image without a `vscode` user, this fails loudly instead of
+  // silently dropping every developer into a root shell.
+  "remoteUser": "vscode",
+
+  // The live suite's spec validators are real Node parsers (@apidevtools/swagger-parser,
+  // graphql) and their node_modules is gitignored rather than committed, so a fresh
+  // clone has none and test/validate.sh's _ensure_spec_validators returns 1. Without
+  // this the container looks ready and then fails partway: `--group live` stops in
+  // test_rest_api and test_soap_service, and five of the `--group offline` generate-*
+  // targets stop too, all with "spec-validators deps missing or incomplete".
+  //
+  // This is onCreateCommand rather than an image layer because the workspace is
+  // bind-mounted OVER the image's copy of it: anything npm installs into the
+  // workspace path at build time is shadowed the moment the container starts.
+  // yq and python3 are system binaries and so DO belong in the Dockerfile; this
+  // one cannot.
+  //
+  // --ignore-scripts matches every other npm call site in this repo (both
+  // invocations in .github/workflows/live-tests.yml), keeping package lifecycle
+  // scripts from executing under the non-blocking audit-only egress policy.
+  "onCreateCommand": "bash .devcontainer/on-create.sh"
+}
