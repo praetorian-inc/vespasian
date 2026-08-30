@@ -2793,7 +2793,7 @@ if [[ ! -f "$WORKFLOW" ]]; then
     # balanced section for a balanced suite. Those two figures are a measurement, not a pin,
     # and will drift as the suite grows — re-measure rather than trusting them. Only
     # EXPECTED_ASSERTIONS at the bottom of this file is self-enforcing.
-    for hr_pad in "the set of jobs carrying harden-runner" "the full job set" "the AC3 enforcement step and the exemption rationale" "the workflow-shape pin (shell overrides, permissions, env)" "devcontainer-changes's audit policy" "devcontainer-image's audit policy" "devcontainer-image-arm64's audit policy"; do
+    for hr_pad in "the set of jobs carrying harden-runner" "the full job set" "the AC3 enforcement step and the exemption rationale" "the workflow-shape pin (shell overrides, permissions, env)" "devcontainer-changes's audit policy" "devcontainer-image's audit policy" "devcontainer-image-arm64's audit policy" "the AC5 stale-comment guard"; do
         fail "${hr_pad} could not be checked: $WORKFLOW is missing"
     done
 else
@@ -3100,6 +3100,20 @@ else
                 fail "the set of jobs carrying harden-runner has changed — pinned '${hr_pinned_sorted}', found '${hr_actual}'. A new job carrying the policy needs an entry in EXPECTED_HR_JOBS and hr_expected; a job that lost it needs the removal recorded here."
             fi ;;
     esac
+
+    # AC5 of LAB-6015 ("the now-stale 'block ... once telemetry confirms the set'
+    # comments are removed or updated") was satisfied by DELETING those comments, with
+    # nothing to keep it satisfied. Measured: merging main's LAB-5766 work reintroduced
+    # three of them verbatim — one per new devcontainer job — and every other pin in
+    # this file stayed green, because they are all structural and this is prose. An AC
+    # met by deletion needs a guard or it regresses on the next merge from anyone who
+    # copied the old block.
+    stale_hr=$(grep -c "once telemetry confirms the set" "$WORKFLOW" || true)
+    if [[ "$stale_hr" == "0" ]]; then
+        pass "no stale \"flip to 'block' once telemetry confirms the set\" comment survives in live-tests.yml (LAB-6015 AC5)"
+    else
+        fail "${stale_hr} stale \"once telemetry confirms the set\" comment(s) are back in live-tests.yml. LAB-6015 AC5 requires them removed or updated: they tell a reader the allowlist has never been derived, which is false for the five block-mode jobs and misleading for the three audit ones (those are on audit deliberately under AC6, with the reason recorded in place). This most often returns via a merge that adds a job by copying an older harden-runner block."
+    fi
 
             # The carrying-set check above sees WHICH jobs have the step, not what policy it sets, so
             # an audit->block flip on a devcontainer job is invisible to it (the job still carries
@@ -5308,7 +5322,7 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # ones the pre-LAB-6015 shape check also caught.
 # ── end merged-from-main history ─────────────────────────────────────────────
 
-EXPECTED_ASSERTIONS=252
+EXPECTED_ASSERTIONS=253
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."

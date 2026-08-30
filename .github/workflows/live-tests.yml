@@ -591,13 +591,28 @@ jobs:
       # notice. One producer, two consumers, nothing to keep in step.
       should-run: ${{ steps.gate.outputs.run }}
     steps:
-      # Defense-in-depth (LAB-4732): monitor and record all
-      # outbound network traffic. Audit mode is non-blocking — it logs egress
-      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
-      # 'block' with an allowed-endpoints list once telemetry confirms the set.
-      # DUPLICATED across preflight-selftest / validator-regression / docs-check /
-      # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
-      # integration-tests / test. harden-runner is a SHA-pinned security control:
+      # Defense-in-depth (LAB-4732): monitor and record all outbound network
+      # traffic. Audit mode is non-blocking — it logs egress to the StepSecurity
+      # dashboard without enforcing an allowlist.
+      #
+      # THIS JOB STAYS ON `audit` DELIBERATELY, recorded rather than silent —
+      # LAB-6015 AC6 exists for exactly this case. That ticket flipped the five
+      # older jobs to `block`, but its AC2 requires every allowed-endpoints list to
+      # be DERIVED FROM TELEMETRY of real runs, and the three devcontainer jobs
+      # landed on main (LAB-5766) after those six source runs were captured. A
+      # docker/devcontainer build's egress set is exactly the kind that has to be
+      # measured rather than guessed: flipping blind would either break the build or
+      # ship a folklore allowlist, which is the thing AC2 was written to prevent.
+      # Deriving these three is follow-up work, not LAB-6015's.
+      #
+      # test/test-runner-args.sh pins this job in EXPECTED_AUDIT_JOBS with a per-job
+      # policy assertion, so a silent flip to `block` — or a silent loss of the step
+      # — fails the build and names the job.
+      #
+      # DUPLICATED across all EIGHT harden-runner jobs: the five on `block`
+      # (preflight-selftest / validator-regression / docs-check / integration-tests /
+      # test) and the three on `audit` (devcontainer-changes / devcontainer-image /
+      # devcontainer-image-arm64). harden-runner is a SHA-pinned security control:
       # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job
       # on a stale pin.
       - name: Harden runner
@@ -733,13 +748,28 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Defense-in-depth (LAB-4732): monitor and record all
-      # outbound network traffic. Audit mode is non-blocking — it logs egress
-      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
-      # 'block' with an allowed-endpoints list once telemetry confirms the set.
-      # DUPLICATED across preflight-selftest / validator-regression / docs-check /
-      # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
-      # integration-tests / test. harden-runner is a SHA-pinned security control:
+      # Defense-in-depth (LAB-4732): monitor and record all outbound network
+      # traffic. Audit mode is non-blocking — it logs egress to the StepSecurity
+      # dashboard without enforcing an allowlist.
+      #
+      # THIS JOB STAYS ON `audit` DELIBERATELY, recorded rather than silent —
+      # LAB-6015 AC6 exists for exactly this case. That ticket flipped the five
+      # older jobs to `block`, but its AC2 requires every allowed-endpoints list to
+      # be DERIVED FROM TELEMETRY of real runs, and the three devcontainer jobs
+      # landed on main (LAB-5766) after those six source runs were captured. A
+      # docker/devcontainer build's egress set is exactly the kind that has to be
+      # measured rather than guessed: flipping blind would either break the build or
+      # ship a folklore allowlist, which is the thing AC2 was written to prevent.
+      # Deriving these three is follow-up work, not LAB-6015's.
+      #
+      # test/test-runner-args.sh pins this job in EXPECTED_AUDIT_JOBS with a per-job
+      # policy assertion, so a silent flip to `block` — or a silent loss of the step
+      # — fails the build and names the job.
+      #
+      # DUPLICATED across all EIGHT harden-runner jobs: the five on `block`
+      # (preflight-selftest / validator-regression / docs-check / integration-tests /
+      # test) and the three on `audit` (devcontainer-changes / devcontainer-image /
+      # devcontainer-image-arm64). harden-runner is a SHA-pinned security control:
       # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job
       # on a stale pin.
       #
@@ -959,13 +989,28 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Defense-in-depth (LAB-4732): monitor and record all
-      # outbound network traffic. Audit mode is non-blocking — it logs egress
-      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
-      # 'block' with an allowed-endpoints list once telemetry confirms the set.
-      # DUPLICATED across preflight-selftest / validator-regression / docs-check /
-      # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
-      # integration-tests / test. harden-runner is a SHA-pinned security control:
+      # Defense-in-depth (LAB-4732): monitor and record all outbound network
+      # traffic. Audit mode is non-blocking — it logs egress to the StepSecurity
+      # dashboard without enforcing an allowlist.
+      #
+      # THIS JOB STAYS ON `audit` DELIBERATELY, recorded rather than silent —
+      # LAB-6015 AC6 exists for exactly this case. That ticket flipped the five
+      # older jobs to `block`, but its AC2 requires every allowed-endpoints list to
+      # be DERIVED FROM TELEMETRY of real runs, and the three devcontainer jobs
+      # landed on main (LAB-5766) after those six source runs were captured. A
+      # docker/devcontainer build's egress set is exactly the kind that has to be
+      # measured rather than guessed: flipping blind would either break the build or
+      # ship a folklore allowlist, which is the thing AC2 was written to prevent.
+      # Deriving these three is follow-up work, not LAB-6015's.
+      #
+      # test/test-runner-args.sh pins this job in EXPECTED_AUDIT_JOBS with a per-job
+      # policy assertion, so a silent flip to `block` — or a silent loss of the step
+      # — fails the build and names the job.
+      #
+      # DUPLICATED across all EIGHT harden-runner jobs: the five on `block`
+      # (preflight-selftest / validator-regression / docs-check / integration-tests /
+      # test) and the three on `audit` (devcontainer-changes / devcontainer-image /
+      # devcontainer-image-arm64). harden-runner is a SHA-pinned security control:
       # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job
       # on a stale pin.
       #
