@@ -2775,10 +2775,13 @@ if [[ ! -f "$WORKFLOW" ]]; then
     for _ in "${EXPECTED_HR_JOBS[@]}"; do
         fail "harden-runner policy for a pinned job could not be checked: $WORKFLOW is missing"
     done
-    # Keep this arm's counted-outcome total equal to the `else` arm's. The else emits TEN:
+    # Keep this arm's counted-outcome total equal to the `else` arm's. The else emits FOURTEEN:
     # five per-job policy pins, the carrying-jobs set, the full job set, the AC3 step, the
     # exemption rationale, and the workflow-shape (shell / permissions / env) pin. This arm
-    # emits the "not found" line above plus five per-job pads, so it owes four more.
+    # emits the "not found" line above plus five per-job pads, so it owes eight more —
+    # which is why the hr_pad loop below has eight entries. Count the loop, not this
+    # sentence: it has been wrong three times now (rounds 2, 8, and again when the
+    # LAB-5766 merge added the three audit-job pins and the AC5 guard).
     #
     # Adding a check to the else without a pad here is what silently unbalanced it in review
     # round 2, and again in round 8 — the second time the count was right and only this
@@ -2786,7 +2789,7 @@ if [[ ! -f "$WORKFLOW" ]]; then
     # MEASURED annotations. Re-measure both arms when you touch either.
     #
     # This makes THIS SECTION constant, not the file. With the workflow absent the whole
-    # suite still comes up short of its pin — 144 outcomes against 195, MEASURED at this
+    # suite still comes up short of its pin — 173 outcomes against 253, MEASURED at this
     # head — because three other blocks (at the `if [[ -f "$WORKFLOW" ]]` guards further up
     # and down this file) have no else arm and emit nothing. That imbalance predates this
     # ticket and is not LAB-6015's to fix; stated here so the next reader does not take a
@@ -3122,11 +3125,39 @@ else
             # section exists to prevent, and it would most likely break a docker build; and a job
             # silently LOSING `audit` is the same hole the block-mode pins close for the other five.
             for aud_job in "${EXPECTED_AUDIT_JOBS[@]}"; do
-                aud_got=$(yq_query "[.jobs.\"${aud_job}\".steps[] | select((.uses // \"\") | test(\"step-security/harden-runner\")) | (.with.\"egress-policy\" // \"<unset>\")] | join(\",\")" -r)
-                case "$aud_got" in
+                # Policy value AND the three job-shape keys that decide whether harden-runner runs
+    # at all. Not the full hr_policy string the block jobs get: those five ENFORCE, so
+    # replicating fourteen fields here would triple the re-pin friction on a file that
+    # took 25 commits in six months. But `container:` (the action does not support
+    # container jobs), `services:` (service containers start before steps[0]) and
+    # harden-runner not being steps[0] each make the step a no-op while `egress-policy`
+    # still reads `audit` — and what is lost then is the very telemetry AC6's follow-up
+    # needs to derive these three allowlists, while the pin still reports them healthy.
+    aud_got=$(yq_query "\"policy=\" + ([.jobs.\"${aud_job}\".steps[] | select((.uses // \"\") | test(\"step-security/harden-runner\")) | (.with.\"egress-policy\" // \"<unset>\")] | join(\",\"))
+      + \" first=\" + ((.jobs.\"${aud_job}\".steps[0].uses // \"\") | test(\"step-security/harden-runner\") | tostring)
+      + \" container=\" + ((.jobs.\"${aud_job}\" | has(\"container\")) | tostring)
+      + \" services=\" + ((.jobs.\"${aud_job}\" | has(\"services\")) | tostring)
+      + \" \" + ([.jobs.\"${aud_job}\".steps[] | select((.uses // \"\") | test(\"step-security/harden-runner\"))]
+        | map(\"sudo=\" + ((.with.\"disable-sudo\" // \"<unset>\") | tostring)
+            + \" if=\" + ((has(\"if\")) | tostring)
+            + \" coe=\" + ((.\"continue-on-error\" // false) | tostring)
+            + \" withkeys=\" + ([.with | keys | .[]] | sort | join(\",\"))) | join(\" ;; \"))" -r)
+                # Per job, because devcontainer-changes sets `disable-sudo: true` and the two image
+    # jobs deliberately do not (line ~776 records why). Measured: WITHOUT the step-level
+    # half of this string, `if: false` on an audit job's harden-runner step and a dropped
+    # `disable-sudo` both survived at 253/0 — the step is skipped, the job records NO
+    # telemetry, and the pin still reported "runs harden-runner in audit, explicitly".
+    # That matters doubly here: telemetry is the only route off `audit` under AC2, so
+    # silently removing it makes the AC6 follow-up unsatisfiable while looking green.
+    case "$aud_job" in
+        devcontainer-changes) aud_want='policy=audit first=true container=false services=false sudo=true if=false coe=false withkeys=disable-sudo,egress-policy' ;;
+        *)                    aud_want='policy=audit first=true container=false services=false sudo=<unset> if=false coe=false withkeys=egress-policy' ;;
+    esac
+    case "$aud_got" in
                     __NO_YQ__)    fail_no_yq "${aud_job}'s harden-runner policy" ;;
                     __YQ_ERROR__) fail_yq_error "${aud_job}'s harden-runner policy" ;;
-                    audit)        pass "${aud_job} still runs harden-runner in audit, explicitly (LAB-6015 AC6: recorded, not silent)" ;;
+                    "$aud_want")
+                                  pass "${aud_job} still runs harden-runner in audit as its FIRST step, with no container: or services:, explicitly (LAB-6015 AC6: recorded, not silent)" ;;
                     *)            fail "${aud_job}'s harden-runner egress-policy is '${aud_got}', expected 'audit'. If this job is being flipped to block, its allowed-endpoints must be derived from harden-runner telemetry of real runs (LAB-6015 AC2) — not guessed — and it must move from EXPECTED_AUDIT_JOBS to EXPECTED_HR_JOBS with an hr_expected entry. If it lost the step entirely, the carrying-jobs pin above should have caught that first." ;;
                 esac
             done
@@ -5196,7 +5227,8 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # that runs the nested module's tests survived at 179/0.
 #
 # ── LAB-6015 (harden-runner egress: audit -> block) ───────────────────────────
-# This branch adds THIRTEEN counted outcomes on top of main's 182, all in the
+# This branch adds SEVENTEEN counted outcomes on top of main's 236 (main's own base moved
+# from 182 to 236 when LAB-5766 landed), all in the
 # "harden-runner egress policy" section. Measured at each step, never computed:
 #   +5  one per job in EXPECTED_HR_JOBS — each job's WHOLE policy compared against a
 #       pinned expectation (action SHA, `block`, disable-sudo, no `if:`, harden-runner
@@ -5256,6 +5288,16 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       invocation of test/assert-egress-enforced.sh. Measured: the step shipped
 #       unpinned and deleting it left the suite green; later, `shell: cat {0}` left the
 #       run value byte-identical while the runner merely CAT-ed the script and exited 0.
+#   +3  one per job in EXPECTED_AUDIT_JOBS — the three devcontainer jobs LAB-5766 added,
+#       each pinned as `audit` AND on the job-shape keys that decide whether the step
+#       runs at all (first, container, services). AC6 says a job that cannot be flipped
+#       keeps `audit` EXPLICITLY; these are that, and the pin makes both directions —
+#       a silent flip to `block`, a silent no-op of the step — a named failure.
+#   +1  the AC5 stale-comment guard. AC5 was met by DELETING the four stale
+#       "flip once telemetry confirms the set" comments, and the LAB-5766 merge
+#       reintroduced three of them verbatim while every structural pin stayed green,
+#       because they are YAML/digest-based and this is prose. A criterion met by
+#       deletion needs a guard or it regresses on the next merge.
 #   +1  the workflow SHAPE, in one outcome: the whole `defaults.run` NODE at workflow and
 #       job level (so `working-directory`, which re-roots every relative guard invocation,
 #       is covered alongside `shell`), no step-level `shell:`, `permissions` at both levels,
@@ -5291,8 +5333,8 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       `python3 -c "urllib.request..."` and `exec 3<>/dev/tcp/host/443`. Enumerating
 #       egress methods has no end; pinning the body has one.
 #
-# The +13 is CONSTANT BY CONSTRUCTION across all three arms — workflow present with yq,
-# present without yq, and missing — at 13 outcomes each. The three behavioural
+# The +17 is CONSTANT BY CONSTRUCTION across all three arms — workflow present with yq,
+# present without yq, and missing — at 17 outcomes each. The three behavioural
 # outcomes read only the script file, never the workflow or yq, so they are constant too. That property is why
 # EXPECTED_HR_JOBS is a HARDCODED list: the first version derived it from the workflow,
 # which emitted six outcomes with yq and one without, leaving this pin wrong on any host

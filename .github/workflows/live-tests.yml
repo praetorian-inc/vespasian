@@ -16,7 +16,12 @@ permissions:
   contents: read
 
 # ── ALLOWLIST PROVENANCE (LAB-6015) ───────────────────────────────────────────
-# Every harden-runner step below runs `egress-policy: block`. The per-job
+# The harden-runner steps in EXPECTED_HR_JOBS run `egress-policy: block`; the ones
+# in EXPECTED_AUDIT_JOBS run `audit` deliberately, with the reason recorded at each
+# of those jobs and in LAB-6015's AC6 note. Both arrays live in
+# test/test-runner-args.sh and are the authority — this block deliberately does NOT
+# restate which jobs or how many, because every hand-maintained count in this file
+# has gone stale (see the note below). The per-job
 # `allowed-endpoints` lists are DERIVED FROM TELEMETRY, not guessed: the union of
 # the `endpoint called` lines in the harden-runner post-step output of six green
 # `live-tests` push runs on main —
@@ -93,9 +98,19 @@ permissions:
 # CONTAINER job and the action does not support those; its own comment records
 # that. check-label is the other: it is a non-container job whose single step is
 # an inline bash gate with no checkout and no network use, so there is nothing
-# for an egress policy to protect. So live-tests.yml has seven jobs, six of them
-# non-container, and FIVE carry the policy — do not write "all five non-container
-# jobs", which is what the first version of this block said.
+# for an egress policy to protect.
+#
+# DO NOT WRITE A JOB COUNT HERE. This sentence has now been wrong three times: it
+# first said "all five non-container jobs"; it was corrected to "seven jobs, six of
+# them non-container, and FIVE carry the policy"; and merging LAB-5766 added three
+# more jobs, which made that wrong too — while every structural pin stayed green,
+# because a census in prose is not something a YAML pin can check. (No corrected
+# figure is given here on purpose; writing one is how the previous two got stale.)
+#
+# The census belongs in EXPECTED_ALL_JOBS / EXPECTED_HR_JOBS /
+# EXPECTED_AUDIT_JOBS in test/test-runner-args.sh, which ARE asserted against the
+# workflow on every run and fail the build naming the job. Name the arrays here, not
+# the numbers.
 #
 # KEEP `allowed-endpoints` A `>` BLOCK SCALAR. `*.blob.core.windows.net:443`
 # starts with `*`, which YAML reads as an ALIAS indicator anywhere it is not
@@ -152,7 +167,8 @@ jobs:
       # which jobs carry the step at all and the full job set, so none of those can move
       # without the build failing and naming the job. The three devcontainer jobs
       # (LAB-5766) still run `audit` and are pinned as audit, deliberately: see the
-      # AC6 note in the ALLOWLIST PROVENANCE block above.
+      # AC6 rationale recorded at each of those jobs (devcontainer-changes / devcontainer-image /
+      # devcontainer-image-arm64), and pinned via EXPECTED_AUDIT_JOBS.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -326,7 +342,8 @@ jobs:
       # which jobs carry the step at all and the full job set, so none of those can move
       # without the build failing and naming the job. The three devcontainer jobs
       # (LAB-5766) still run `audit` and are pinned as audit, deliberately: see the
-      # AC6 note in the ALLOWLIST PROVENANCE block above.
+      # AC6 rationale recorded at each of those jobs (devcontainer-changes / devcontainer-image /
+      # devcontainer-image-arm64), and pinned via EXPECTED_AUDIT_JOBS.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -397,7 +414,8 @@ jobs:
       # which jobs carry the step at all and the full job set, so none of those can move
       # without the build failing and naming the job. The three devcontainer jobs
       # (LAB-5766) still run `audit` and are pinned as audit, deliberately: see the
-      # AC6 note in the ALLOWLIST PROVENANCE block above.
+      # AC6 rationale recorded at each of those jobs (devcontainer-changes / devcontainer-image /
+      # devcontainer-image-arm64), and pinned via EXPECTED_AUDIT_JOBS.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -1122,7 +1140,8 @@ jobs:
       # which jobs carry the step at all and the full job set, so none of those can move
       # without the build failing and naming the job. The three devcontainer jobs
       # (LAB-5766) still run `audit` and are pinned as audit, deliberately: see the
-      # AC6 note in the ALLOWLIST PROVENANCE block above.
+      # AC6 rationale recorded at each of those jobs (devcontainer-changes / devcontainer-image /
+      # devcontainer-image-arm64), and pinned via EXPECTED_AUDIT_JOBS.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -1200,7 +1219,8 @@ jobs:
       # which jobs carry the step at all and the full job set, so none of those can move
       # without the build failing and naming the job. The three devcontainer jobs
       # (LAB-5766) still run `audit` and are pinned as audit, deliberately: see the
-      # AC6 note in the ALLOWLIST PROVENANCE block above.
+      # AC6 rationale recorded at each of those jobs (devcontainer-changes / devcontainer-image /
+      # devcontainer-image-arm64), and pinned via EXPECTED_AUDIT_JOBS.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
