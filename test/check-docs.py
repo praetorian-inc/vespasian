@@ -64,11 +64,18 @@ FENCE_RE = re.compile(r"^([ \t]*)(```|~~~)", re.MULTILINE)
 # dedicated check a deleted definition (heading renders as literal brackets) or
 # an orphaned definition passes silently.
 REF_DEF_RE = re.compile(r"^ {0,3}\[(?P<label>[^\]\n]+)\]:\s+\S", re.MULTILINE)
-# A bracket group that is not an image (no leading '!'). Labels do not nest.
-BRACKET_RE = re.compile(r"(?<!!)\[(?P<inner>[^\[\]]*)\]")
+# A bracket group. Labels do not nest. Reference-style images (`![label]`,
+# `![label][]`, `![text][label]`) resolve through the same definitions as
+# reference links, so they are counted as usages too; inline links/images
+# (`[text](url)`, `![alt](url)`) are excluded downstream by the following "(".
+BRACKET_RE = re.compile(r"\[(?P<inner>[^\[\]]*)\]")
+# A GitHub task-list checkbox at a list-item start: "- [ ]", "* [x]", "+ [X]".
+# The bracket prefix is the bullet up to the checkbox.
+TASK_ITEM_RE = re.compile(r"^\s*[-*+]\s+$")
 # Inline code spans, so bracketed tokens inside them (`[role=button]`,
-# `map[string][]string`) are not read as reference links.
-INLINE_CODE_RE = re.compile(r"(?P<ticks>`+)(?:.|\n)*?(?P=ticks)")
+# `map[string][]string`) are not read as reference links. The disjoint
+# `[\s\S]` (not `.|\n`) keeps the lazy repetition single-path, not ReDoS-shaped.
+INLINE_CODE_RE = re.compile(r"(?P<ticks>`+)[\s\S]*?(?P=ticks)")
 
 
 def repo_root():
@@ -287,19 +294,25 @@ def reference_defs_and_usages(text):
     """Return (defs, usages) of reference-link labels found in already-stripped text.
 
     Definitions are `[label]: target` lines. Usages are shortcut (`[label]`),
-    collapsed (`[label][]`), and full (`[text][label]`) references; inline links
-    (`[text](url)`), definitions, empty/task-list brackets, and footnotes
-    (`[^ref]`) are excluded.
+    collapsed (`[label][]`), and full (`[text][label]`) references, including
+    their image forms (`![label]`, ...). Inline links/images (`[text](url)`,
+    `![alt](url)`), definitions, empty brackets, GitHub task-list checkboxes
+    (`- [ ]` / `- [x]`), and footnotes (`[^ref]`) are excluded.
     """
     defs = {_norm_label(m.group("label")) for m in REF_DEF_RE.finditer(text)}
     usages = set()
     for m in BRACKET_RE.finditer(text):
         nxt = text[m.end()] if m.end() < len(text) else ""
         if nxt in ("(", ":"):
-            continue  # inline link, or reference definition
+            continue  # inline link/image, or reference definition
         inner = m.group("inner")
         if not inner.strip() or inner.startswith("^"):
-            continue  # empty / task-list marker / footnote
+            continue  # empty / unchecked task-list marker / footnote
+        if inner in ("x", "X"):
+            # Checked task-list item ("- [x]"): a checkbox, not a reference.
+            line_start = text.rfind("\n", 0, m.start()) + 1
+            if TASK_ITEM_RE.match(text[line_start:m.start()]):
+                continue
         if nxt == "[":
             m2 = BRACKET_RE.match(text, m.end())
             if m2 is not None:
