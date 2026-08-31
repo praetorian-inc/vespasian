@@ -238,11 +238,11 @@ jobs:
           # subject. It happens not to collide today only because that pin is
           # yq-gated and so does not emit on this run — which is exactly the kind
           # of accident that stops being true after an unrelated edit.
-          if printf '%s\n' "$out" | grep -q '^test-runner-args: FAIL — assertion accounting drift'; then
+          if grep -q '^test-runner-args: FAIL — assertion accounting drift' <<< "$out"; then
             echo "::error::the guard suite reports assertion accounting drift without yq — a vacuity sentinel arm credits the wrong number of outcomes, so a yq-less contributor is told the ledger is stale instead of the real cause" >&2
             exit 1
           fi
-          printf '%s\n' "$out" | grep -q '=== Summary ===' \
+          grep -q '=== Summary ===' <<< "$out" \
             || { echo "::error::the guard suite did not reach its summary without yq — it died before reporting" >&2; exit 1; }
           # The yq-gated arms must actually have been REACHED, or this step passes
           # while proving nothing — a suite that never touched them looks identical
@@ -251,7 +251,7 @@ jobs:
           # filter step's own "yq unavailable or the workflow is unparseable". Match
           # both, or the honest run fails the equality check below by exactly one.
           yqpat='yq is required|yq unavailable'
-          if ! printf '%s\n' "$out" | grep -qE "$yqpat"; then
+          if ! grep -qE "$yqpat" <<< "$out"; then
             echo "::error::the yq-less run produced no 'yq is required' diagnostic, so the yq-gated arms were never reached and this step asserted nothing" >&2
             exit 1
           fi
@@ -260,8 +260,8 @@ jobs:
           # run showed 21 failures instead of the expected yq ones and this step
           # still exited 0. MEASURED. Compare the failure count against the number
           # of yq-attributed diagnostics.
-          fails=$(printf '%s\n' "$out" | sed -n 's/^  \([0-9]*\) passed, \([0-9]*\) failed.*/\2/p' | head -1)
-          yqfails=$(printf '%s\n' "$out" | grep -cE "^  FAIL:.*($yqpat)" || true)
+          fails=$(sed -n 's/^  \([0-9]*\) passed, \([0-9]*\) failed.*/\2/p' <<< "$out" | head -1)
+          yqfails=$(grep -cE "^  FAIL:.*($yqpat)" <<< "$out" || true)
           if [ "${fails:-0}" -ne "${yqfails:-0}" ]; then
             echo "::error::the yq-less run reported ${fails} failure(s) but only ${yqfails} are yq-attributed — the extra failure(s) are a real regression this step must not mask" >&2
             exit 1
@@ -578,7 +578,7 @@ jobs:
             exit 1
           }
           printf '%s\n' "$out"
-          printf '%s' "$out" | grep -q "already present" \
+          grep -q "already present" <<< "$out" \
             || { echo "second run did not take the idempotent path"; exit 1; }
 
   # Decides whether a PULL REQUEST touches the devcontainer image or anything it
@@ -882,7 +882,7 @@ jobs:
             want=$(sed -n "s/^go //p" go.mod | head -1)
             have=$(go version | sed -n "s/.*go\([0-9][0-9.]*\).*/\1/p")
             [ -n "$want" ] && [ -n "$have" ] || { echo "could not read go.mod (got: $want) or go version (got: $have)" >&2; exit 1; }
-            oldest=$(printf "%s\n%s\n" "$want" "$have" | sort -V | head -1)
+            oldest=$(printf "%s\n%s\n" "$want" "$have" | sort -V | sed -n 1p)
             [ "$oldest" = "$want" ] || { echo "the image ships Go $have but go.mod requires >= $want; bump the Go layer in .devcontainer/Dockerfile" >&2; exit 1; }
             echo "container matches devcontainer.json: user=vscode, VESPASIAN_NO_SANDBOX=true, /dev/shm=${shm}B, spec-validator deps present, go=${have} (go.mod wants >= ${want})"
           '

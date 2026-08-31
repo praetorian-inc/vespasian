@@ -1920,6 +1920,38 @@ else
             pass "every script live-tests.yml direct-execs is committed 100755 ($(wc -l <<< "$direct_exec_scripts") scripts checked)"
         fi
     fi
+    # SIGPIPE under `set -o pipefail` makes a guard report the OPPOSITE of what it
+    # measured. `grep -q` exits the instant it matches, closing the pipe; printf's
+    # next write takes EPIPE and returns 1; pipefail promotes that to the PIPELINE's
+    # status; and a leading `!` or a trailing `||` then reads "matched" as "did not
+    # match". It is a race between the reader exiting and printf draining, so it is
+    # intermittent rather than a clean size cutoff.
+    #
+    # MEASURED in run 33405732303 on head 47685bb: the yq-less step's
+    # `printf | grep -qE "$yqpat"` matched at byte 9763 of a 31933-byte output,
+    # printf logged `write error: Broken pipe`, and the step died with "produced no
+    # 'yq is required' diagnostic" -- while 40 such diagnostics sat in the log it had
+    # just printed. 500 local trials of the identical command reproduced it 0 times.
+    # That is why prose cannot hold this: live-tests.yml ALREADY carried a measured
+    # comment prescribing the herestring, and five other sites in the same file kept
+    # the broken form regardless. Asserted mechanically instead.
+    #
+    # `head -N` is the same class -- it exits after N lines and upstream takes the
+    # EPIPE -- so it is matched too. Whole-line comments are stripped first, because
+    # the explanatory comment in live-tests.yml necessarily names the bad idiom. The
+    # pattern uses [|] rather than \| because `awk -v` processes escapes in the
+    # value: `\|` would arrive as a bare `|`, turning the regex into an alternation
+    # that matches nearly every line and making this a permanent false FAIL.
+    sigpipe_re='printf.*[|].*(grep([[:space:]]+-[a-zA-Z]+)*[[:space:]]+-[a-zA-Z]*q|head[[:space:]]+-)'
+    sigpipe_hits=$(awk -v r="$sigpipe_re" '
+        { line = $0; sub(/^[[:space:]]+/, "", line)
+          if (line ~ /^#/) next
+          if ($0 ~ r) printf "%d ", NR }' "$WORKFLOW")
+    if [[ -n "${sigpipe_hits// /}" ]]; then
+        fail "live-tests.yml pipes printf into an early-exiting reader (grep -q / head -N) at line(s) ${sigpipe_hits}-- under 'set -o pipefail' the reader exits on its first match, printf takes SIGPIPE, and the pipeline's non-zero status INVERTS the guard's verdict. Measured in run 33405732303: 40 yq-attributed FAILs were read as zero and the step reported the opposite. Use a herestring: grep -q PATTERN <<< \"\$out\""
+    else
+        pass "live-tests.yml feeds no printf into an early-exiting reader (the SIGPIPE-under-pipefail verdict-inversion class)"
+    fi
 
     # The per-suite/continue-on-error/if: checks below all operate on
     # the preflight-selftest JOB BLOCK, which by construction starts after the
@@ -5045,6 +5077,19 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #         test/test-runner-args.sh`) — a plain `bash` here inherits an exported
 #         ugrep `grep` function that gives different answers than CI.
 #
+#   +1    round 14: the printf-into-`grep -q` SIGPIPE guard. Under `set -o pipefail`
+#         the reader exits on its first match and printf's EPIPE becomes the
+#         PIPELINE's status, so `!`/`||` read the verdict backwards. Run 33405732303
+#         failed that way on a green suite. Six sites in live-tests.yml carried the
+#         form; the file already documented why not to.
+#
+#         The structured entries above stop at 236. Rounds 8-13 raised the pin to
+#         253 without extending this ledger, so 236 -> 253 is UNATTRIBUTED here --
+#         EXPECTED_ASSERTIONS is the authority on the running total, not the sum of
+#         these bands.
+#
+#   = 254  MEASURED, in a clean child shell (same caveat as the 236 entry).
+#
 # The recurring lesson, recorded because it cost six rounds: when a block gains a
 # counted outcome, its vacuity-sentinel arms must gain the matching credit in the
 # same edit. That was missed five times, each time caught by RUNNING a degraded
@@ -5364,7 +5409,7 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # ones the pre-LAB-6015 shape check also caught.
 # ── end merged-from-main history ─────────────────────────────────────────────
 
-EXPECTED_ASSERTIONS=253
+EXPECTED_ASSERTIONS=254
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
