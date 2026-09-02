@@ -2900,9 +2900,9 @@ else
         __YQ_ERROR__) fail_yq_error "the full set of jobs in live-tests.yml" ;;
         *)
             if [[ "$all_actual" == "$all_pinned" ]]; then
-                pass "the job set is exactly the pinned seven (${all_pinned})"
+                pass "the job set is exactly the pinned ${#EXPECTED_ALL_JOBS[@]} (${all_pinned})"
             else
-                fail "live-tests.yml's job set has changed — pinned '${all_pinned}', found '${all_actual}'. A new job must either carry harden-runner (add it to EXPECTED_HR_JOBS and hr_expected) or have its exemption recorded in EXPECTED_ALL_JOBS' comment. A job that went away needs the removal recorded here."
+                fail "live-tests.yml's job set has changed — pinned '${all_pinned}', found '${all_actual}'. A new job must either carry harden-runner (add it to EXPECTED_HR_JOBS and hr_expected), keep recorded audit (EXPECTED_AUDIT_JOBS), or have its exemption recorded in EXPECTED_ALL_JOBS' comment. A job that went away needs the removal recorded here."
             fi ;;
     esac
     # BLOCK jobs plus AUDIT jobs: every job that carries the step at all. Keeping the two
@@ -3063,7 +3063,7 @@ else
 
     # The two checks above cover jobs that carry the policy and the job (LAB-6015 review)
     # SET, but not the two jobs that are exempt from it. Measured: appending a
-    # `curl` step to check-label leaves the job set the pinned seven, the carrying
+     # `curl` step to check-label leaves EXPECTED_ALL_JOBS matching, the carrying
     # set the pinned five, every hr_expected comparison untouched, and the suite at
     # 143/0 — an exempt job silently gaining unrestricted egress. Each exemption
     # rests on a specific, checkable fact, so pin the fact rather than the name:

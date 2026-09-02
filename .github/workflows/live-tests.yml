@@ -141,7 +141,7 @@ jobs:
       # check_prerequisites (test/setup-live-targets.sh:248), which is a DISPLAY
       # LABEL — `log_ok "Go $(go version | ...)"` — with no version gate behind
       # it. Under the default GOTOOLCHAIN=auto that bare call still honours
-      # go.mod's `go 1.25.8` and fetches a toolchain, which is the only reason
+      # go.mod's `go` directive and fetches a toolchain, which is the only reason
       # this job ever reached proxy.golang.org, sum.golang.org and
       # storage.googleapis.com. Pinning `local` removes the fetch, and with it
       # three endpoints from the allowlist below — including
