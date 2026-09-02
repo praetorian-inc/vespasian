@@ -385,6 +385,15 @@ jobs:
       - name: Validator regression test
         run: ./test/validate_test.sh
 
+      # Same AC3 runtime proof as preflight-selftest, LAST for the same reason:
+      # this is the only network-dependent assertion in the job. Dropping the
+      # identical script here extends the proof into a job whose allowlist
+      # carries `*.blob.core.windows.net:443` (the only non-literal entry);
+      # proxy.golang.org is not on this job's list, so the unlisted-host probe
+      # still refuses. test/test-runner-args.sh pins this step the same way it
+      # pins preflight-selftest's.
+      - name: Assert egress policy enforces (AC3)
+        run: ./test/assert-egress-enforced.sh
 
   # Community-health docs guard (LAB-5870). Asserts the required docs exist, every
   # relative markdown link and heading anchor resolves, and the CODEOWNERS '*' roster
@@ -1039,6 +1048,12 @@ jobs:
       # github.com for the pinned yq binary. Emulated or not, that is the same
       # third-party egress executed as root, so dropping the monitoring here
       # would have left the arch we understand LEAST the one we watch least.
+      #
+      # disable-sudo is NOT set here for the same reason as `devcontainer-image`
+      # (:803): `docker build` on a GitHub runner reaches the daemon through the
+      # docker group, but the base image's own layers and the browser install run
+      # as root inside the build sandbox, and pinning that down is what the build
+      # is for.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:

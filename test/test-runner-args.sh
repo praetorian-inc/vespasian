@@ -2946,10 +2946,13 @@ else
     # likewise pins that preflight-selftest INVOKES its four guard suites, never what they
     # contain. `bash -n` in the un-gated syntax-check step covers syntax.
     # AGENTS.md records the same reasoning for test/assert-chrome-install.sh.
-    ac3_got=$(yq_query '"last=" + (((.jobs."preflight-selftest".steps[-1].name) // "") == "Assert egress policy enforces (AC3)" | tostring)
+    ac3_got=$(yq_query '"preflight=" + ("last=" + (((.jobs."preflight-selftest".steps[-1].name) // "") == "Assert egress policy enforces (AC3)" | tostring)
       + " shell=" + ([.jobs."preflight-selftest".steps[] | select(.name == "Assert egress policy enforces (AC3)") | (.shell // "<default>")] | join(""))
-      + " run=" + (([.jobs."preflight-selftest".steps[] | select(.name == "Assert egress policy enforces (AC3)") | .run] | join("")) | sub("\s+$"; ""))' -r)
-    ac3_want='last=true shell=<default> run=./test/assert-egress-enforced.sh'
+      + " run=" + (([.jobs."preflight-selftest".steps[] | select(.name == "Assert egress policy enforces (AC3)") | .run] | join("")) | sub("\s+$"; "")))
+      + " validator=" + ("last=" + (((.jobs."validator-regression".steps[-1].name) // "") == "Assert egress policy enforces (AC3)" | tostring)
+      + " shell=" + ([.jobs."validator-regression".steps[] | select(.name == "Assert egress policy enforces (AC3)") | (.shell // "<default>")] | join(""))
+      + " run=" + (([.jobs."validator-regression".steps[] | select(.name == "Assert egress policy enforces (AC3)") | .run] | join("")) | sub("\s+$"; "")))' -r)
+    ac3_want='preflight=last=true shell=<default> run=./test/assert-egress-enforced.sh validator=last=true shell=<default> run=./test/assert-egress-enforced.sh'
     # The script's BODY is checked too — the two probe calls and the two hostname
     # assignments — the same way and for the same reason install-chrome-e2e's render
     # assertion is checked above: grep the file, comments stripped, for the invocations it
@@ -2971,9 +2974,9 @@ else
         __YQ_ERROR__) fail_yq_error "the AC3 egress-enforcement step" ;;
         *)
             if [[ "$ac3_got" == "$ac3_want" && "$ac3_body" == "yes" ]]; then
-                pass "AC3 enforcement step is last in preflight-selftest, invokes test/assert-egress-enforced.sh, and that script still makes both probe calls against both pinned hosts"
+                pass "AC3 enforcement step is last in preflight-selftest and validator-regression, invokes test/assert-egress-enforced.sh, and that script still makes both probe calls against both pinned hosts"
             else
-                fail "the AC3 egress-enforcement step no longer matches its pin — deleted, renamed, moved off the end of the job, or pointed at something other than test/assert-egress-enforced.sh. This is the only runtime check that block mode actually ENFORCES; the policy pin above only checks what the YAML says. Restore it, or record the decision to drop it here deliberately, or the script stopped making both probe calls against both pinned hosts (body=${ac3_body}).
+                fail "the AC3 egress-enforcement step no longer matches its pin — deleted, renamed, moved off the end of preflight-selftest or validator-regression, or pointed at something other than test/assert-egress-enforced.sh. This is the only runtime check that block mode actually ENFORCES; the policy pin above only checks what the YAML says. Restore it, or record the decision to drop it here deliberately, or the script stopped making both probe calls against both pinned hosts (body=${ac3_body}).
         want: ${ac3_want}
         got:  ${ac3_got}"
             fi ;;

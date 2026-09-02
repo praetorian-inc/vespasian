@@ -71,25 +71,15 @@ CONTROL_URL="https://github.com/"
 # job red on a correctly-enforcing runner; that is worse than the gap it chased.
 #
 # SCOPE, stated because the assertion is narrower than "block enforces": this script runs
-# in ONE job, preflight-selftest, whose allowlist is the two-entry wildcard-free one. The
-# other four policy jobs get no runtime proof, and THREE of them — validator-regression,
-# integration-tests and test — carry `*.blob.core.windows.net:443`, the only entry whose
-# matching is non-trivial and the one this workflow admits is wider than needed. If
-# harden-runner ever failed open on a wildcard entry, that is exactly what this step exists
-# to catch and exactly what it cannot see, while every static pin stayed green.
+# in TWO jobs. preflight-selftest has the two-entry wildcard-free allowlist;
+# validator-regression carries `*.blob.core.windows.net:443`, the only entry whose matching
+# is non-trivial. UNLISTED_URL is proxy.golang.org, which neither job allowlists, so the
+# unlisted-host probe refuses in both. The remaining two policy jobs — integration-tests
+# and test — DO allowlist proxy.golang.org, so this script cannot drop in there without a
+# different unlisted host. docs-check also omits it but is not a wildcard job.
 #
-# Reusing the script elsewhere is a one-liner for TWO of those jobs and not for the other
-# two: UNLISTED_URL below is proxy.golang.org, which IS allowlisted in integration-tests and
-# test, so those two would need a different unlisted host — but validator-regression and
-# docs-check do not allowlist it, so the step drops in verbatim. Adding it to
-# validator-regression is therefore the cheapest way to extend the proof into a
-# wildcard-carrying job, and is the obvious next step if this residual is ever worth
-# closing.
-#
-# An earlier version of this paragraph said "the four jobs whose effective allow-set
-# includes the wildcard" and called reuse "not a one-liner" flatly. Both overstated the
-# residual; three review lanes independently caught it. Read the pass as "block enforces in
-# a job with a two-entry literal allowlist", not "block enforces".
+# Read the pass as "block enforces in a literal-allowlist job AND in one wildcard-carrying
+# job", not "block enforces in every policy job".
 #
 # What actually bounds the risk: the control request below. If the unlisted host were down
 # AND the policy were off, this step would still pass — but that needs two independent
@@ -109,3 +99,4 @@ if ! curl -sS --max-time 15 -o /dev/null "$CONTROL_URL"; then
     exit 1
 fi
 echo "ok: allowlisted host reachable — so the refusal above is not a blanket loss of egress"
+
