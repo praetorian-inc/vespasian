@@ -45,12 +45,20 @@ import (
 //     check and redirectScopeGuard. (LAB-4011.)
 //   - proxyURL == nil, allowPrivate false: a clone of http.DefaultTransport
 //     with DialContext wired to ssrfSafeDialContext so the DNS-rebinding TOCTOU
-//     window is closed at connect time (SEC-BE-002).
+//     window is closed at connect time.
 //   - proxyURL == nil, allowPrivate true: http.DefaultTransport unchanged.
 func newHTTPClient(scopeFn func(string) bool, allowPrivate bool, timeout time.Duration, proxyURL *url.URL, proxyInsecure bool) *http.Client {
 	transport := http.RoundTripper(http.DefaultTransport)
 	switch {
 	case proxyURL != nil:
+		// Cross-reference: pkg/httpx.BuildHTTPClient encodes the SAME
+		// security-sensitive TLS-verify gate below (InsecureSkipVerify only for
+		// --proxy-insecure && scheme http/https); keep the two in lockstep if that
+		// gate ever changes. They are intentionally NOT merged: this branch keeps
+		// DefaultTransport's dialer for the proxy connection (asserted by
+		// TestNewHTTPClient_Proxy), while httpx clears DialContext and pins MinVersion
+		// TLS 1.2, so delegating here would regress this proven path.
+		//
 		// Clone DefaultTransport and route through the proxy, keeping its
 		// keep-alive, HTTP/2, and idle-connection tunings.
 		base, ok := http.DefaultTransport.(*http.Transport)
@@ -69,14 +77,14 @@ func newHTTPClient(scopeFn func(string) bool, allowPrivate bool, timeout time.Du
 		// real target through the tunnel and no substitute CA is involved, so
 		// verification is always kept for socks5 regardless of proxyInsecure.
 		if proxyInsecure && (proxyURL.Scheme == "http" || proxyURL.Scheme == "https") {
-			t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // G402: opt-in via --proxy-insecure for http/https proxy MITM (see doc comment)
+			t.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- opt-in via --proxy-insecure for http/https proxy MITM (see doc comment)
 		}
 		transport = t
 	case !allowPrivate:
 		// Clone DefaultTransport and override only DialContext so we keep its
 		// TLS, keep-alive, HTTP/2, proxy, and idle-connection tunings while
 		// re-resolving and re-validating IPs at connect time, closing the
-		// DNS-rebinding TOCTOU window (SEC-BE-002).
+		// DNS-rebinding TOCTOU window.
 		base, ok := http.DefaultTransport.(*http.Transport)
 		if !ok {
 			// Defensive: stdlib always sets *http.Transport, but if a future
@@ -108,6 +116,13 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 	if err != nil {
 		return nil, err
 	}
+	// The net/http backend records exactly one request per visited page, so the
+	// request budget reduces to a page cap here (LAB-4678 Phase 3). The headless
+	// engine, where one page fires many requests, enforces MaxRequests as a
+	// distinct running count.
+	maxPages = httpPageCap(maxPages, c.opts.MaxRequests)
+
+	warnInteractUnsupported(c.opts.Stderr, c.opts.Interact)
 
 	// Validate and parse the proxy on the HTTP path. The CLI validates too
 	// (cmd/vespasian doCrawl), but this guards library/SDK callers that build
@@ -152,10 +167,9 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 	// in depth if it is ever mis-wired (SEC-BE-001). Both read c.pageTimeout.
 	client := newHTTPClient(scopeFn, c.opts.AllowPrivate, c.pageTimeout, proxyURL, c.opts.ProxyInsecure)
 
-	if frontier.Push([]urlEntry{{URL: targetURL, Depth: 0}}) == 0 {
-		return nil, fmt.Errorf("seed URL rejected by frontier (scope, SSRF, or parse): %s; "+
-			"if crawling a private host (localhost, 127.0.0.1, RFC1918, link-local), "+
-			"pass %s", redactSeedURL(targetURL), flagDangerousAllowPrivate)
+	resumeCfg := c.opts.resume(targetURL)
+	if err := c.restoreAndSeed(frontier, targetURL, resumeCfg); err != nil {
+		return nil, err
 	}
 
 	var (
@@ -180,6 +194,10 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 	wg.Wait()
 	frontier.Close()
 
+	// Capture resume state after the workers have stopped, on every exit path
+	// including budget truncation and cancellation (LAB-4678 Phase 4).
+	captureCheckpoint(frontier, resumeCfg, time.Now())
+
 	if ctx.Err() != nil {
 		if c.opts.Stderr != nil {
 			fmt.Fprint(c.opts.Stderr, interruptMessage) //nolint:errcheck // best-effort
@@ -196,6 +214,59 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 	copy(snapshot, results)
 	mu.Unlock()
 	return snapshot, nil
+}
+
+// restoreAndSeed applies any resume state to the frontier and then seeds it with the
+// target. Resume must be restored BEFORE seeding so already-covered pages are not
+// re-crawled (LAB-4678). A resumed frontier has already seen the seed, so Push returns
+// 0 for it — expected, not a rejection, which is why the failure condition also
+// requires an empty queue. Split out of Crawl to stay under the cyclomatic complexity
+// gate.
+func (c *HTTPCrawler) restoreAndSeed(frontier *urlFrontier, targetURL string, resumeCfg resumeOptions) error {
+	resumed := resumeFrontier(frontier, resumeCfg, time.Now(), c.opts.Stderr)
+
+	if frontier.Push([]urlEntry{{URL: targetURL, Depth: 0}}) == 0 && frontier.Len() == 0 {
+		if resumed {
+			return fmt.Errorf("resumed checkpoint has no pending pages and seed URL %s "+
+				"was already covered; nothing to crawl", redactSeedURL(targetURL))
+		}
+		return fmt.Errorf("seed URL rejected by frontier (scope, SSRF, or parse): %s; "+
+			"if crawling a private host (localhost, 127.0.0.1, RFC1918, link-local), "+
+			"pass %s", redactSeedURL(targetURL), flagDangerousAllowPrivate)
+	}
+	return nil
+}
+
+// warnInteractUnsupported reports that --interact does nothing on the net/http
+// backend, which has no DOM to click. Staying silent left an operator who passed
+// "--interact --headless=false" to conclude the target had no interaction-only
+// surface. No-op when the option was not requested or Stderr is nil.
+func warnInteractUnsupported(stderr io.Writer, interact bool) {
+	if !interact || stderr == nil {
+		return
+	}
+	fmt.Fprint(stderr, "warning: --interact requires the headless backend (it clicks DOM elements); ignoring it with --headless=false\n") //nolint:errcheck // best-effort
+}
+
+// httpPageCap folds the request budget into the page cap: this backend records one
+// request per page, so a MaxRequests bound reduces to a page cap. Kept as a helper so
+// HTTPCrawler.Crawl stays under the cyclomatic complexity gate.
+//
+// maxPages MUST already be resolved to a positive value — validateCrawlInputs
+// normalizes the "0 means unlimited" sentinel to DefaultMaxPages before this is
+// called. The guard below enforces that rather than trusting it: with maxPages as an
+// unlimited sentinel, a naive `maxRequests < maxPages` comparison is false and the
+// request budget would be silently discarded, failing a politeness control open
+// against a sensitive target.
+func httpPageCap(maxPages, maxRequests int) int {
+	if maxRequests <= 0 {
+		return maxPages
+	}
+	if maxPages <= 0 {
+		// Unlimited pages: the request budget is the only bound left.
+		return maxRequests
+	}
+	return min(maxRequests, maxPages)
 }
 
 // runWorker is the per-goroutine loop: pop, fetch, record, push links.
@@ -222,18 +293,59 @@ func (c *HTTPCrawler) runWorker(
 		// MarkActive is NOT called: Pop already incremented the active counter in
 		// its own critical section. Only MarkIdle() is needed.
 
+		// The page cap cancels the shared context, so a worker blocked in Pop can
+		// wake up holding an entry it must not fetch. Return it to the queue
+		// instead of dropping it — with the default concurrency this path was
+		// draining the entire pending queue, leaving cross-run resume with
+		// nothing to continue from (LAB-4678 Phase 4).
+		if ctx.Err() != nil {
+			frontier.Requeue(entry)
+			frontier.MarkIdle()
+			return
+		}
+
 		observed, links := c.fetchPage(ctx, client, limiter, entry)
 
+		// Not covered: either the fetch was canceled, or the budget filled while
+		// it was in flight and the result is about to be discarded below. Either
+		// way the page still needs crawling, so requeue it.
+		if observed == nil && ctx.Err() != nil {
+			frontier.Requeue(entry)
+			frontier.MarkIdle()
+			return
+		}
+
+		// fetchPage returns nil only on a transport-level failure (DNS, connection
+		// reset, rate-limiter or per-page timeout, request build) — an HTTP error
+		// STATUS still yields an observation. With the context alive that is a
+		// plausibly transient failure, so keep the page out of the persisted
+		// seen-set: Checkpoint.Seen accumulates across resume cycles, so leaving it
+		// there turned one bad fetch into a permanent drop. It is not requeued now,
+		// so this run does not retry it.
+		if observed == nil {
+			frontier.MarkFailed(entry)
+		}
+
 		if observed != nil {
+			recorded := false
 			mu.Lock()
 			if *pageCount < maxPages {
 				*pageCount++
 				*results = append(*results, *observed)
+				recorded = true
 				if *pageCount >= maxPages {
 					cancel()
 				}
 			}
 			mu.Unlock()
+			// The budget filled while this fetch was in flight, so its result was
+			// dropped. The URL is already in seen, so without a requeue the page
+			// would be permanently uncrawlable on resume.
+			if !recorded {
+				frontier.Requeue(entry)
+				frontier.MarkIdle()
+				return
+			}
 		}
 
 		if len(links) > 0 {

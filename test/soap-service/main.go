@@ -24,6 +24,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/praetorian-inc/vespasian/test/internal/target"
 )
 
 // SOAPEnvelope wraps a SOAP request or response body.
@@ -169,7 +171,7 @@ func handleWSDL(w http.ResponseWriter, r *http.Request) {
 
 	var wsdlData []byte
 	for _, path := range candidates {
-		data, readErr := os.ReadFile(path) //nolint:gosec // G304: test server, path from known WSDL files
+		data, readErr := os.ReadFile(path) // #nosec G304 G703 -- test server, path from known WSDL files
 		if readErr == nil {
 			wsdlData = data
 			break
@@ -182,7 +184,8 @@ func handleWSDL(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-	w.Write(wsdlData) //nolint:errcheck,gosec // test server best-effort response
+	// #nosec G104 G705
+	w.Write(wsdlData) //nolint:errcheck // test server best-effort response
 }
 
 func handleIndex(w http.ResponseWriter, _ *http.Request) {
@@ -201,9 +204,13 @@ func main() {
 	mux.HandleFunc("/service.wsdl", handleWSDL)
 	mux.HandleFunc("/soap", handleSOAP)
 
-	addr := ":" + port
-	log.Printf("soap-service listening on %s", addr)       //nolint:gosec // test server, log injection N/A
-	if err := http.ListenAndServe(addr, mux); err != nil { //nolint:gosec // test server, timeouts not needed
+	// Loopback default and the shared server timeout both
+	// live in test/internal/target, so there is one copy to reason about and one
+	// place for Test 18b to assert.
+	addr := target.Addr(port)
+	log.Printf("soap-service listening on http://%s/", addr) // #nosec G706 -- test server, log injection N/A
+	srv := target.Server(addr, mux)
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }

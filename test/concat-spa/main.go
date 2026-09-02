@@ -20,6 +20,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+
+	"github.com/praetorian-inc/vespasian/test/internal/target"
 )
 
 func main() {
@@ -74,9 +76,12 @@ func main() {
 		http.NotFound(w, r)
 	})
 
-	addr := ":" + port
-	log.Printf("concat-spa listening on http://localhost%s/", addr)     //nolint:gosec // G706: local test target; port is a controlled PORT env/default, not attacker input
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 0} //nolint:gosec // local test target, no timeout needed
+	// Loopback default and the shared server timeout both
+	// live in test/internal/target, so there is one copy to reason about and one
+	// place for Test 18b to assert.
+	addr := target.Addr(port)
+	log.Printf("concat-spa listening on http://%s/", addr) // #nosec G706 -- local test target; port is a controlled PORT env/default, not attacker input
+	srv := target.Server(addr, mux)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}

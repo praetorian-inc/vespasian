@@ -27,6 +27,8 @@ import (
 	"os"
 	"strings"
 	"sync"
+
+	"github.com/praetorian-inc/vespasian/test/internal/target"
 )
 
 // User represents a user resource.
@@ -78,7 +80,8 @@ var (
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v) //nolint:errcheck,gosec // test server best-effort response
+	// #nosec G104
+	json.NewEncoder(w).Encode(v) //nolint:errcheck // test server best-effort response
 }
 
 func setCORSHeaders(w http.ResponseWriter) {
@@ -310,7 +313,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)        // 10MB upload cap
-	if err := r.ParseMultipartForm(10 << 20); err != nil { //nolint:gosec // G120: 10MB cap enforced via MaxBytesReader above
+	if err := r.ParseMultipartForm(10 << 20); err != nil { // #nosec G120 -- 10MB cap enforced via MaxBytesReader above
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid multipart"})
 		return
 	}
@@ -421,7 +424,8 @@ func handleBinaryResponse(w http.ResponseWriter, _ *http.Request) {
 	// Minimal PNG: 8-byte header + minimal IHDR + IEND
 	data := make([]byte, 128)
 	copy(data, []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A})
-	w.Write(data) //nolint:errcheck,gosec // test server best-effort response
+	// #nosec G104
+	w.Write(data) //nolint:errcheck // test server best-effort response
 }
 
 // handleMixedContent returns JSON with a field containing base64 binary data.
@@ -466,7 +470,8 @@ func handleTrailingSlash(w http.ResponseWriter, r *http.Request) {
 func handleMismatchedContentType(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "mismatched"}) //nolint:errcheck,gosec // test server best-effort response
+	// #nosec G104
+	json.NewEncoder(w).Encode(map[string]string{"status": "mismatched"}) //nolint:errcheck // test server best-effort response
 }
 
 // handleAuthRequired returns 401 unless Authorization header is present.
@@ -486,7 +491,8 @@ func handleDeepLinks(w http.ResponseWriter, r *http.Request) {
 	setCORSHeaders(w)
 	level := strings.TrimPrefix(r.URL.Path, "/api/deep/")
 	var depth int
-	fmt.Sscanf(level, "%d", &depth) //nolint:errcheck,gosec // test server best-effort parse
+	// #nosec G104
+	fmt.Sscanf(level, "%d", &depth) //nolint:errcheck // test server best-effort parse
 	if depth <= 0 {
 		depth = 1
 	}
@@ -549,8 +555,10 @@ func handleGzipResponse(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Content-Encoding", "gzip")
 	gz := gzip.NewWriter(w)
-	json.NewEncoder(gz).Encode(map[string]string{"compressed": "true", "data": "gzip-test-payload"}) //nolint:errcheck,gosec // test server best-effort response
-	gz.Close()                                                                                       //nolint:errcheck,gosec // best-effort cleanup
+	// #nosec G104
+	json.NewEncoder(gz).Encode(map[string]string{"compressed": "true", "data": "gzip-test-payload"}) //nolint:errcheck // test server best-effort response
+	// #nosec G104
+	gz.Close() //nolint:errcheck // best-effort cleanup
 }
 
 // ── Classifier edge case endpoints ──────────────────────────
@@ -659,7 +667,7 @@ func handleEmptyOK(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// SEC-FE-001: indexHTML embeds an inline <script> that fires fetch() requests on
+// indexHTML embeds an inline <script> that fires fetch() requests on
 // page load to exercise vespasian's form-body parser during E2E crawls. This is
 // intentional and acceptable because this server is a local test fixture only —
 // it is never deployed and is not subject to CSP. Do NOT copy this pattern to
@@ -694,6 +702,16 @@ func handleIndex(w http.ResponseWriter, _ *http.Request) {
   <li>POST /api/login - URL-encoded form login</li>
   <li>POST /api/upload - Multipart file upload</li>
 </ul>
+<!-- LAB-3890 T2: a real static HTML <form> whose action (/api/subscribe) is
+     NOT linked or fetched anywhere else. The scan command's analyze.ExtractForms
+     augmentation synthesizes a POST request from this markup, so /api/subscribe
+     appearing in the generated spec proves ExtractForms ran in the full pipeline. -->
+<h2>Subscribe (static HTML form — exercises scan's ExtractForms augmentation)</h2>
+<form method="post" action="/api/subscribe">
+  <input type="email" name="email" placeholder="you@example.com" required>
+  <input type="text" name="name" placeholder="Your name">
+  <button type="submit">Subscribe</button>
+</form>
 <!-- TEST-ONLY: inline script intentionally fires fetch() to exercise vespasian's form-body parser during E2E crawls. Acceptable here because this server is a local test fixture only — never deployed and not subject to CSP. Do NOT copy this pattern to production. -->
 <script>
   // Fire urlencoded POST to /api/login on page load (for form data E2E testing)
@@ -839,9 +857,13 @@ func main() {
 	mux.HandleFunc("/api/assets/", handleUUIDItem)
 	// /api/users/{id}/orders is routed via handleUserByID
 
-	addr := ":" + port
-	log.Printf("rest-api listening on %s", addr)           //nolint:gosec // test server, log injection N/A
-	if err := http.ListenAndServe(addr, mux); err != nil { //nolint:gosec // test server, timeouts not needed
+	// Loopback default and the shared server timeout both
+	// live in test/internal/target, so there is one copy to reason about and one
+	// place for Test 18b to assert.
+	addr := target.Addr(port)
+	log.Printf("rest-api listening on http://%s/", addr) // #nosec G706 -- test server, log injection N/A
+	srv := target.Server(addr, mux)
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }

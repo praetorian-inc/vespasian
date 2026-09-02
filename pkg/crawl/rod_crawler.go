@@ -61,7 +61,11 @@ func (c *RodCrawler) crawlHeadless(ctx context.Context, targetURL string, maxPag
 		defer cancel()
 	}
 
-	scopeFn, err := scopeChecker(targetURL, c.opts.Scope, c.opts.AllowPrivate)
+	// newSeedScope wraps the policy predicate with the seed-effective-origin
+	// widening: Chrome follows a seed redirect and tags every captured request
+	// with the post-redirect origin, which the exact same-origin predicate would
+	// otherwise reject wholesale. See [seedScope] for the containment bounds.
+	scope, err := newSeedScope(targetURL, c.opts.Scope, c.opts.AllowPrivate, c.opts.Stderr)
 	if err != nil {
 		return nil, fmt.Errorf("scope setup: %w", err)
 	}
@@ -78,12 +82,17 @@ func (c *RodCrawler) crawlHeadless(ctx context.Context, targetURL string, maxPag
 	engine, err := newRodEngine(browserMgr.wsURL(), engineOptions{
 		Concurrency:   c.opts.Concurrency,
 		MaxPages:      maxPages,
+		MaxRequests:   c.opts.MaxRequests,
+		Interact:      c.opts.Interact,
 		MaxDepth:      c.opts.Depth,
 		PageTimeout:   time.Duration(PageTimeout) * time.Second,
 		StableTimeout: DefaultStableWait,
 		Headers:       extraHeaders,
-		ScopeCheck:    scopeFn,
+		ScopeCheck:    scope.Check,
 		Stderr:        c.opts.Stderr,
+		Resume:        c.opts.resume(targetURL),
+
+		LearnEffectiveOrigin: scope.LearnEffectiveOrigin,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create engine: %w", err)

@@ -83,6 +83,15 @@ func (c *Capability) Parameters() []capability.Parameter {
 		capability.Bool("probe", "Enable endpoint probing").WithDefault("true"),
 		capability.Bool("merge_slugs", "Merge sibling slug paths into one templated REST path (off by default; REST only)").WithDefault("false"),
 		capability.Int("slug_threshold", "Distinct values at a path position before merge_slugs collapses it (minimum 2)").WithDefault("2"),
+		// Declared, not just read in crawlOptsFromCtx: hosts discover configurable
+		// inputs from this list, so a parameter the reader honors but this list
+		// omits is not reachable through the Guard-facing surface and is settable
+		// only by a hand-built ExecutionContext (Codex review, PR #189).
+		// TestCapability_DeclaredParametersAreReadable derives the read set from
+		// crawlOptsFromCtx's own source and fails on any parameter missing here, so
+		// the next one cannot ship dark.
+		capability.Int("max_requests", "Maximum captured requests before stopping (0 = unlimited); a rate bound distinct from max_pages").WithDefault("0"),
+		capability.Bool("interact", "Click a bounded set of page controls to surface interaction-only endpoints (headless only; mutates state)").WithDefault("false"),
 	}
 }
 
@@ -93,7 +102,9 @@ func (c *Capability) Match(_ capability.ExecutionContext, input capmodel.WebAppl
 	}
 	u, err := url.Parse(input.PrimaryURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return fmt.Errorf("vespasian requires HTTP/HTTPS URL, got %q", input.PrimaryURL)
+		// Redacted: the rejected value is echoed into the host's error surface, and
+		// a userinfo-bearing URL is exactly the kind that fails this check.
+		return fmt.Errorf("vespasian requires HTTP/HTTPS URL, got %q", crawl.RedactURL(input.PrimaryURL))
 	}
 	if !input.Seed {
 		return fmt.Errorf("vespasian only runs on web application seeds")
@@ -119,6 +130,12 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 	}
 
 	start := time.Now()
+
+	// PrimaryURL is host-supplied and nothing upstream strips userinfo, so every
+	// sink below logs the redacted form. Computed once: crawl.RedactURL fails
+	// closed to a placeholder whenever it cannot prove the result is
+	// credential-free.
+	logTarget := crawl.RedactURL(input.PrimaryURL)
 
 	// TODO: propagate ctx from ExecutionContext once capability-sdk exposes a
 	// context.Context (see doc.go). Until then the crawl and JS-analysis phases
@@ -146,7 +163,7 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 
 	if mode == "crawl" {
 		slog.Info("vespasian crawl completed",
-			"target", input.PrimaryURL,
+			"target", logTarget,
 			"mode", "crawl",
 			"duration_ms", time.Since(start).Milliseconds(),
 			"crawled_pages", len(requests),
@@ -158,7 +175,7 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 	hasSpec, apiType, scanErr := c.runScan(ctx, requests, input, output)
 
 	slog.Info("vespasian scan completed",
-		"target", input.PrimaryURL,
+		"target", logTarget,
 		"mode", "scan",
 		"duration_ms", time.Since(start).Milliseconds(),
 		"crawled_pages", len(requests),
@@ -170,6 +187,33 @@ func (c *Capability) Invoke(ctx capability.ExecutionContext, input capmodel.WebA
 	return scanErr
 }
 
+// slogWriter is a minimal io.Writer that funnels lines written to it into
+// slog.Warn, tagged with the scan target. Its sole caller is runScan's
+// ScanOptions.Warnings below: without it, the probe-stage cross-origin gate's
+// warnings (internal/pipeline's writeStatus calls, via
+// pipeline.Options.Warnings) had nowhere to go on the SDK path -- Warnings was
+// left unset entirely, so a WebApplication whose app and API endpoints live on
+// different origins (e.g. www.example.com vs api.example.com) silently stopped
+// having its API probed, with no record of the decision anywhere: not the spec,
+// not slog.
+//
+// target must already be redacted; this type does not redact. Callers pass
+// crawl.RedactURL's output so a credentialed PrimaryURL is not tagged onto
+// every warning the writer emits.
+type slogWriter struct {
+	target string
+}
+
+// Write logs p (trimmed of the trailing newline writeStatus always appends
+// in internal/pipeline) at Warn level, tagged with the scan target for
+// attribution, and reports the full input length so callers relying on
+// io.Writer's contract (n == len(p), err == nil for a "successful" write)
+// see no error -- this adapter cannot fail.
+func (w slogWriter) Write(p []byte) (int, error) {
+	slog.Warn("vespasian: probe coverage warning", "target", w.target, "detail", strings.TrimSuffix(string(p), "\n"))
+	return len(p), nil
+}
+
 // runScan runs the classify → probe → generate phase and emits a WebApplication
 // with the spec if one is produced. Returns (hasSpec, resolvedAPIType).
 func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.ObservedRequest, input capmodel.WebApplication, output capability.Emitter) (bool, string, error) {
@@ -179,6 +223,12 @@ func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.O
 	slugThreshold := parseSlugThreshold(ctx.Parameters)
 
 	apiType, _ := ctx.Parameters.GetString("api_type")
+
+	// Every sink in this function that names the target logs this, not
+	// input.PrimaryURL: the value is host-supplied, nothing upstream strips
+	// userinfo, and crawl.RedactURL fails closed to a placeholder whenever it
+	// cannot prove the result is credential-free.
+	redactedTarget := crawl.RedactURL(input.PrimaryURL)
 
 	// ResolveAndGenerate detects the API type (when apiType is "" or "auto"),
 	// conditionally probes <primaryURL>?wsdl and promotes to WSDL on success,
@@ -200,10 +250,16 @@ func (c *Capability) runScan(ctx capability.ExecutionContext, requests []crawl.O
 		MergeSlugs:    mergeSlugs,
 		SlugThreshold: slugThreshold,
 		Status:        nil,
-		AfterWSDL:     nil,
+		// Warnings routes the probe-stage cross-origin gate's warnings into
+		// slog rather than leaving them unset (silently discarded by
+		// internal/pipeline's nil-safe writeStatus), so a WebApplication whose
+		// app and API live on different origins does not stop having its API
+		// probed with no record of the decision anywhere. See slogWriter above.
+		Warnings:  slogWriter{target: redactedTarget},
+		AfterWSDL: nil,
 	})
 	if err != nil {
-		slog.Warn("vespasian: classify/generate failed", "target", input.PrimaryURL, "error", err)
+		slog.Warn("vespasian: classify/generate failed", "target", redactedTarget, "error", err)
 		return false, apiType, nil
 	}
 
@@ -254,6 +310,16 @@ func crawlOptsFromCtx(ctx capability.ExecutionContext) (crawl.CrawlerOptions, er
 	}
 	if d, ok := ctx.Parameters.GetInt("depth"); ok {
 		opts.Depth = d
+	}
+	// max_requests and interact are user-facing CLI flags, so they must also be
+	// reachable from the Guard-facing surface; without these two reads neither was.
+	// (ResumeFrom/OnCheckpoint stay unwired here on purpose — checkpoint storage and
+	// hand-back are the host's, see doc.go.)
+	if m, ok := ctx.Parameters.GetInt("max_requests"); ok {
+		opts.MaxRequests = m
+	}
+	if i, ok := ctx.Parameters.GetBool("interact"); ok {
+		opts.Interact = i
 	}
 	if h, ok := ctx.Parameters.GetString("headers"); ok && h != "" {
 		parsed, err := parseHeaders(h)

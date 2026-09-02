@@ -11,6 +11,7 @@
 <p align="center">
   <a href="https://github.com/praetorian-inc/vespasian/actions/workflows/ci.yml"><img src="https://github.com/praetorian-inc/vespasian/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://goreportcard.com/report/github.com/praetorian-inc/vespasian"><img src="https://goreportcard.com/badge/github.com/praetorian-inc/vespasian" alt="Go Report Card"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/praetorian-inc/vespasian"><img src="https://api.scorecard.dev/projects/github.com/praetorian-inc/vespasian/badge" alt="OpenSSF Scorecard"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
 </p>
 
@@ -42,16 +43,17 @@ Vespasian takes a different approach: it observes actual network traffic at the 
 | **GraphQL API Discovery** | Detects GraphQL endpoints, runs tiered introspection queries, and generates GraphQL SDL schemas |
 | **WSDL/SOAP Discovery** | Identifies SOAP services via SOAPAction headers and envelope detection; fetches and parses WSDL documents |
 | **gRPC API Discovery** | Classifies gRPC and gRPC-Web traffic via content-type, trailer headers, and path shape; enumerates services and methods through the Server Reflection Protocol — with reflection-off fallbacks (grpc-gateway/Envoy OpenAPI scrape and gRPC-Web JS-binding recovery) — and generates `.proto` schemas |
-| **API Type Auto-Detection** | Automatically determines API type (REST, GraphQL, WSDL) from captured traffic without manual selection. gRPC is opt-in via `--api-type grpc` — its binary HTTP/2 framing is not auto-detected |
+| **API Type Auto-Detection** | Automatically determines API type (REST, GraphQL, WSDL) from captured traffic without manual selection. Each request votes for one type only, and a non-REST type must beat the REST surface by a 1.5x margin to win. That keeps the verdict stable where mixed captures actually sit — near-equal counts, where the old rule flipped on a single request — but a threshold rule always has a boundary, so a capture sitting exactly at the margin can still change type on one observation. Generic `text/xml` is not treated as SOAP evidence on its own, so one XML document cannot type a whole capture as WSDL. gRPC is opt-in via `--api-type grpc` — its binary HTTP/2 framing is not auto-detected |
 | **Browser Crawling** | Two backends: headless mode drives Chrome via [go-rod](https://github.com/go-rod/rod) for full JavaScript/SPA support; non-headless mode uses a stdlib net/http engine (DFS, 150 rps, scope+SSRF redirect guard) for lightweight crawls. The headless backend uses a configured or **system Chrome** by default and does not download a browser from third-party mirrors unless explicitly opted in (supply-chain hardening); it also disables Chrome telemetry so crawl egress stays minimal |
-| **SPA Bundle Extraction** | Post-crawl pass that scans JavaScript bundles for API path strings and probes them with raw HTTP, recovering endpoints the headless browser could not exercise |
+| **SPA Bundle Extraction** | Post-crawl pass that scans JavaScript bundles for API path strings and probes them with raw HTTP, recovering endpoints the headless browser could not exercise. JavaScript bodies are kept in the capture even when the bundle is served from an out-of-scope asset host (a CDN, `assetPrefix`, a `static.` subdomain), since static analysis reads the capture and would otherwise see nothing for those deployments; the bundles themselves are never classified as endpoints |
+| **Next.js Route Recovery** | Recovers App Router routes from chunk URLs (`/_next/static/chunks/app/vaults/[vaultId]/page-<hash>.js` → `/vaults/{vaultId}`), including dynamic and catch-all segments. Works on React Server Components bundles, where request paths are built at runtime and no path literal exists in the body to extract. Recovered routes are reported under `-v` as near-misses (reason `next-route-chunk`); they are never emitted as spec operations, since the chunk URL does not reveal which HTTP verbs the route exports. The exclusion is structural — the classifier reports them as not-an-API rather than merely scoring them low — so it holds at any `--confidence` value |
 | **Static Form Extraction** | Statically parses `<form>` elements in captured HTML responses — including login, search, and admin forms — to surface submission endpoints and parameters that dynamic crawling may never trigger |
 | **Traffic Import** | Import existing captures from Burp Suite XML, HAR 1.2 files, and mitmproxy dumps |
-| **Active Probing** | OPTIONS discovery, JSON schema inference, WSDL document fetching, GraphQL introspection, and gRPC server reflection |
+| **Active Probing** | OPTIONS discovery, JSON schema inference, WSDL document fetching, GraphQL introspection, and gRPC server reflection. Every probe target is gated to the scan's own origin by default — a classified candidate whose URL doesn't share the scan target's scheme/host/port (e.g. an attacker-controlled absolute URL recovered from a JS bundle) is skipped rather than probed; internal-only, no CLI flag, same policy as SPA Bundle Extraction's cross-origin gate below |
 | **Path Normalization** | `/users/42` and `/users/87` become `/users/{id}` with known literal preservation (`/me`, `/self`) |
 | **SSRF Protection** | Blocks crawling and probing of private and loopback addresses by default. Pass `--dangerous-allow-private` to test internal targets (localhost, 127.0.0.1, RFC1918, link-local); the flag is required when the seed URL is itself a private host. |
-| **JS Bundle Static Analysis** | Statically analyses captured JavaScript bundles to recover API endpoints, path parameters, and request-body fields missed by dynamic crawling. Enabled by default via `--analyze-js`; sourcemap recovery is controlled by `--fetch-sourcemaps` (default: `true` for `scan`/`crawl`, `false` for `generate`). |
-| **Proxy Support** | Route crawl traffic through Burp Suite or other intercepting proxies on both crawler backends (headless Chrome and `--headless=false` net/http); http/https/socks5. Probe and JS-replay traffic is not proxied. |
+| **JS Bundle Static Analysis** | Statically analyses captured JavaScript bundles to recover API endpoints, path parameters, and request-body fields missed by dynamic crawling. Also reconstructs concat / `+`-chain / literal service-prefix forms (e.g. `"/api/posts/".concat(id, "/comment")`, `"identity/" + "api/auth/login"`) fully offline as unprobed candidates, with no network access required — non-literal operands become a numeric sentinel, parameterized downstream. Enabled by default via `--analyze-js`; sourcemap recovery is controlled by `--fetch-sourcemaps` (default: `true` for `scan`/`crawl`, `false` for `generate`). |
+| **Proxy Support** | Route traffic through Burp Suite or other intercepting proxies; http/https/socks5. Covers the crawl stage on both backends (headless Chrome and `--headless=false` net/http) plus the post-crawl active stages — probe (OPTIONS/schema/WSDL-fetch/GraphQL introspection/gRPC reflection), JS-replay, and jsstatic sourcemap fetches. socks5 always verifies TLS; `--proxy-insecure` (http/https only) accepts a MITM proxy's certificate. |
 | **Two-Stage Pipeline** | Capture once, generate many: separate capture and generation steps for maximum flexibility |
 
 ## How It Works
@@ -114,6 +116,35 @@ literals (identifiers, function calls, expressions) are replaced with a numeric
 placeholder, so `"/api/posts/".concat(id, "/comment")` becomes the probeable
 path `/api/posts/0/comment`, which the OpenAPI generator then parameterizes to
 `/api/posts/{postId}/comment`.
+
+These concat / `+`-chain / service-prefix paths are also recovered by a
+second, fully-offline static analysis pass (see "JS Bundle Static Analysis"
+above) that needs no reachable target at all — it emits them as unprobed
+candidates directly from the captured bundle bytes. Live JS-replay,
+described in this section, additionally re-fetches and probes those same
+reconstructions over HTTP, drops 404 decoys, and performs a speculative
+service-prefix fan-out that the offline pass deliberately omits (fan-out
+combinations are only safe once probed and 404-filtered). Live replay is
+additive, with one exception: a path the probe answers with a 404 is dropped
+as a decoy — other statuses (200, 204, 401/403, 302, ...) never refute an
+offline candidate. So pointing `generate` at a reachable target *can* yield
+slightly fewer endpoints than running fully offline.
+
+A 404 is the best signal available here, but it is not proof of absence.
+Returning 404 rather than 401/403 for a real-but-unauthorized resource is a
+widespread anti-enumeration convention, and a hostile target can fingerprint
+the probe's `User-Agent` and 404 everything to hide its API surface. Because
+an honest server also 404s a path that is genuinely absent, no additional
+probe can separate the two cases — telling them apart needs credentials, not
+another request. Every dropped path is therefore **named on stderr** along
+with both remedies: re-run with `--header` if the endpoint is auth-gated, or
+`--probe=false` to keep every offline candidate.
+
+> **Note:** a `capture.json` produced by a build predating this feature already
+> carries `static:js` entries, which makes `generate` skip the static pass
+> (the idempotency guard that keeps `crawl` → `generate` identical to `scan`).
+> Re-run the capture to recover concat/service-prefix endpoints from it.
+> Captures from `import` (Burp/HAR/mitmproxy) are unaffected.
 
 By default this step:
 
@@ -264,9 +295,9 @@ Vespasian classifies and generates specifications for four API types:
 3. **Path heuristics**: `/api/`, `/v1/`, `/v2/`, `/v3/`, `/rest/`, `/rpc/` paths boost confidence
 4. **HTTP method**: POST/PUT/PATCH/DELETE to non-page URLs
 5. **Response structure**: JSON object or array bodies (not HTML)
-6. **Request-side signal**: an API path plus a JSON/XML `Accept` (or request content-type) classifies the endpoint even when its response was not captured, so the REST-vs-not verdict does not depend on response timing
+6. **Request-side signal**: an explicit JSON/XML `Accept` (or request content-type) classifies the endpoint on any path, even when its response was not captured — so the REST-vs-not verdict does not depend on response timing and is not limited to hardcoded API paths. Browser navigation (`text/html`) and non-committal (`*/*`) requests are excluded to avoid over-classification
 
-The classification signals above are content-based and deterministic: identical input traffic yields the same endpoint set, the same classification, and a byte-identical spec every run. Run with `-v` to see the per-endpoint classification reason.
+The classification signals above are content-based and deterministic: identical input traffic yields the same endpoint set, the same classification, and a byte-identical spec every run. Run with `-v` to see the per-endpoint classification reason, including near-miss endpoints that fell just below the threshold and were not emitted (so `-v` explains a missing endpoint, not only a present one).
 
 ### GraphQL Classification Heuristics
 
@@ -330,17 +361,47 @@ vespasian scan <url> [flags]
   -H, --header       Auth headers to inject (repeatable)
   -o, --output       Output spec file (default: stdout)
   --depth            Max crawl depth (default: 3)
-  --max-pages        Max pages to visit — counts pages visited, not captured requests (default: 100)
+  --max-pages        Max pages to visit — counts pages visited, not captured requests (default: 100).
+                     URLs differing only in query string are separate pages, capped at 4 distinct
+                     query variants per path: ?page=2 and ?tab=billing routinely serve different
+                     content than the bare path, while a catalogue of ?id= values does not, so the
+                     cap admits the former without spending the budget on the latter.
+  --max-requests     Captured-request budget (0 = unlimited); a rate/politeness bound distinct
+                     from --max-pages. The crawl reserves a page's estimated request cost
+                     before starting it and reconciles against the actual count when it
+                     finishes, so the total does NOT scale with --concurrency. The estimate is
+                     the running mean of requests per page, so it adapts to the target; as the
+                     budget fills, fewer pages start concurrently. Overshoot is bounded by the
+                     page that crosses the limit, since in-flight pages are allowed to finish
+                     rather than being cut mid-capture. The budget may also be UNDER-spent: if
+                     the next page is not estimated to fit, it does not start.
+  --interact         Click buttons to surface interaction-only endpoints (headless only; off by
+                     default). It matches every <button>, [role=button], and [onclick] control,
+                     INCLUDING form submit buttons, so it submits forms and can mutate state.
+                     Controls whose label looks destructive, session-ending, or an irreversible
+                     commit (delete/logout/reset/pay/place order/...) are skipped, matched on
+                     visible text plus aria-label/title/value on the control and
+                     aria-label/title/alt on its descendants, so a labeled icon inside a button
+                     is not missed. A control whose label carries no word at all (an icon-only
+                     glyph) is treated as unreadable and skipped rather than clicked. That is a
+                     best-effort label match, not a guarantee — treat --interact as an active,
+                     state-changing option.
   --timeout          Maximum duration for the entire scan (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine
-  --proxy            Proxy URL for the crawl stage (e.g., http://127.0.0.1:8080); http/https/socks5.
-                     Routes crawl traffic on both backends; probe and JS-replay traffic is not proxied.
-                     TLS verification stays on by default. Private targets still require
-                     --dangerous-allow-private (proxy relaxes only the dial-time SSRF pin, not URL scope).
-  --proxy-insecure   Disable TLS certificate verification for an http/https intercepting proxy
-                     (Burp/mitmproxy MITM) on the net/http backend (--headless=false). Off by default;
-                     no effect on socks5 or the headless backend (trust the proxy CA via the OS store).
+  --proxy            Proxy URL (e.g., http://127.0.0.1:8080); http/https/socks5.
+                     Routes crawl, probe (OPTIONS/schema/WSDL-fetch/GraphQL introspection/gRPC
+                     reflection), JS-replay, and jsstatic sourcemap-fetch traffic through the proxy.
+                     TLS verification stays on by default (socks5 always verifies). Private targets still
+                     require --dangerous-allow-private (proxy relaxes only the dial-time SSRF pin, not URL scope).
+  --proxy-insecure   Disable TLS verification for the net/http stages routed through an http/https
+                     intercepting proxy (Burp/mitmproxy MITM): the crawl stage (only with
+                     --headless=false) plus — regardless of --headless — jsstatic sourcemap fetch,
+                     probe, WSDL discovery, and JS-replay. Off by default. No effect on socks5, on the
+                     gRPC target's certificate verification (governed solely by
+                     --grpc-insecure-skip-verify) — though for an https-scheme proxy --proxy-insecure
+                     DOES disable verification of the proxy's own certificate on that dial's CONNECT
+                     leg — or on the headless backend (trust the proxy CA via the OS store).
   --confidence       Min classification confidence (default: 0.5)
   --probe            Enable active probing (default: true)
   --deduplicate      Deduplicate endpoints before probing (default: true)
@@ -363,17 +424,44 @@ vespasian crawl <url> [flags]
   -H, --header       Auth headers to inject (repeatable)
   -o, --output       Capture output file (default: stdout)
   --depth            Max crawl depth (default: 3)
-  --max-pages        Max pages to visit — counts pages visited, not captured requests (default: 100)
+  --max-pages        Max pages to visit — counts pages visited, not captured requests (default: 100).
+                     URLs differing only in query string are separate pages, capped at 4 distinct
+                     query variants per path: ?page=2 and ?tab=billing routinely serve different
+                     content than the bare path, while a catalogue of ?id= values does not, so the
+                     cap admits the former without spending the budget on the latter.
+  --max-requests     Captured-request budget (0 = unlimited); a rate/politeness bound distinct
+                     from --max-pages. The crawl reserves a page's estimated request cost
+                     before starting it and reconciles against the actual count when it
+                     finishes, so the total does NOT scale with --concurrency. The estimate is
+                     the running mean of requests per page, so it adapts to the target; as the
+                     budget fills, fewer pages start concurrently. Overshoot is bounded by the
+                     page that crosses the limit, since in-flight pages are allowed to finish
+                     rather than being cut mid-capture. The budget may also be UNDER-spent: if
+                     the next page is not estimated to fit, it does not start.
+  --interact         Click buttons to surface interaction-only endpoints (headless only; off by
+                     default). It matches every <button>, [role=button], and [onclick] control,
+                     INCLUDING form submit buttons, so it submits forms and can mutate state.
+                     Controls whose label looks destructive, session-ending, or an irreversible
+                     commit (delete/logout/reset/pay/place order/...) are skipped, matched on
+                     visible text plus aria-label/title/value on the control and
+                     aria-label/title/alt on its descendants, so a labeled icon inside a button
+                     is not missed. A control whose label carries no word at all (an icon-only
+                     glyph) is treated as unreadable and skipped rather than clicked. That is a
+                     best-effort label match, not a guarantee — treat --interact as an active,
+                     state-changing option.
   --timeout          Maximum duration for the entire crawl (default: 10m)
   --scope            same-origin or same-domain (default: same-origin)
   --headless         Headless Chrome mode (default: true); --headless=false uses the stdlib net/http engine
-  --proxy            Proxy URL for the crawl stage (e.g., http://127.0.0.1:8080); http/https/socks5.
-                     Routes crawl traffic on both backends; probe and JS-replay traffic is not proxied.
-                     TLS verification stays on by default. Private targets still require
-                     --dangerous-allow-private (proxy relaxes only the dial-time SSRF pin, not URL scope).
-  --proxy-insecure   Disable TLS certificate verification for an http/https intercepting proxy
-                     (Burp/mitmproxy MITM) on the net/http backend (--headless=false). Off by default;
-                     no effect on socks5 or the headless backend (trust the proxy CA via the OS store).
+  --proxy            Proxy URL (e.g., http://127.0.0.1:8080); http/https/socks5.
+                     Routes crawl traffic on both backends plus jsstatic sourcemap fetches through the
+                     proxy (socks5 always verifies TLS). TLS verification stays on by default. Private
+                     targets still require --dangerous-allow-private (proxy relaxes only the dial-time
+                     SSRF pin, not URL scope).
+  --proxy-insecure   Disable TLS verification for the net/http stages routed through an http/https
+                     intercepting proxy (Burp/mitmproxy MITM): the crawl stage (only with
+                     --headless=false) plus jsstatic sourcemap fetch (regardless of --headless). Off
+                     by default. No effect on socks5 or the headless backend (trust the proxy CA via
+                     the OS store).
   --dangerous-allow-private  Disable SSRF protection for crawling, allowing
                      private/localhost targets (localhost, 127.0.0.1, RFC1918,
                      link-local). Required when the seed URL is a private
@@ -408,6 +496,17 @@ vespasian generate <api-type> <capture-file> [flags]
   --confidence       Min classification confidence (default: 0.5)
   --probe            Enable active probing (default: true)
   --deduplicate      Deduplicate endpoints before probing (default: true)
+  --proxy            Proxy URL (e.g., http://127.0.0.1:8080); http/https/socks5.
+                     Routes the probe (OPTIONS/schema/WSDL-fetch/GraphQL introspection/gRPC
+                     reflection), JS-replay, and jsstatic sourcemap-fetch traffic through the proxy.
+                     TLS verification stays on by default (socks5 always verifies). Private targets still
+                     require --dangerous-allow-private (proxy relaxes only the dial-time SSRF pin, not URL scope).
+  --proxy-insecure   Disable TLS verification for the net/http stages routed through an http/https
+                     intercepting proxy (Burp/mitmproxy MITM): probe, JS-replay, and jsstatic sourcemap
+                     fetch. Off by default. No effect on socks5 or on the gRPC target's certificate
+                     verification (governed solely by --grpc-insecure-skip-verify) — though for an
+                     https-scheme proxy --proxy-insecure DOES disable verification of the proxy's own
+                     certificate on that dial's CONNECT leg.
   --dangerous-allow-private  Disable SSRF protection on the probe path
                      (OPTIONS/schema/WSDL-fetch/GraphQL introspection) for
                      private/localhost targets. WARNING: Do not use on
@@ -486,7 +585,7 @@ When analyzing JavaScript bundles served by an attacker-controlled application, 
 
 ### Prerequisites
 
-- [Go 1.24+](https://go.dev/dl/)
+- [Go 1.27.0+](https://go.dev/dl/)
 - [golangci-lint](https://golangci-lint.run/welcome/install/)
 
 ### Build and Test
@@ -497,24 +596,24 @@ cd vespasian
 make build       # Build the binary to bin/vespasian
 make test        # Run tests with race detection
 make lint        # Run golangci-lint (gocritic, misspell, revive)
-make check       # Run all checks (fmt, vet, lint, test)
+make gosec       # Run gosec at the version CI pins (fetched via go run)
+make check       # Run all checks (fmt, vet, lint, lint-comments, gosec, test, check-docs)
 ```
 
 ```bash
 make coverage    # Generate coverage report
+make coverage-gate # Fail if total coverage is below the CI threshold (85%)
 make deps        # Download and tidy modules
 make clean       # Remove build artifacts
 ```
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/my-feature`)
-3. Commit your changes (`git commit -am 'Add my feature'`)
-4. Push to the branch (`git push origin feature/my-feature`)
-5. Open a Pull Request
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, project layout, how to add a classifier, generator, importer, or probe strategy, and the commit and pull request conventions.
 
-Please ensure all CI checks pass before requesting review.
+In short: fork the repository, create a feature branch, make sure `make check` passes, and open a Pull Request. Note that `make check` reformats as well as validates — it runs `gofmt -s -w .` first, so it may modify your working tree.
+
+This project is governed by our [Code of Conduct](CODE_OF_CONDUCT.md), and [GOVERNANCE.md](GOVERNANCE.md) lists the maintainers and how decisions are made. For questions and support, see [SUPPORT.md](SUPPORT.md). Security vulnerabilities should be reported per [SECURITY.md](SECURITY.md) rather than as public issues.
 
 ## License
 

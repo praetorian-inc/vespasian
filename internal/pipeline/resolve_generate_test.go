@@ -15,7 +15,10 @@
 package pipeline_test
 
 import (
+	"bytes"
 	"context"
+	"net/url"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -23,6 +26,7 @@ import (
 
 	"github.com/praetorian-inc/vespasian/internal/pipeline"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 )
 
 // TestResolveAndGenerate_AutoDetectsREST verifies that an empty APIType triggers
@@ -201,4 +205,101 @@ func TestResolveAndGenerate_UnknownTypeErrors(t *testing.T) {
 	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported API type")
+}
+
+// TestResolveAndGenerate_ForwardsProxy verifies that ScanOptions.Proxy is
+// forwarded both to ResolveWSDLType (the WSDL discovery fetch) and to
+// Options (the subsequent classify/probe/generate stage) — the recording
+// proxy must see traffic from both stages (LAB-4993).
+func TestResolveAndGenerate_ForwardsProxy(t *testing.T) {
+	ts := wsdlServer(t)
+
+	proxy, hits := newRecordingProxy(t, true)
+
+	proxyURL, err := url.Parse(proxy.URL)
+	require.NoError(t, err)
+
+	in := []crawl.ObservedRequest{
+		{Method: "GET", URL: ts.URL + "/", Response: crawl.ObservedResponse{StatusCode: 200}},
+	}
+
+	spec, apiType, foundWSDL, _, err := pipeline.ResolveAndGenerate(
+		context.Background(),
+		in,
+		pipeline.ScanOptions{
+			TargetURL:    ts.URL,
+			APIType:      pipeline.APITypeREST,
+			Confidence:   0.5,
+			Probe:        true,
+			Deduplicate:  true,
+			AllowPrivate: true,
+			Proxy:        httpx.ProxyConfig{URL: proxyURL},
+		},
+	)
+	require.NoError(t, err)
+	assert.True(t, foundWSDL, "valid WSDL document must be discovered through the proxy")
+	assert.Equal(t, pipeline.APITypeWSDL, apiType)
+	assert.NotEmpty(t, spec)
+
+	// The proxy must have seen traffic from BOTH the WSDL discovery fetch
+	// (ResolveWSDLType) and the subsequent probe stage (Options); either stage
+	// silently skipping the proxy would leave hits unexpectedly low, so this
+	// asserts more than one hit rather than merely non-zero.
+	assert.GreaterOrEqual(t, hits.Load(), int64(2),
+		"proxy must be forwarded to both ResolveWSDLType and the ClassifyProbeGenerate probe stage")
+}
+
+// TestResolveAndGenerate_ForwardsTargetURLAndWarningsToProbeGate pins TEST-002:
+// ResolveAndGenerate must forward ScanOptions.TargetURL and ScanOptions.Warnings
+// into the Options it builds for ClassifyProbeGenerate, because those two fields
+// are what the SEC-BE-001 probe-stage cross-origin gate runs on. This is the
+// `scan` command's path (cmd/vespasian/main.go calls ResolveAndGenerate with
+// ScanCmd.scanOptions), and it is a DIFFERENT call site from GenerateCmd.options()
+// — which is why the CLI-boundary tests in cmd/vespasian/main_test.go did not
+// cover it. Verified by mutation: deleting either forward in resolve_generate.go
+// previously left the whole repository green, so `scan --target-url` could have
+// silently stopped pinning the gate's origin, and the cross-origin skip warnings
+// could have gone silent, with no test noticing.
+//
+// The capture is the CDN-first / real-API-second shape used in
+// probe_origin_gate_test.go: the CDN entry occupies the "first request" slot that
+// crawl.ResolveTargetOrigin would fall back to, so pinning TargetURL to the API
+// host is the only thing that makes the API — and not the CDN — the probed origin.
+func TestResolveAndGenerate_ForwardsTargetURLAndWarningsToProbeGate(t *testing.T) {
+	api, apiHits := countingAPIServer(t)
+	cdn, cdnHits := thirdPartyAssetServer(t)
+
+	requests := []crawl.ObservedRequest{
+		apiRequest(cdn.URL + "/api/v1/analytics"),
+		apiRequest(api.URL + "/api/v1/accounts"),
+	}
+
+	var warnings bytes.Buffer
+	_, apiType, _, _, err := pipeline.ResolveAndGenerate(
+		context.Background(),
+		requests,
+		pipeline.ScanOptions{
+			APIType:      pipeline.APITypeREST,
+			Confidence:   0.5,
+			Probe:        true,
+			AllowPrivate: true, // loopback httptest servers must be dial-able
+			Deduplicate:  true,
+			TargetURL:    api.URL, // forwarded => gate pins the API origin
+			Warnings:     &warnings,
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, pipeline.APITypeREST, apiType)
+
+	// TargetURL forwarded: the pinned origin is probed, the other is not.
+	assert.Positive(t, atomic.LoadInt32(apiHits),
+		"ScanOptions.TargetURL must reach Options.TargetURL so the gate pins the API origin and probes it")
+	assert.Zero(t, atomic.LoadInt32(cdnHits),
+		"the non-pinned origin must be rejected by the cross-origin gate, not probed")
+
+	// Warnings forwarded: the skip warning reaches the caller's writer.
+	assert.Contains(t, warnings.String(), "skipping cross-origin candidates for",
+		"ScanOptions.Warnings must reach Options.Warnings so the cross-origin skip warning is visible")
+	assert.NotContains(t, warnings.String(), "--target-url not set",
+		"TargetURL pinned the origin, so the derived-origin warning must NOT fire")
 }

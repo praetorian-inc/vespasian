@@ -1,5 +1,5 @@
 {
-  "description": "Expected API paths from a live crawl of the REST API target. The crawler discovers GET endpoints via links on the index page and POST endpoints via JS fetch calls. Parameter names may vary (e.g., {userId} vs {id}).",
+  "description": "Expected API paths from a live crawl of the REST API target, two-stage: `vespasian crawl` then `vespasian generate rest --probe=false`. Consumed by test_rest_api in test/run-live-tests.sh, which generates from the NON-headless http capture (capture-false.json). GET endpoints are discovered via links on the index page; /api/subscribe is recovered by generate's analyze.ExtractForms augmentation from the static HTML <form> on the index page (LAB-3890 T2). Parameter names may vary (e.g., {userId} vs {id}); validate_path_coverage matches params positionally. PARTIAL LOCKSTEP WITH scan-expected-paths.json — the two fixtures are kept identical on the path SET, total_paths, post_form_paths, and post_form_body_fields_by_path (exactly the fields _assert_fixture_parity in test/validate_test.sh compares), so any endpoint added to or removed from the test/rest-api server MUST be applied to BOTH files or that assertion fails loudly. They DELIBERATELY DIVERGE on the per-path method lists for /api/login and /api/upload: here both are GET-only, in scan-expected-paths.json both are GET+POST. This is real generator behavior, not drift — test_rest_api generates from the non-headless http capture with `--probe=false`, so no JavaScript runs and no active probe fires: the inline `fetch('/api/login',{method:'POST'})` / `fetch('/api/upload',{method:'POST'})` literals are recovered statically as GET candidates (Source=static:js, floored to default confidence by RESTClassifier Rule 7) and the POST verb is never observed. test_scan_rest runs the single-stage headless `scan` with probing on, so the JS-fired POSTs ARE observed and both paths surface GET+POST there. /api/subscribe is POST in both files because it originates from the static <form> via ExtractForms, independent of JS execution. The method lists are intentionally NOT compared by _assert_fixture_parity, and validate_path_coverage reads path keys only, so this divergence is expected and asserted-around rather than enforced. Whoever changes the two-stage vs scan discovery behavior (e.g. adds a probe/discovery stage to one command, or removes it) should update these method lists and this note in both files to match.",
   "paths": {
     "/api/health": ["GET"],
     "/api/users": ["GET"],
@@ -9,9 +9,14 @@
     "/api/products/{id}": ["GET"],
     "/api/orders": ["GET"],
     "/api/orders/{id}": ["GET"],
-    "/api/login": ["POST"],
-    "/api/upload": ["POST"]
+    "/api/login": ["GET"],
+    "/api/upload": ["GET"],
+    "/api/subscribe": ["POST"]
   },
-  "total_paths": 10,
+  "total_paths": 11,
+  "post_form_paths": ["/api/subscribe"],
+  "post_form_body_fields_by_path": {
+    "/api/subscribe": ["email", "name"]
+  },
   "excluded_patterns": [".js", ".css", ".png", ".ico", ".svg", ".woff"]
 }

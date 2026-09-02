@@ -16,17 +16,26 @@ permissions:
   contents: read
 
 jobs:
-  # Fast, un-gated regression self-test for the preflight Chrome/Chromium
-  # detection logic (LAB-3893). Independent of the check-label gate, so it runs
-  # on every push/PR even when the full suite is skipped via 'skip-live-tests'.
+  # Fast, un-gated regression net: a syntax check plus all four guard suites —
+  # preflight Chrome/Chromium detection (LAB-3893), install-chrome.sh's
+  # non-privileged surface, setup-live-targets.sh's teardown/orphan-PID
+  # hardening (LAB-2893), and the target-group/dispatch drift guard (which also
+  # guards this job's own step list and the browser-target classification).
+  # Independent of the check-label gate, so it runs on every push/PR even when
+  # the full suite is skipped via 'skip-live-tests'.
   preflight-selftest:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      # Defense-in-depth (LAB-4732 / SEC-BE-002): monitor and record all
+      # Defense-in-depth (LAB-4732): monitor and record all
       # outbound network traffic. Audit mode is non-blocking — it logs egress
       # to the StepSecurity dashboard without enforcing an allowlist. Flip to
       # 'block' with an allowed-endpoints list once telemetry confirms the set.
+      # DUPLICATED across preflight-selftest / validator-regression / docs-check /
+      # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
+      # integration-tests / test. harden-runner is a SHA-pinned security control:
+      # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job
+      # on a stale pin.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -37,11 +46,796 @@ jobs:
         with:
           persist-credentials: false
 
+      # All four guard suites below are invoked by DIRECT EXEC, not via `bash`.
+      # They are committed 100755 and the repo tells operators to run them that
+      # way, so exec-ing them also verifies the mode bit survived the round trip;
+      # `bash <script>` silently works on a file that lost +x. One style for all
+      # four, so there is nothing to keep in sync.
       - name: Syntax check
-        run: bash -n test/setup-live-targets.sh
+        run: bash -n test/setup-live-targets.sh && bash -n test/install-chrome.sh && bash -n test/assert-chrome-install.sh && bash -n test/assert-devcontainer-lookpath.sh && bash -n .devcontainer/on-create.sh
+
+      # The guard suites again, on a PATH with yq removed. Every assertion block
+      # with a vacuity sentinel has to credit exactly the counted outcomes its
+      # other arm does not emit; get that wrong and the suite is green here and
+      # reports a misleading "assertion accounting drift" on a contributor's
+      # machine instead of the real cause. That class has recurred repeatedly on
+      # this repo (once live at merge, and again through the LAB-5766 review
+      # rounds). Most instances were found by executing this configuration rather
+      # than by reading — which is why it runs here. Two were found by other
+      # means, so this is the cheapest net, not the only one. CI ships yq, so
+      # nothing else in this workflow exercises those arms.
+      - name: test-runner-args.sh on a yq-less PATH (skip-credit accounting)
+        run: |
+          set -euo pipefail
+          noyq="$(mktemp -d)/bin"; mkdir -p "$noyq"
+          IFS=: read -ra dirs <<< "$PATH"
+          for d in "${dirs[@]}"; do
+            [ -d "$d" ] || continue
+            for f in "$d"/*; do
+              if [ ! -x "$f" ] || [ -d "$f" ]; then continue; fi
+              b=$(basename "$f")
+              if [ "$b" = yq ]; then continue; fi
+              if [ ! -e "$noyq/$b" ]; then ln -sf "$f" "$noyq/$b"; fi
+            done
+          done
+          if ! command -v yq >/dev/null 2>&1; then
+            echo "yq is absent from the normal PATH, so this check cannot tell the two arms apart" >&2; exit 1
+          fi
+          if PATH="$noyq" command -v yq >/dev/null 2>&1; then
+            echo "yq still resolves on the stripped PATH, so this check would be vacuous" >&2; exit 1
+          fi
+          # No trailing `|| true` here: this job's own guard rejects that pattern on
+          # a run line, and rightly — it is how a failing step gets neutered. The
+          # non-zero exit is expected (the suite fails without yq) and is captured
+          # deliberately, so the checks below can distinguish an honest failure from
+          # an accounting-drift one.
+          # The suite is EXPECTED to exit non-zero here (yq-gated assertions fail),
+          # so its status is captured rather than propagated. `if ...; then :; else :; fi`
+          # is deliberate and is NOT a disguised `|| true`: the checks below decide
+          # the step's outcome, and they fail it on anything other than the expected
+          # shape.
+          if out=$(PATH="$noyq" bash test/test-runner-args.sh 2>&1); then :; else :; fi
+          printf '%s\n' "$out"
+          # Anchored to the suite's actual drift line, not the bare phrase. The
+          # suite now also PRINTS that phrase inside an assertion message (the pin
+          # asserting this very step exists), so a loose grep would match its own
+          # subject. It happens not to collide today only because that pin is
+          # yq-gated and so does not emit on this run — which is exactly the kind
+          # of accident that stops being true after an unrelated edit.
+          if printf '%s\n' "$out" | grep -q '^test-runner-args: FAIL — assertion accounting drift'; then
+            echo "::error::the guard suite reports assertion accounting drift without yq — a vacuity sentinel arm credits the wrong number of outcomes, so a yq-less contributor is told the ledger is stale instead of the real cause" >&2
+            exit 1
+          fi
+          printf '%s\n' "$out" | grep -q '=== Summary ===' \
+            || { echo "::error::the guard suite did not reach its summary without yq — it died before reporting" >&2; exit 1; }
+          # The yq-gated arms must actually have been REACHED, or this step passes
+          # while proving nothing — a suite that never touched them looks identical
+          # to one whose credits are correct.
+          # Two wordings are yq-attributed: fail_no_yq()'s "yq is required", and the
+          # filter step's own "yq unavailable or the workflow is unparseable". Match
+          # both, or the honest run fails the equality check below by exactly one.
+          yqpat='yq is required|yq unavailable'
+          if ! printf '%s\n' "$out" | grep -qE "$yqpat"; then
+            echo "::error::the yq-less run produced no 'yq is required' diagnostic, so the yq-gated arms were never reached and this step asserted nothing" >&2
+            exit 1
+          fi
+          # And every failure must BE one of those arms. Checking only for drift let
+          # an unrelated regression through: with one assertion flipped to fail, the
+          # run showed 21 failures instead of the expected yq ones and this step
+          # still exited 0. MEASURED. Compare the failure count against the number
+          # of yq-attributed diagnostics.
+          fails=$(printf '%s\n' "$out" | sed -n 's/^  \([0-9]*\) passed, \([0-9]*\) failed.*/\2/p' | head -1)
+          yqfails=$(printf '%s\n' "$out" | grep -cE "^  FAIL:.*($yqpat)" || true)
+          if [ "${fails:-0}" -ne "${yqfails:-0}" ]; then
+            echo "::error::the yq-less run reported ${fails} failure(s) but only ${yqfails} are yq-attributed — the extra failure(s) are a real regression this step must not mask" >&2
+            exit 1
+          fi
 
       - name: Run preflight self-test
-        run: bash test/preflight-selftest.sh
+        run: ./test/preflight-selftest.sh
+
+      # install-chrome.sh's non-privileged surface: argument handling,
+      # architecture resolution, and the pinned signing-key fingerprint. The
+      # download / apt / privileged-mutation paths are deliberately not
+      # exercised — they need root, network, and destructive system changes.
+      - name: Run install-chrome self-test
+        run: ./test/install-chrome-selftest.sh
+
+      # Teardown / orphan-PID / port-exhaustion regressions (LAB-2893). Needs
+      # no Go, Node or Chrome — it spawns lightweight stand-ins — so it belongs
+      # in this un-gated job rather than the full live suite. Previously it ran
+      # in no job at all despite its header claiming otherwise.
+      - name: Run setup-live-targets self-test
+        run: ./test/setup-live-targets_test.sh
+
+      # Target-group/dispatch drift guard plus the offline-run and load_config
+      # allowlist guards. Moved here from the label-gated `test` job: it needs
+      # no Go, Node or Chrome, and leaving it gated meant a PR carrying
+      # 'skip-live-tests' skipped the very guards that catch silent coverage
+      # drift — exactly what they exist to prevent.
+      #
+      # This step also guards THIS job's own wiring: test-runner-args.sh asserts
+      # that each of the four suites above is still invoked here, so silently
+      # dropping one fails CI instead of quietly reducing coverage.
+      - name: Drift guard (target groups vs dispatch)
+        run: ./test/test-runner-args.sh
+
+  # Fast, un-gated regression test for the spec validators (PR #187 review,
+  # advisory finding). Proves the validators reject malformed specs (no grep
+  # false-pass); ~1s runtime, no Go build, no live services. Deliberately
+  # outside the check-label gate — same rationale as preflight-selftest above:
+  # applying 'skip-live-tests' must not also silently disable the regression
+  # net that catches the validators reverting to grep-equivalent behavior.
+  validator-regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # Defense-in-depth (LAB-4732): monitor and record all
+      # outbound network traffic. Audit mode is non-blocking — it logs egress
+      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
+      # 'block' with an allowed-endpoints list once telemetry confirms the set.
+      # DUPLICATED across preflight-selftest / validator-regression / docs-check /
+      # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
+      # integration-tests / test. harden-runner is a SHA-pinned security control:
+      # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job
+      # on a stale pin.
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        with:
+          egress-policy: audit
+          disable-sudo: true
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      # DUPLICATED across validator-regression / test: this setup-node (npm
+      # cache) plus the `npm ci --ignore-scripts` "Install spec validators" step
+      # below are kept byte-identical in both jobs — update BOTH copies in
+      # lockstep.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: test/spec-validators/package-lock.json
+
+      # --ignore-scripts prevents install/preinstall/postinstall
+      # lifecycle scripts from running under harden-runner's non-blocking
+      # audit-only egress policy. These validators are pure libraries with no
+      # install step, but this protects against a future lockfile refresh
+      # silently introducing one.
+      - name: Install spec validators
+        working-directory: test/spec-validators
+        run: npm ci --ignore-scripts
+
+      - name: Validator regression test
+        run: ./test/validate_test.sh
+
+
+  # Community-health docs guard (LAB-5870). Asserts the required docs exist, every
+  # relative markdown link and heading anchor resolves, and the CODEOWNERS '*' roster
+  # matches the GOVERNANCE.md maintainer table. LAB-5870 existed because GOVERNANCE.md
+  # and SUPPORT.md were absent from main for a week with nothing to notice; run against
+  # that commit this job fails on both files.
+  #
+  # Lives here rather than in ci.yml because ci.yml's paths filter is Go-only, so a
+  # docs-only PR never triggers it — the job that guards docs must not itself be gated
+  # on Go files changing. Outside the check-label gate for the same reason as
+  # preflight-selftest and validator-regression: 'skip-live-tests' must not disable it.
+  docs-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # Defense-in-depth (LAB-4732): monitor and record all
+      # outbound network traffic. Audit mode is non-blocking — it logs egress
+      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
+      # 'block' with an allowed-endpoints list once telemetry confirms the set.
+      # DUPLICATED across preflight-selftest / validator-regression / docs-check /
+      # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
+      # integration-tests / test. harden-runner is a SHA-pinned security control:
+      # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job
+      # on a stale pin.
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        with:
+          egress-policy: audit
+          disable-sudo: true
+
+      # fetch-depth 0 is NOT needed: the checker reads the working tree and uses
+      # `git ls-files`, which works on a shallow clone.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Check community-health docs
+        run: python3 test/check-docs.py --verbose
+
+  # End-to-end exercise of install-chrome.sh's PRIVILEGED path — the download,
+  # the signature-verified apt install, the trap teardown, and the AC4 cleanup
+  # that runs after the package's postinst. install-chrome-selftest.sh covers
+  # every rejection arm unprivileged but deliberately stops before the first
+  # $SUDO, so this region shipped with no automated coverage at all: a change
+  # that broke the actual install would pass every existing suite.
+  #
+  # Not run on every PR. It needs root, network egress to Google, and it mutates
+  # system state — all of which are fine here because the container is thrown
+  # away, but it is slow and externally-dependent, so it is opt-in via
+  # workflow_dispatch (and on push to main, where a break should not stay hidden).
+  install-chrome-e2e:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Restated at job level even though the workflow default already grants only
+    # `contents: read`. This job runs as root with live egress, so it is the one
+    # place a future widening of the workflow-level default must NOT reach. The
+    # block CONTAINS that widening; it does not report it. A job-level
+    # `permissions:` emits no signal when the default above it changes — the
+    # scope here simply stays narrow. Detecting the widening is a separate job
+    # for a workflow-shape guard, not something this block can do.
+    permissions:
+      contents: read
+    container:
+      # Digest-pinned like the SHA-pinned actions above: a mutable tag means the
+      # thing this job installs into can change under us between runs. Refresh
+      # deliberately.
+      image: ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea
+    # REQUIRED, not stylistic. For a CONTAINER job the runner does not default
+    # `run:` to bash — it uses `sh -e {0}` — so `set -euo pipefail` in an inline
+    # block dies on line 1 with "Illegal option -o pipefail" and exit 2, before
+    # a single assertion runs. MEASURED in run 32388761616, the first time this
+    # job ever executed: `Assert no phone-home artifacts survive` failed exactly
+    # there and `Re-run is idempotent` was skipped behind it. The two steps that
+    # invoke committed scripts were unaffected, because a `#!/usr/bin/env bash`
+    # shebang decides the interpreter regardless of the step shell — which is a
+    # second reason to keep assertions in scripts rather than inline here.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # No harden-runner here: it does not support running inside a container
+      # job. The egress this job makes (Google's apt repo) is the thing under
+      # test, and the container is disposable.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      # The image is bare: the installer needs apt metadata plus curl/gpg, and
+      # asserting their absence first is not the point of this job.
+      - name: Bootstrap the bare image
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends ca-certificates curl gnupg
+
+      # Runs as root, so SUDO resolves empty and every privileged branch is
+      # exercised directly.
+      - name: Install Chrome end-to-end
+        run: ./test/install-chrome.sh
+
+      # The assertions live in a committed script, not inline here: this job is
+      # opt-in, so a syntax error in an inline block would first surface on a
+      # push to main. As a file it is covered by the un-gated preflight-selftest
+      # job's `bash -n` list, which runs on every PR.
+      - name: Assert the install actually produced a runnable browser
+        run: ./test/assert-chrome-install.sh
+
+      # AC4, asserted against a real install rather than a fixture.
+      - name: Assert no phone-home artifacts survive
+        run: |
+          set -euo pipefail
+          fail=0
+          # KEEP IN LOCKSTEP with PHONE_HOME_PATHS + TMP_LIST/TMP_KEYRING/TMP_PREF
+          # in test/install-chrome.sh. The list is duplicated deliberately — an
+          # assertion that sourced the script under test would inherit the same
+          # blind spot as the script — but a duplicate drifts, and this one had
+          # already lost the deb822 source and the package's own keyring, the two
+          # paths the CURRENT package actually writes.
+          for p in /etc/apt/sources.list.d/google-chrome.list \
+                   /etc/apt/sources.list.d/google-chrome.sources \
+                   /etc/cron.daily/google-chrome \
+                   /usr/share/keyrings/google-chrome.gpg \
+                   /etc/apt/sources.list.d/google-chrome-vespasian-temp.list \
+                   /usr/share/keyrings/google-chrome-vespasian-temp.gpg \
+                   /etc/apt/preferences.d/google-chrome-vespasian-temp.pref; do
+            if [ -e "$p" ]; then echo "LEFTOVER: $p"; fail=1; fi
+          done
+          # `[ -s ]` passed on any non-empty byte, so a bare newline or
+          # a stale record from an earlier image layer satisfied it. Assert the
+          # record actually names the browser that was just installed, and that
+          # it landed at the mode the record is installed with — the fixture-level case v
+          # in install-chrome-selftest.sh already checks both, so the real
+          # install was being verified less specifically than the mock.
+          [ -s /usr/share/vespasian/chrome-version ] || { echo "missing version record"; fail=1; }
+          if [ -s /usr/share/vespasian/chrome-version ]; then
+            record=/usr/share/vespasian/chrome-version
+            . ./test/common.sh
+            bin=$(detect_chrome_binary) || { echo "detect_chrome_binary failed"; fail=1; bin=""; }
+            # Major version only: the record is written once at install time and
+            # the binary could legitimately be a later build by the time a
+            # re-run reads it, but the major cannot drift within one job.
+            #
+            # Compare the record's OWN first version number to the installed
+            # major, rather than substring-searching for it. `grep -qF 150`
+            # also matched "1150", "3150" and a date like "2026-08-11 150", so
+            # it passed on records that never named this build. An equality test
+            # on the extracted number has no anchoring subtlety at all — and
+            # `^` inside an ERE alternation group is not an anchor in GNU grep,
+            # so the obvious regex fix silently matched nothing.
+            if [ -n "${bin}" ]; then
+              major=$("${bin}" --version | grep -oE '[0-9]+' | head -1)
+              rec_major=$(grep -oE '[0-9]+' "$record" | head -1)
+              [ "$rec_major" = "$major" ] \
+                || { echo "version record names major '$rec_major', installed is '$major': $(cat "$record")"; fail=1; }
+            fi
+            mode=$(stat -c '%a' "$record")
+            [ "$mode" = "644" ] || { echo "version record mode is $mode, expected 644"; fail=1; }
+          fi
+          # Guarded: the `[ -s ]` check above already reports a missing record
+          # with a clear message and sets fail=1. An unguarded `cat` here then
+          # appended a raw "No such file or directory" to stderr, burying that
+          # diagnosis under a second, less informative error.
+          if [ -s /usr/share/vespasian/chrome-version ]; then
+            echo "recorded build: $(cat /usr/share/vespasian/chrome-version)"
+          else
+            echo "recorded build: (no version record written)"
+          fi
+          exit "$fail"
+
+      # Second run must take the idempotent early-exit path and stay clean.
+      - name: Re-run is idempotent
+        run: |
+          set -euo pipefail
+          # The explicit handler is what preserves $out on the failure path:
+          # under errexit a failing run aborts the step at the assignment, so
+          # the printf below never ran and the installer's own diagnostics —
+          # the only record of WHY the second run failed — were discarded.
+          out=$(./test/install-chrome.sh 2>&1) || {
+            printf '%s\n' "$out"
+            echo "second install-chrome.sh run failed" >&2
+            exit 1
+          }
+          printf '%s\n' "$out"
+          printf '%s' "$out" | grep -q "already present" \
+            || { echo "second run did not take the idempotent path"; exit 1; }
+
+  # Decides whether a PULL REQUEST touches the devcontainer image or anything it
+  # copies. GitHub Actions has no per-job `paths` filter and this workflow must
+  # run on every PR (the un-gated guard suites depend on that), so the filter has
+  # to be a job whose output the image job gates on.
+  #
+  # This exists because the image job used to run only on push-to-main and
+  # workflow_dispatch, which meant .devcontainer/ merged unverified and a broken
+  # image first surfaced on main — the branch that can least afford it. Scoped to
+  # the paths that can actually break the build, so an ordinary PR still pays
+  # nothing: the live egress to Google and the browser download only happen when
+  # the image or the installer it copies actually changed.
+  devcontainer-changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      # Only should-run is exported. An earlier revision also exported the raw
+      # `changed` filter result, which nothing consumed — a second surface a
+      # maintainer could reach for expecting "the image should build", and get
+      # subtly wrong behaviour, since `changed` alone omits the
+      # workflow_dispatch and push-to-main arms.
+      #
+      # The full run condition, computed ONCE. Both image jobs consume this
+      # instead of each restating the three-arm expression: duplicated gating is
+      # how the amd64 and arm64 legs would silently desynchronise, and unlike the
+      # harden-runner pin there is no lockstep comment or assertion that would
+      # notice. One producer, two consumers, nothing to keep in step.
+      should-run: ${{ steps.gate.outputs.run }}
+    steps:
+      # Defense-in-depth (LAB-4732): monitor and record all
+      # outbound network traffic. Audit mode is non-blocking — it logs egress
+      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
+      # 'block' with an allowed-endpoints list once telemetry confirms the set.
+      # DUPLICATED across preflight-selftest / validator-regression / docs-check /
+      # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
+      # integration-tests / test. harden-runner is a SHA-pinned security control:
+      # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job
+      # on a stale pin.
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        with:
+          egress-policy: audit
+          disable-sudo: true
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+          # Full history: the filter below diffs against the base branch, which a
+          # shallow clone cannot resolve a merge base for.
+          fetch-depth: 0
+
+      # Plain git, not a marketplace action. dorny/paths-filter is NOT on this
+      # org's Actions allowlist: a workflow referencing it fails at STARTUP, with
+      # no jobs, no annotations and no logs. Measured — a minimal workflow off
+      # main whose only non-standard action was dorny/paths-filter returned
+      # startup_failure, while the two docker/* actions in the arm64 leg returned
+      # success on the same probe. That is why live-tests.yml could not run at all
+      # between the first devcontainer commit and this one.
+      #
+      # WATCHED is the single source of truth for what makes the image job run;
+      # test/test-runner-args.sh asserts its contents.
+      - id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          # Only a pull_request needs a path decision; the other two arms of the
+          # gate below are unconditional.
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "devcontainer=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags origin "$BASE_REF"
+          # --no-renames is load-bearing. Rename detection is on by default
+          # (diff.renames has defaulted to true since git 2.9) and reports ONLY
+          # the destination of a rename, so moving a file OUT of a watched path
+          # emitted just the new path and the filter said false. MEASURED in a
+          # scratch repo: after `git mv .devcontainer/thing.sh docs/thing.sh`,
+          # --name-only printed only `docs/thing.sh` and the matcher returned
+          # devcontainer=false; with --no-renames it printed BOTH paths and the
+          # filter fired. A rename becomes a delete plus an add, which is what
+          # the matcher needs, and it costs nothing on a non-rename PR.
+          changed=$(git diff --no-renames --name-only "origin/${BASE_REF}...HEAD")
+          printf 'changed files:\n%s\n' "$changed"
+          WATCHED='.devcontainer/* .dockerignore .github/workflows/live-tests.yml go.mod test/install-chrome.sh test/common.sh test/assert-chrome-install.sh test/assert-devcontainer-lookpath.sh test/setup-live-targets.sh test/run-live-tests.sh'
+          hit=false
+          # read -r per line, NOT `for f in $changed`: the default IFS splits on
+          # space and tab too, so a tracked path containing either would be torn
+          # into fragments matching no pattern and the job would conclude the
+          # image needs no rebuild. Setting IFS=$'\n' globally is NOT the fix —
+          # it also stops `$WATCHED` (a space-separated list) from splitting, so
+          # every path stops matching. `IFS=` scoped to the read affects only the
+          # read; $WATCHED keeps the default IFS it needs.
+          # set -f is load-bearing. $WATCHED must stay unquoted so it word-splits,
+          # but unquoted also means PATHNAME EXPANSION, and this runs in a checkout
+          # where .devcontainer/ exists — so `.devcontainer/*` was being replaced by
+          # the files present on disk before it was ever used as a case pattern.
+          # MEASURED: it then matched .devcontainer/Dockerfile but NOT
+          # .devcontainer/nested/thing.sh, and not any .devcontainer file the PR
+          # DELETES, since a deleted path is absent from the working tree the glob
+          # expands against. A PR removing part of the devcontainer skipped the
+          # image rebuild. set -f keeps the patterns literal for `case` to match.
+          set -f
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            for pat in $WATCHED; do
+              # shellcheck disable=SC2254
+              case "$f" in $pat) hit=true; break 2 ;; esac
+            done
+          done <<< "$changed"
+          set +f
+          echo "devcontainer=$hit" >> "$GITHUB_OUTPUT"
+          echo "::notice::devcontainer paths changed: $hit"
+
+      # workflow_dispatch and push-to-main are unconditional, for the same reason
+      # install-chrome-e2e has them: live egress to Google and a browser download,
+      # against an image that changes far less often than the code. The
+      # pull_request arm is what stops .devcontainer/ merging unverified, and it
+      # is filtered so an ordinary PR still pays nothing.
+      # Context values come through env:, never interpolated into the shell body.
+      # `${{ }}` is substituted into the source BEFORE bash parses it, so a ref
+      # carrying $(...) would execute; the env: form removes the class outright.
+      - id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          FILTER: ${{ steps.filter.outputs.devcontainer }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$EVENT_NAME" == "push" && "$REF" == "refs/heads/main" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$EVENT_NAME" == "pull_request" && "$FILTER" == "true" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping the devcontainer image build — no watched path changed."
+          fi
+
+  # .devcontainer/Dockerfile is what closes LAB-5064's AC1; this job is the only
+  # thing that checks it still does. Nothing else in this repo builds a
+  # Dockerfile, so without it the wiring would rot invisibly and the ticket would
+  # be closed on an assertion nobody re-checks.
+  devcontainer-image:
+    needs: devcontainer-changes
+    # Gate computed once in devcontainer-changes; see the comment on its
+    # should-run output for the three arms and why each is there.
+    if: needs.devcontainer-changes.outputs.should-run == 'true'
+    runs-on: ubuntu-24.04
+    # 45, not 30. This job does strictly more than the `test` job (also 30): it
+    # builds an image from scratch, pulls a base image and a browser, and THEN
+    # runs the same live suite that job runs, plus two guard suites and the
+    # integration tests — all under a container runtime. The live step is the
+    # one that would be dropped under time pressure, and it is the only evidence
+    # AC3 has.
+    timeout-minutes: 45
+    env:
+      # One pin, referenced by every step below. It was six literals, which is
+      # the same lockstep hazard the harden-runner comment names — except this
+      # one had no comment and no guard, so a partial bump would have skewed
+      # `up` and `exec` against each other silently.
+      DEVCONTAINER_CLI: '@devcontainers/cli@0.88.0'
+    # Restated at job level for the reason install-chrome-e2e states it: this
+    # job pulls a base image and installs a browser from a third-party repo, so
+    # it is a place a future widening of the workflow-level default must not
+    # reach.
+    permissions:
+      contents: read
+    steps:
+      # Defense-in-depth (LAB-4732): monitor and record all
+      # outbound network traffic. Audit mode is non-blocking — it logs egress
+      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
+      # 'block' with an allowed-endpoints list once telemetry confirms the set.
+      # DUPLICATED across preflight-selftest / validator-regression / docs-check /
+      # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
+      # integration-tests / test. harden-runner is a SHA-pinned security control:
+      # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job
+      # on a stale pin.
+      #
+      # disable-sudo is NOT set here, unlike preflight-selftest: `docker build`
+      # on a GitHub runner reaches the daemon through the docker group, but the
+      # base image's own layers and the browser install run as root inside the
+      # build sandbox, and pinning that down is what the build is for.
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      # Built through devcontainer.json, not around it. A raw `docker build -f
+      # .devcontainer/Dockerfile . ` re-specifies the build by hand, so the file
+      # every developer's "Reopen in Container" actually consumes is never
+      # parsed: its "context": "..", its containerEnv, its runArgs and its
+      # remoteUser were all unasserted, and breaking any of them changed no
+      # signal in this repository. Driving the CLI means the thing under test is
+      # the thing developers run.
+      #
+      # The build log is captured because a successful build is AC4's only
+      # proof: `container=docker` on the Dockerfile's RUN is what makes
+      # install-chrome.sh take its in_container() branch, and that branch is the
+      # one that removes AND verifies-absent the package's phone-home artifacts.
+      # The marker below is emitted only on that arm — the non-container arm
+      # prints "No temporary apt artifacts left behind" instead — so grepping for
+      # it is what distinguishes "the audit ran and passed" from "the audit never
+      # ran".
+      - name: Build the devcontainer image (through devcontainer.json)
+        run: |
+          set -euo pipefail
+          # No --image-name: `up` below does not look an image up by tag, it
+          # rebuilds from the same config and hits Docker's layer cache. This
+          # step exists for the marker assertion, not to produce a named image.
+          npx --yes "$DEVCONTAINER_CLI" build \
+            --workspace-folder . \
+            --log-level info 2>&1 | tee /tmp/devcontainer-build.log
+          grep -qF 'No Google apt source, keyring, or update pinger left behind' /tmp/devcontainer-build.log \
+            || { echo "install-chrome.sh did not take its in_container() branch during the build — AC4's verify-absent pass never ran" >&2; exit 1; }
+
+      # `up` rather than `run`: this creates the container the way a developer
+      # gets it — containerEnv (VESPASIAN_NO_SANDBOX), runArgs (--shm-size=1g),
+      # remoteUser (vscode), and the onCreateCommand that installs the live
+      # suite's spec-validator deps. Every `devcontainer exec` below therefore
+      # runs as vscode with that environment, instead of as root with none of
+      # it, which is what the raw `docker run` steps used to do.
+      - name: Start the devcontainer
+        run: |
+          set -euo pipefail
+          npx --yes "$DEVCONTAINER_CLI" up --workspace-folder . 2>&1 | tee /tmp/devcontainer-up.log
+
+      # Applying devcontainer.json's settings is not the same as asserting them.
+      # The job was rebuilt around the file so containerEnv, runArgs, remoteUser
+      # and the onCreateCommand are exercised — but deleting `remoteUser` would
+      # make every exec below run as root and change no other signal, deleting
+      # containerEnv would change nothing observable, and an about:blank render
+      # would not notice --shm-size going away. So assert the environment the
+      # exec steps actually inherit, once, cheaply, before using it.
+      - name: Assert the container matches devcontainer.json
+        run: |
+          set -euo pipefail
+          npx --yes "$DEVCONTAINER_CLI" exec --workspace-folder . bash -c '
+            set -euo pipefail
+            [ "$(id -un)" = vscode ] || { echo "expected remoteUser vscode, got $(id -un)" >&2; exit 1; }
+            [ "${VESPASIAN_NO_SANDBOX:-}" = true ] || { echo "containerEnv VESPASIAN_NO_SANDBOX not applied" >&2; exit 1; }
+            shm=$(df -B1 --output=size /dev/shm | tail -1 | tr -d " ")
+            [ "$shm" -ge 1000000000 ] || { echo "runArgs --shm-size=1g not applied: /dev/shm is $shm bytes" >&2; exit 1; }
+            # The same check _ensure_spec_validators makes (test/validate.sh:57-62),
+            # and deliberately not `-d node_modules`: that is the weaker form the
+            # repo already rejected, because an interrupted npm ci or a pruned
+            # cache leaves node_modules present but unusable. It matters more
+            # here than anywhere else, because the devcontainers CLI does not
+            # surface a failing onCreateCommand as a non-zero exit from `up`
+            # (microsoft/vscode-remote-release#8906), so `set -euo pipefail` on
+            # the start step cannot catch it — this is the only thing that does.
+            for pkg in @apidevtools/swagger-parser graphql; do
+              [ -f "test/spec-validators/node_modules/$pkg/package.json" ] \
+                || { echo "onCreateCommand did not install the spec-validator deps: $pkg is missing or incomplete" >&2; exit 1; }
+            done
+            # The toolchain the image ships must satisfy go.mod, or every Go step
+            # in the container dies with "go.mod requires go >= X (running Y;
+            # GOTOOLCHAIN=local)" — a message that names the setting rather than
+            # the image, and reads as a knob to relax. That is exactly what
+            # happened here: the base tag ships Go 1.25.12 and main moved go.mod
+            # to 1.27.0. Derived from go.mod rather than pinned to a literal, so
+            # the next bump of the go directive fails HERE, naming both versions,
+            # instead of surfacing as an opaque toolchain error in a later step.
+            want=$(sed -n "s/^go //p" go.mod | head -1)
+            have=$(go version | sed -n "s/.*go\([0-9][0-9.]*\).*/\1/p")
+            [ -n "$want" ] && [ -n "$have" ] || { echo "could not read go.mod (got: $want) or go version (got: $have)" >&2; exit 1; }
+            oldest=$(printf "%s\n%s\n" "$want" "$have" | sort -V | head -1)
+            [ "$oldest" = "$want" ] || { echo "the image ships Go $have but go.mod requires >= $want; bump the Go layer in .devcontainer/Dockerfile" >&2; exit 1; }
+            echo "container matches devcontainer.json: user=vscode, VESPASIAN_NO_SANDBOX=true, /dev/shm=${shm}B, spec-validator deps present, go=${have} (go.mod wants >= ${want})"
+          '
+
+      # Reuses the committed assertion script rather than restating it: this is
+      # the same script install-chrome-e2e runs, so the two cannot disagree about
+      # what "a runnable browser" means.
+      - name: Assert the image ships a runnable browser
+        run: npx --yes "$DEVCONTAINER_CLI" exec --workspace-folder . bash test/assert-chrome-install.sh
+
+      # The Go side. Committed as a script for the reason its header gives: an
+      # inline block is not a file, so `bash -n` cannot see it and a syntax error
+      # in one first surfaces on main.
+      - name: Assert launcher.LookPath resolves and the browser launches
+        run: npx --yes "$DEVCONTAINER_CLI" exec --workspace-folder . bash test/assert-devcontainer-lookpath.sh
+
+      # The image is only useful if the suites the repo tells contributors to run
+      # actually run in it. Asserting the tool list in prose is what let the
+      # image ship without yq: test-runner-args.sh routes to fail() rather than
+      # skip() when yq is missing, so a yq-less image reported 8 failures from a
+      # suite CONTRIBUTING.md tells every contributor to run. These two suites
+      # exercise python3, yq and the spec-validator deps between them, so a
+      # missing prerequisite fails here instead of in a developer's terminal.
+      # Split one per suite: they are independent guards, so the step NAME in the
+      # Actions UI should say which one broke rather than making the reader open
+      # a shared log.
+      - name: Assert test-runner-args.sh runs in the image
+        run: npx --yes "$DEVCONTAINER_CLI" exec --workspace-folder . bash test/test-runner-args.sh
+
+      - name: Assert preflight-selftest.sh runs in the image
+        run: npx --yes "$DEVCONTAINER_CLI" exec --workspace-folder . bash test/preflight-selftest.sh
+
+      # LAB-5766 AC3 names this command specifically: `--group live` running
+      # rod-backed targets IN THIS CONTAINER. Nothing ran it in the image — the
+      # `test` job runs it on the bare runner against the runner's own Chrome,
+      # which proves nothing about this image. The two guards above are not
+      # substitutes: test-runner-args.sh is a dry-run structural check that
+      # starts no services, and preflight-selftest.sh sources
+      # setup-live-targets.sh under its BASH_SOURCE guard so main() never runs.
+      #
+      # This is the only step that exercises the whole chain the criterion
+      # describes: setup builds and starts the target services, then the live
+      # group drives real crawls through go-rod against them.
+      #
+      # The exit code alone is not enough. run-live-tests.sh only fails an
+      # all-skipped run when the WHOLE selection skipped (`total_pass -eq 0 &&
+      # total_skip -gt 0`), and LIVE_TARGETS mixes rod-backed targets with plain
+      # HTTP ones (scan-rest, edge-cases, crawl-depth, no-download are not in
+      # BROWSER_TARGETS). So if the browser stopped resolving inside the image,
+      # the HTTP targets would still pass, total_pass > 0, the gate would not
+      # fire, and this step would go green having proved nothing about AC3 —
+      # asserting that SOMETHING ran rather than that the rod-backed targets did.
+      # Capture the output and require the browser-driven rows by name.
+      - name: Assert the live suite runs in the image (AC3)
+        run: |
+          set -euo pipefail
+          out=$(npx --yes "$DEVCONTAINER_CLI" exec --workspace-folder . bash -c \
+            './test/setup-live-targets.sh && ./test/run-live-tests.sh --no-build --group live' 2>&1) || {
+            printf '%s\n' "$out"
+            echo "live suite failed inside the devcontainer image" >&2
+            exit 1
+          }
+          printf '%s\n' "$out"
+          # no-download is named by LAB-4999 and is rod-backed; concat-spa and
+          # forms-target are in BROWSER_TARGETS. Each must report PASS, not SKIP.
+          missing=""
+          for t in no-download concat-spa forms-target; do
+            # A herestring, NOT `printf ... | grep -q`. Under `set -o pipefail`,
+            # grep -q exits the instant it matches, closing the pipe; printf then
+            # takes SIGPIPE and the PIPELINE reports 141, which this `||` reads as
+            # "target absent" and turns into a failed AC3 — a false red on a green
+            # suite. It is a scheduling race between grep exiting and printf
+            # filling the pipe buffer, so it is intermittent rather than a clean
+            # size cutoff: MEASURED with GNU grep 3.11 (the version on the CI
+            # runner), an input whose first line matches returns 0 at 60 KB and
+            # 141 at 200 KB, and the same 200 KB input returns 0 with pipefail
+            # off while a file-based grep finds the match either way. The captured
+            # $out is ~28.8 KB today, so this is latent, and it grows with every
+            # target added. A herestring feeds grep from a temp file with no pipe
+            # and no writer to signal — verified 0 up to 2 MB, while a SKIPped
+            # target still correctly reports missing.
+            # One shape only. The suite never prints PASS before the target name:
+            # print_summary emits the target name and then the status on one row,
+            # with ANSI colour escapes interposed between them — which is why the
+            # pattern needs `.*` there rather than a fixed-width gap — and the
+            # per-target line is `log_ok "concat-spa: ALL CHECKS PASSED"`. The
+            # dropped `PASS.*name` alternative matched nothing real and could only
+            # false-positive off an unrelated line that mentions a target after the
+            # word PASS. The [^a-z-] boundaries are load-bearing and must stay:
+            # without them `concat-spa` is satisfied by a `concat-spa-two-stage` row.
+            grep -qE "(^|[^a-z-])${t}[^a-z-].*PASS" <<<"$out" \
+              || missing="${missing} ${t}"
+          done
+          if [ -n "$missing" ]; then
+            echo "AC3: these rod-backed targets did not report PASS:${missing}" >&2
+            echo "  A green run with these skipped means the image shipped no usable browser." >&2
+            exit 1
+          fi
+          echo "AC3: rod-backed targets (no-download, concat-spa, forms-target) reported PASS in the image"
+
+      # Always, so a failed live run still stops the target services rather than
+      # leaving them for the next job on this runner. Mirrors the `test` job's
+      # own teardown.
+      - name: Tear down live targets
+        if: always()
+        run: npx --yes "$DEVCONTAINER_CLI" exec --workspace-folder . bash test/setup-live-targets.sh --teardown
+
+  # Build-only arm64 leg. The Dockerfile's header, devcontainer.json's premise and
+  # the PR that added them all commit to arm64 working, and the base image index
+  # does carry linux/arm64 — but only linux/amd64 was ever built, so the claim
+  # rested on registry inspection rather than on a build. No run steps: QEMU
+  # emulation is too slow to drive a browser through, and the failure this guards
+  # against is the layer not building at all (an arch-specific apt resolution, or
+  # the yq pin's arm64 digest going stale).
+  devcontainer-image-arm64:
+    needs: devcontainer-changes
+    # Same gate as its amd64 sibling, and the same single producer — see
+    # devcontainer-changes' should-run output.
+    if: needs.devcontainer-changes.outputs.should-run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      # Defense-in-depth (LAB-4732): monitor and record all
+      # outbound network traffic. Audit mode is non-blocking — it logs egress
+      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
+      # 'block' with an allowed-endpoints list once telemetry confirms the set.
+      # DUPLICATED across preflight-selftest / validator-regression / docs-check /
+      # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
+      # integration-tests / test. harden-runner is a SHA-pinned security control:
+      # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job
+      # on a stale pin.
+      #
+      # This job needs it for the same reason its amd64 sibling does, and an
+      # earlier revision of this comment claimed the opposite ("it runs no repo
+      # code"), which was simply false: the build COPYs test/install-chrome.sh
+      # and RUNs it as root, reaching dl.google.com for the Chrome package and
+      # github.com for the pinned yq binary. Emulated or not, that is the same
+      # third-party egress executed as root, so dropping the monitoring here
+      # would have left the arch we understand LEAST the one we watch least.
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392  # v3.6.0
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435  # v3.11.1
+
+      # Same context the devcontainer build uses (repo root), for the same
+      # reason: the Dockerfile COPYs out of test/.
+      - name: Build the devcontainer image for linux/arm64
+        run: |
+          set -euo pipefail
+          docker buildx build --platform linux/arm64 \
+            -f .devcontainer/Dockerfile \
+            --progress=plain \
+            . 2>&1 | tee /tmp/devcontainer-arm64.log
+          grep -qF 'No Google apt source, keyring, or update pinger left behind' /tmp/devcontainer-arm64.log \
+            || { echo "arm64 build did not take install-chrome.sh's in_container() branch" >&2; exit 1; }
 
   # Gate: run by default; skip PR runs only when 'skip-live-tests' label is present.
   # Push-to-main and workflow_dispatch always run.
@@ -62,23 +856,49 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
-  # Runs all test targets in one job.  Target groups are defined in
-  # test/run-live-tests.sh (OFFLINE_TARGETS / LIVE_TARGETS); offline targets
-  # run first so a live-setup failure cannot mask deterministic coverage.
-  test:
+  # Integration-tagged Go tests (LAB-4678 review).
+  #
+  # Why this job exists: nothing anywhere passed `-tags=integration`. The Makefile's
+  # `test` target is `go test -race ./...` and no workflow set the tag, so 24 tests
+  # across 4 files had never executed in CI -- including
+  # TestCrawlerContract_ScopeConfinement and TestCrawlerContract_DepthLimit, the only
+  # end-to-end assertions of two crawl containment controls, and the LAB-4678 tests
+  # that pin the exact --max-pages count and assert --interact never clicks a
+  # destructive control. A regression in any of them merged green.
+  #
+  # It lives in this workflow rather than ci.yml because everything it needs is
+  # already here: the stable Chrome shipped with ubuntu-24.04, the Go toolchain, and
+  # the skip-live-tests label gate. ci.yml delegates to a shared reusable workflow
+  # that takes only build-* inputs and cannot pass a build tag.
+  #
+  # It is a SEPARATE job from `test` rather than a step inside it so a live-target
+  # setup failure and a browser-test failure are distinguishable at a glance, and so
+  # neither masks the other.
+  integration-tests:
     needs: check-label
     if: needs.check-label.outputs.should-run == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Measured at ~170s locally for the whole tagged suite. 15 minutes leaves room
+    # for a slower runner without letting a hung browser burn a full 30.
+    timeout-minutes: 15
     env:
+      # The runner's Chrome cannot use its sandbox in this container; browser.go
+      # honors this env var (see shouldDisableSandbox), matching the `test` job.
       VESPASIAN_NO_SANDBOX: "true"
+      # This runner is SUPPOSED to have a browser, so an unavailable Chrome is a
+      # failure here rather than a skip. Without it every rod row skips and this job
+      # reports green having executed none of the browser-only assertions it exists
+      # for — the diagnostic step below deliberately decides nothing, so nothing else
+      # would catch that (LAB-4678 review).
+      VESPASIAN_REQUIRE_CHROME: "1"
     steps:
-      # Defense-in-depth (LAB-4732 / SEC-BE-002): monitor and record all
-      # outbound network traffic. Audit mode is non-blocking — it logs egress
-      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
-      # 'block' with an allowed-endpoints list once telemetry confirms the set
-      # (expected: github.com, proxy.golang.org, sum.golang.org,
-      # storage.googleapis.com, objects.githubusercontent.com, registry.npmjs.org).
+      # Defense-in-depth (LAB-4732): monitor and record all
+      # outbound network traffic. Audit mode is non-blocking.
+      # DUPLICATED across preflight-selftest / validator-regression / docs-check /
+      # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
+      # integration-tests / test. harden-runner is a SHA-pinned security control:
+      # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job
+      # on a stale pin.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -89,30 +909,105 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Drift guard (target groups vs dispatch)
-        run: ./test/test-runner-args.sh
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5.5.0
+        with:
+          go-version-file: go.mod
+
+      # DIAGNOSTIC ONLY, never a gate. Records which browser the runner has so a
+      # launch failure below is immediately explicable. Deliberately does not decide
+      # anything: the authoritative resolution is launcher.LookPath() in the Go code
+      # (the headless backend pins a local Chrome and does not download one,
+      # LAB-4999), and the repo's canonical candidate list lives in
+      # test/setup-live-targets.sh. Duplicating that list here as a pass/fail check
+      # would create a second source of truth that can drift from both.
+      - name: Report available browser (diagnostic)
+        continue-on-error: true
+        run: |
+          for candidate in google-chrome google-chrome-stable chromium chromium-browser; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+              echo "$candidate: $("$candidate" --version 2>&1)"
+            fi
+          done
+
+      - name: Run integration-tagged tests
+        run: make test-integration
+
+  # Runs all test targets in one job.  Target groups are defined in
+  # test/run-live-tests.sh (OFFLINE_TARGETS / LIVE_TARGETS); offline targets
+  # run first so a live-setup failure cannot mask deterministic coverage.
+  test:
+    # preflight-selftest as well as check-label: the drift guard and the shell
+    # self-tests moved into that job, and they used to be the FIRST step of this
+    # one, where a failure stopped the 30-minute suite immediately. Depending on
+    # the job restores that fail-fast: there is no value in building Go, starting
+    # six services and crawling with a browser when the guards have already shown
+    # the target groups have drifted out of sync with the dispatch block.
+    #
+    # preflight-selftest needs no Go, Node or Chrome and finishes in well under a
+    # minute, so serializing on it costs far less than a wasted full run.
+    needs: [check-label, preflight-selftest]
+    if: needs.check-label.outputs.should-run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      VESPASIAN_NO_SANDBOX: "true"
+    steps:
+      # Defense-in-depth (LAB-4732): monitor and record all
+      # outbound network traffic. Audit mode is non-blocking — it logs egress
+      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
+      # 'block' with an allowed-endpoints list once telemetry confirms the set
+      # (expected: github.com, proxy.golang.org, sum.golang.org,
+      # storage.googleapis.com, objects.githubusercontent.com, registry.npmjs.org).
+      # DUPLICATED across preflight-selftest / validator-regression / docs-check /
+      # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
+      # integration-tests / test. harden-runner is a SHA-pinned security control:
+      # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job
+      # on a stale pin.
+      - name: Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        with:
+          egress-policy: audit
+          disable-sudo: true
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5.5.0
         with:
           go-version-file: go.mod
 
+      # DUPLICATED across validator-regression / test: this setup-node (npm
+      # cache) plus the `npm ci --ignore-scripts` "Install spec validators" step
+      # below are kept byte-identical in both jobs — update BOTH copies in
+      # lockstep.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: 20
+          cache: npm
+          cache-dependency-path: test/spec-validators/package-lock.json
+
+      # LAB-3890 T1: the offline generate-{rest,graphql,wsdl} targets validate
+      # output with real parsers (swagger-parser + graphql-js) instead of grep.
+      # Deps are hermetic once installed; the only egress is registry.npmjs.org
+      # (already in the anticipated harden-runner allowlist above).
+      # --ignore-scripts prevents install/preinstall/postinstall
+      # lifecycle scripts from running under harden-runner's non-blocking
+      # audit-only egress policy.
+      - name: Install spec validators
+        working-directory: test/spec-validators
+        run: npm ci --ignore-scripts
 
       - name: Build vespasian
         run: go build -o bin/vespasian ./cmd/vespasian
 
-      - name: Write stub config for offline tests
-        run: |
-          printf '%s\n' \
-            "REST_API_PORT=8990" \
-            "SOAP_SERVICE_PORT=8991" \
-            "GRAPHQL_SERVER_PORT=8992" \
-            "CONCAT_SPA_PORT=8993" \
-            "TARGETS_SETUP=" \
-            > test/.live-test-config
-
+      # No stub config is written before the offline run any more. LAB-5064 made
+      # run-live-tests.sh load .live-test-config only when a selected target
+      # actually talks to a live service, so the offline group needs none — and
+      # writing one here meant CI exercised the config-present path while the
+      # promise made to developers ("--group offline works on a fresh checkout")
+      # went untested on every run. The live group still gets a real config from
+      # the "Setup live targets" step below.
       - name: Run offline tests
         run: ./test/run-live-tests.sh --no-start --no-build --group offline
 

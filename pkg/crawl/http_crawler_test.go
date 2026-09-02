@@ -188,23 +188,18 @@ func TestNewHTTPClient_ProxySecureByDefault(t *testing.T) {
 	}
 }
 
-// TestHTTPCrawler_RoutesThroughProxy is an end-to-end check that the HTTP
-// backend sends its requests through the configured proxy. The proxy runs on
-// loopback, which the SSRF dial guard would reject — so a successful crawl
-// proves the guard is correctly skipped when --proxy is set (LAB-4011).
-func TestHTTPCrawler_RoutesThroughProxy(t *testing.T) {
-	// Origin server the proxy will forward to.
-	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprint(w, "<html><body>ok</body></html>")
-	}))
-	defer origin.Close()
-
-	// A minimal forwarding proxy on loopback. It records that it was used and
-	// proxies the (plain http) request to the origin.
-	var proxied atomic.Int64
+// newRecordingProxy starts a forwarding httptest proxy that increments a
+// counter for every request it forwards and copies the upstream response's
+// status code and body through (headers are not forwarded — neither current
+// caller needs them). Registers its own t.Cleanup, so callers don't need a
+// deferred stop. Shared by http_crawler_test.go and jsreplay_test.go
+// (TEST-007); mirrors internal/pipeline/pipeline_test.go's helper of the
+// same name.
+func newRecordingProxy(t *testing.T) (proxyURL *url.URL, hits *atomic.Int64) {
+	t.Helper()
+	hits = &atomic.Int64{}
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		proxied.Add(1)
+		hits.Add(1)
 		outReq, err := http.NewRequestWithContext(r.Context(), r.Method, r.RequestURI, nil) //nolint:gosec // test proxy forwards the received request URI
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -217,15 +212,36 @@ func TestHTTPCrawler_RoutesThroughProxy(t *testing.T) {
 		}
 		defer resp.Body.Close() //nolint:errcheck // test cleanup
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body) //nolint:gosec // test best-effort
+		_, _ = io.Copy(w, resp.Body) //nolint:errcheck,gosec // test proxy
 	}))
-	defer proxy.Close()
+	t.Cleanup(proxy.Close)
+
+	u, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatalf("parse proxy URL: %v", err)
+	}
+	return u, hits
+}
+
+// TestHTTPCrawler_RoutesThroughProxy is an end-to-end check that the HTTP
+// backend sends its requests through the configured proxy. The proxy runs on
+// loopback, which the SSRF dial guard would reject — so a successful crawl
+// proves the guard is correctly skipped when --proxy is set (LAB-4011).
+func TestHTTPCrawler_RoutesThroughProxy(t *testing.T) {
+	// Origin server the proxy will forward to.
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "<html><body>ok</body></html>")
+	}))
+	defer origin.Close()
+
+	proxyURL, hits := newRecordingProxy(t)
 
 	c := &HTTPCrawler{opts: CrawlerOptions{
 		Depth:    0,
 		MaxPages: 1,
 		Timeout:  10 * time.Second,
-		Proxy:    proxy.URL, // loopback proxy — blocked by ssrf dial guard unless skipped
+		Proxy:    proxyURL.String(), // loopback proxy — blocked by ssrf dial guard unless skipped
 		// AllowPrivate lets the loopback httptest origin pass the upfront scope
 		// check (which is independent of --proxy: proxy relaxes only the
 		// dial-time IP pin, not URL scope). The proxy branch is still exercised.
@@ -236,7 +252,7 @@ func TestHTTPCrawler_RoutesThroughProxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Crawl error = %v", err)
 	}
-	if proxied.Load() == 0 {
+	if hits.Load() == 0 {
 		t.Error("proxy was not used; request did not route through --proxy")
 	}
 	if len(results) == 0 {
@@ -793,5 +809,70 @@ func TestHTTPCrawler_SendsCustomHeaders(t *testing.T) {
 	mu.Unlock()
 	if got != "sentinel" {
 		t.Errorf("X-Test-Header = %q, want sentinel", got)
+	}
+}
+
+// TestHTTPCrawler_InteractWarns covers --interact on the net/http backend. That
+// backend has no DOM to click, so it ignores the option; saying nothing left an
+// operator who ran "--interact --headless=false" to conclude the target had no
+// interaction-only surface. Mirrors the concurrency-cap warning in newRodEngine.
+func TestHTTPCrawler_InteractWarns(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<html><body>ok</body></html>`)
+	}))
+	defer srv.Close()
+
+	run := func(interact bool) string {
+		var stderr bytes.Buffer
+		c := &HTTPCrawler{opts: CrawlerOptions{
+			Depth: 0, MaxPages: 1, Scope: "same-origin",
+			AllowPrivate: true, Interact: interact, Stderr: &stderr,
+		}}
+		if _, err := c.Crawl(context.Background(), srv.URL+"/"); err != nil {
+			t.Fatalf("Crawl(interact=%v): %v", interact, err)
+		}
+		return stderr.String()
+	}
+
+	if got := run(true); !strings.Contains(got, "--interact") || !strings.Contains(got, "headless") {
+		t.Errorf("--interact on the net/http backend produced no warning; stderr = %q", got)
+	}
+	if got := run(false); strings.Contains(got, "--interact") {
+		t.Errorf("warned about --interact when it was not requested; stderr = %q", got)
+	}
+}
+
+// TestHTTPCrawler_TransientFailureNotPersistedAsSeen is the end-to-end half of the
+// retry-on-resume fix. Checkpoint.Seen accumulates across resume cycles, so a page
+// that failed once (here: nothing listening, i.e. a connection refused standing in
+// for a DNS blip or a 503-shaped transport failure) would be treated as covered by
+// every future resumed run and never retried.
+func TestHTTPCrawler_TransientFailureNotPersistedAsSeen(t *testing.T) {
+	// A server that is up long enough to hand out a reachable URL, then closed —
+	// so the crawl's fetch fails at the transport level.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	target := srv.URL + "/"
+	srv.Close()
+
+	var got *Checkpoint
+	var stderr bytes.Buffer
+	c := &HTTPCrawler{opts: CrawlerOptions{
+		Depth: 1, MaxPages: 5, Scope: "same-origin", AllowPrivate: true,
+		Stderr:       &stderr,
+		OnCheckpoint: func(cp *Checkpoint) { got = cp },
+	}}
+	results, err := c.Crawl(context.Background(), target)
+	if err != nil {
+		t.Fatalf("Crawl: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected no captured requests against a closed server, got %d", len(results))
+	}
+	if got == nil {
+		t.Fatal("no checkpoint captured")
+	}
+	if len(got.Seen) != 0 {
+		t.Errorf("checkpoint seen-set = %v, want empty: a transient fetch failure must stay retryable on resume", got.Seen)
 	}
 }

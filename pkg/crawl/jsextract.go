@@ -19,6 +19,8 @@ import (
 
 	"github.com/BishopFox/jsluice"
 	"github.com/go-rod/rod"
+
+	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 )
 
 // jsExtractedURL is a jsluice endpoint with its metadata.
@@ -108,11 +110,11 @@ func extractURLsFromResponses(captured []ObservedRequest) []jsExtractedURL {
 	return results
 }
 
+// Delegates to mediatype.IsJavaScript so pkg/classify's static-asset exclusion and this
+// package's retention exemption test the same bytes; a second copy here let the scope
+// filter admit a media type the classifier did not reject (LAB-4678).
 func isJavaScriptContentType(ct string) bool {
-	return strings.Contains(ct, "javascript") ||
-		strings.Contains(ct, "ecmascript") ||
-		ct == "text/js" ||
-		ct == "application/x-js"
+	return mediatype.IsJavaScript(ct)
 }
 
 // jsExtractedToLinks resolves against base for the frontier, dropping static

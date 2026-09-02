@@ -24,6 +24,7 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/classify"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/praetorian-inc/vespasian/pkg/generate"
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 	"github.com/praetorian-inc/vespasian/pkg/probe"
 )
 
@@ -49,6 +50,24 @@ type Options struct {
 	// SSRF protection is still enforced by the dialer regardless.
 	GRPCInsecureSkipVerify bool
 
+	// TargetURL is the scan's intended target, used together with requests to
+	// derive the origin for the probe-stage cross-origin gate (SEC-BE-001) via
+	// crawl.ResolveTargetOrigin. Should be the same value handed to the
+	// JS-replay stage's JSReplayConfig.TargetURL so both stages agree on what
+	// "the target origin" means for this scan. If empty, the origin is
+	// derived from requests the same way JS-replay does.
+	TargetURL string
+
+	// AllowCrossOriginProbe disables the probe-stage cross-origin gate,
+	// permitting probe requests to targets whose origin does not match the
+	// origin resolved from TargetURL/requests. Internal-only — mirrors
+	// crawl.JSReplayConfig.AllowCrossOrigin: defaults to false and has no CLI
+	// flag. Enabling this lets a classified candidate (including a hostile
+	// JS-static literal promoted by classify Rule 7) direct probe traffic at
+	// an attacker-chosen public host; appropriate only for trusted
+	// multi-host/tenant scans.
+	AllowCrossOriginProbe bool
+
 	// MergeSlugs enables observation-based slug merging in REST path
 	// normalization. Ignored by the wsdl/graphql generators.
 	MergeSlugs bool
@@ -61,6 +80,20 @@ type Options struct {
 	// Status is an optional io.Writer for verbose status messages.
 	// Pass nil or io.Discard to suppress.
 	Status io.Writer
+
+	// Proxy routes probe traffic through an intercepting proxy when set. It is
+	// forwarded to probe.Config.Proxy. When enabled it takes precedence over the
+	// AllowPrivate permissive-client branch: the proxied client is built (via
+	// withDefaults), while AllowPrivate still relaxes only the URL-level validator.
+	Proxy httpx.ProxyConfig
+
+	// Warnings is an optional io.Writer for operator-facing warnings that
+	// must be visible regardless of --verbose: the SEC-BE-001 cross-origin
+	// probe-skip warning and the one-time "origin was derived, not chosen"
+	// warning. Mirrors crawl.JSReplayConfig.Stderr / AugmentOptions.WarnError
+	// — separate from Status so these are never accidentally silenced by a
+	// non-verbose CLI invocation. Pass nil to stay fully quiet (e.g. the SDK).
+	Warnings io.Writer
 }
 
 // ValidateSlugThreshold rejects a --slug-threshold < 2 when --merge-slugs is
@@ -99,36 +132,88 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 		classified = classify.Deduplicate(classified)
 	}
 
+	// Resolved once and shared by the probe-stage cross-origin gate below and
+	// the REST generator's servers/info.title derivation (SEC-BE-001/
+	// SEC-BE-002), so the two stages never independently derive "the target
+	// origin" and risk disagreeing. See crawl.ResolveTargetOrigin's doc
+	// comment.
+	targetOrigin := crawl.ResolveTargetOrigin(opts.TargetURL, requests)
+
 	writeStatus(opts.Status, "classified %d API requests (threshold=%.2f)\n", len(classified), opts.Confidence)
 	logClassificationReasons(opts.Status, classified)
+	logNearMisses(opts.Status, classifiers, requests, opts.Confidence)
 
 	if opts.Probe {
-		cfg := probe.DefaultConfig()
-		cfg.GRPCInsecureSkipVerify = opts.GRPCInsecureSkipVerify
-		if opts.AllowPrivate {
-			// allow-private disables ONLY SSRF protection (URLValidator +
-			// DialContext re-resolution). Clone probe's default transport and
-			// override just DialContext with a plain net.Dialer so every other
-			// default (TLS/idle timeouts, and any future proxy/CA settings) is
-			// preserved rather than dropped by a hand-rolled bare transport. The
-			// client otherwise mirrors probe's default client (CheckRedirect only).
-			cfg.URLValidator = func(string) error { return nil }
-			transport := probe.DefaultTransport()
-			transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, network, addr)
-			}
-			cfg.Client = &http.Client{
-				CheckRedirect: func(req *http.Request, via []*http.Request) error {
-					return http.ErrUseLastResponse
-				},
-				Transport: transport,
-			}
-			cfg.Dialer = func(ctx context.Context, network, addr string) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, network, addr)
-			}
+		cfg := buildProbeConfig(opts)
+
+		// Cross-origin probe gate (SEC-BE-001). Applied AFTER buildProbeConfig
+		// — and wrapping whatever validator is in place at this point, nil or
+		// the AllowPrivate no-op set inside buildProbeConfig — so --dangerous-allow-private
+		// disables SSRF checking only and never this gate. Without it, a
+		// hostile JS-static literal (e.g. fetch("https://attacker.example/api/x"))
+		// promoted by classify Rule 7's StaticJSConfidence floor reaches probe
+		// with no origin check at all; the same gap applies to any
+		// cross-origin candidate regardless of producer, since probe is the
+		// only unscoped egress path in the pipeline (crawl is scope-guarded,
+		// JS-replay is same-origin by default). See newCrossOriginValidator
+		// and warnDerivedProbeOrigin for the gate/warning construction.
+		//
+		// The unconditional parse-time gate (newFullURLValidator, SEC-BE-001)
+		// is wrapped here, BEFORE the AllowCrossOriginProbe branch below, for
+		// two load-bearing reasons -- see newFullURLValidator's and
+		// newCrossOriginValidator's own doc comments for the mechanics each
+		// summarizes below:
+		//
+		// 1. AllowCrossOriginProbe must disable only the cross-origin check,
+		// never this independent gate, and applying it here also puts it
+		// INSIDE the cross-origin wrapper rather than inside
+		// newCrossOriginValidator's same-origin arm: a same-origin candidate
+		// carrying embedded userinfo credentials must still reach it, even
+		// though crawl.SameOrigin (which ignores u.User) would let such a
+		// candidate through.
+		//
+		// 2. This wrap is also what resolves a nil cfg.URLValidator to
+		// probe.ValidateProbeURL before newCrossOriginValidator ever sees it,
+		// so that function no longer carries its own nil-base fallback.
+		// Swapping the two wraps below would therefore panic the first time a
+		// SAME-ORIGIN, parse-time-valid candidate is probed -- not for a
+		// cross-origin candidate, which the outer newCrossOriginValidator
+		// rejects in its own cross-origin arm, before base is ever consulted.
+		//
+		// Placed at the pipeline level (not composed into
+		// probe.ValidateProbeURL) because that function is also the exported
+		// default for pkg/probe, which pkg/sdk consumes directly; changing its
+		// behavior would affect every caller of pkg/probe -- a low-severity
+		// finding does not warrant that blast radius.
+		cfg.URLValidator = newFullURLValidator(cfg.URLValidator)
+
+		if !opts.AllowCrossOriginProbe {
+			// originIsDerived keys the (lazy) derived-origin warning on
+			// whether opts.TargetURL actually pinned targetOrigin
+			// (SEC-BE-002), not merely on opts.TargetURL being non-empty. A
+			// non-empty but un-canonicalizable TargetURL (e.g. "not a url",
+			// "://", a duplicated port, an IPv6 zone id) no longer falls
+			// through to a capture-derived origin: crawl.ResolveTargetOrigin
+			// fails closed and returns "" for it (see its doc comment). It
+			// still counts as "derived" here because crawl.SameOrigin("", "")
+			// is false -- SameOrigin requires a non-empty left-hand origin --
+			// so the operator still gets told why every candidate is being
+			// rejected. This call site forwards opts.TargetURL raw;
+			// newCrossOriginValidator derives "was a target pinned at all"
+			// from it at its single point of use, which is what distinguishes
+			// the two ""-origin messages (SEC-BE-003): a pinned-but-
+			// unresolvable target must not be reported as "not set". This one predicate
+			// covers "not set", "set but unusable", and the genuinely derived
+			// case. The warning itself is NOT emitted here -- it fires
+			// lazily, inside newCrossOriginValidator, only on the first
+			// candidate actually rejected as cross-origin (SEC-BE-001 nit
+			// review finding: emitting it here, unconditionally, printed
+			// "endpoints will be skipped" even on an all-same-origin capture
+			// where nothing ever was).
+			originIsDerived := !crawl.SameOrigin(opts.TargetURL, targetOrigin)
+			cfg.URLValidator = newCrossOriginValidator(cfg.URLValidator, targetOrigin, opts.TargetURL, originIsDerived, opts.Warnings)
 		}
+
 		// Pure grpc-gateway traffic is REST/JSON, so the gRPC classifier never
 		// marks it APIType=="grpc" and the gRPC/gateway probes (which only
 		// iterate grpc endpoints) get no targets. Seed one synthetic grpc
@@ -160,6 +245,7 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 	gen, err := generate.GetWithOptions(opts.APIType, generate.Options{
 		MergeSlugs:    opts.MergeSlugs,
 		SlugThreshold: opts.SlugThreshold,
+		TargetOrigin:  targetOrigin,
 	})
 	if err != nil {
 		return nil, err
@@ -171,4 +257,49 @@ func ClassifyProbeGenerate(ctx context.Context, requests []crawl.ObservedRequest
 	}
 
 	return spec, nil
+}
+
+// buildProbeConfig assembles the probe.Config for ClassifyProbeGenerate's probe
+// stage, keeping the (AllowPrivate × Proxy) client/dialer posture out of the
+// orchestration flow. Precedence: a configured proxy wins over the AllowPrivate
+// permissive-client branch — when proxied, cfg.Client/cfg.Dialer are left nil so
+// probe.withDefaults builds the proxied client (proxy transport) and dialGRPC
+// uses the proxy dialer, while AllowPrivate only relaxes the URL validator.
+func buildProbeConfig(opts Options) probe.Config {
+	cfg := probe.DefaultConfig()
+	cfg.GRPCInsecureSkipVerify = opts.GRPCInsecureSkipVerify
+	cfg.Proxy = opts.Proxy
+	if !opts.AllowPrivate {
+		return cfg
+	}
+
+	// allow-private disables ONLY SSRF protection (the URL-level validator, and
+	// — absent a proxy — the DialContext re-resolution).
+	cfg.URLValidator = func(string) error { return nil }
+	if opts.Proxy.Enabled() {
+		// Proxied: the proxied client (built by probe.withDefaults) wins, so
+		// leave cfg.Client/cfg.Dialer nil — AllowPrivate above only relaxed the
+		// URL validator.
+		return cfg
+	}
+
+	// No proxy: clone probe's default transport and override just DialContext
+	// with a plain net.Dialer so every other default (TLS/idle timeouts, and any
+	// future CA settings) is preserved rather than dropped by a hand-rolled bare
+	// transport. The client otherwise mirrors probe's default client
+	// (CheckRedirect only).
+	transport := probe.DefaultTransport()
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, network, addr)
+	}
+	cfg.Client = &http.Client{
+		CheckRedirect: httpx.NoFollowRedirects,
+		Transport:     transport,
+	}
+	cfg.Dialer = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, network, addr)
+	}
+	return cfg
 }

@@ -84,12 +84,54 @@ func TestLogClassificationReasons_EmptyReason(t *testing.T) {
 	}
 }
 
+// TestLogClassificationReasons_SwitchArmsRenderExpectedValue pins each arm of
+// logClassificationReasons' path-rendering switch to the EXACT value it should
+// print. Both non-default arms were previously unpinned: replacing arm 1's
+// guard with `case false:` (so paths render as origins) and reducing arm 2 to
+// u.Hostname() (dropping the port) each survived the whole suite, because the
+// only coverage asserted a substring the leaky forms also satisfied.
+func TestLogClassificationReasons_SwitchArmsRenderExpectedValue(t *testing.T) {
+	for _, tc := range []struct {
+		name, rawURL, want, mustNotContain string
+	}{
+		// Arm 1: a path is present, so print the path -- NOT the origin.
+		// mustNotContain pins that it does NOT fall through to the origin form.
+		{
+			"path arm prints the path",
+			"https://api.example.com:8443/api/v1/users", "/api/v1/users",
+			"https://api.example.com:8443/api/v1/users",
+		},
+		// Arm 2: pathless, so print scheme://host INCLUDING the port (which
+		// u.Hostname() would silently drop) and WITHOUT the query. The
+		// query-drop is what makes deleting the arm visible: without it the
+		// value falls through to crawl.RedactURL, which returns the URL with
+		// its query intact, and a bare Contains(want) still passed (mutant M9).
+		{
+			"host arm keeps the port and drops the query",
+			"https://api.example.com:8443?x=1", "https://api.example.com:8443",
+			"?x=1",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logClassificationReasons(&buf, []classify.ClassifiedRequest{
+				cr("GET", tc.rawURL, "rest", "path-heuristic", 0.6),
+			})
+			out := buf.String()
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("expected rendered value %q, got: %q", tc.want, out)
+			}
+			if strings.Contains(out, tc.mustNotContain) {
+				t.Errorf("arm rendered %q, which it must not: %q", tc.mustNotContain, out)
+			}
+		})
+	}
+}
+
 // TestLogClassificationReasons_UnparseablePathFallback verifies that a URL with
-// no parseable path falls back to printing the full URL instead of an empty
-// path field.
+// no parseable path falls back to the origin rather than an empty path field.
 func TestLogClassificationReasons_UnparseablePathFallback(t *testing.T) {
-	// A URL with no path component (Path == "") triggers the fallback to the
-	// full URL string.
+	// A URL with no path component (Path == "") triggers the origin fallback.
 	const rawURL = "https://api.example.com"
 	var buf bytes.Buffer
 	logClassificationReasons(&buf, []classify.ClassifiedRequest{
@@ -132,6 +174,180 @@ func TestLogClassificationReasons_SanitizesTerminalEscapes(t *testing.T) {
 	}
 }
 
+// TestLogNearMisses_DedupsByEndpoint verifies near-miss output collapses to one
+// line per endpoint (method+path), matching how the classified half is
+// deduplicated, so repeated below-threshold traffic cannot bury the signal.
+//
+// Scope of what this pins: query-only variants of one endpoint collapse. It does
+// NOT distinguish endpoint-level from line-level dedup, because it cannot today —
+// the near-miss band is [NearMissFloor, threshold) and the only REST confidence
+// in that band is PathHeuristicBoost (0.15; the others are 0.6/0.7/0.8/0.85), so
+// every near-miss for a given method+path renders an identical line either way.
+// The key is endpoint identity so it stays correct if a future signal lands in
+// the band with a different score.
+func TestLogNearMisses_DedupsByEndpoint(t *testing.T) {
+	var buf bytes.Buffer
+	classifiers := []classify.APIClassifier{&classify.RESTClassifier{}}
+	// Three query-only variants of one endpoint, plus a second distinct endpoint.
+	requests := []crawl.ObservedRequest{
+		{Method: "GET", URL: "https://example.com/api/thing"},
+		{Method: "GET", URL: "https://example.com/api/thing?page=1"},
+		{Method: "GET", URL: "https://example.com/api/thing?page=2"},
+		{Method: "GET", URL: "https://example.com/api/other"},
+	}
+	logNearMisses(&buf, classifiers, requests, classify.DefaultConfidenceThreshold)
+
+	out := buf.String()
+	if out == "" {
+		t.Fatal("expected near-miss output")
+	}
+	// One header line plus one line per distinct endpoint (/api/thing, /api/other).
+	body := strings.Split(strings.TrimRight(out, "\n"), "\n")[1:]
+	if len(body) != 2 {
+		t.Errorf("got %d near-miss lines, want 2 (one per endpoint):\n%s", len(body), out)
+	}
+	var thing int
+	for _, ln := range body {
+		if strings.Contains(ln, "/api/thing") {
+			thing++
+		}
+	}
+	if thing != 1 {
+		t.Errorf("endpoint /api/thing produced %d lines, want 1:\n%s", thing, out)
+	}
+}
+
+// TestLogNearMisses_SanitizesTerminalEscapes verifies the near-miss -v output
+// neutralizes control bytes too. Near-miss lines render the same untrusted
+// crawled path as the classified lines, so both share classificationLine and
+// the near-miss path must not become a second, unsanitized route to the
+// operator's terminal (SEC-BE-001, extended to the Phase 1 near-miss output).
+func TestLogNearMisses_SanitizesTerminalEscapes(t *testing.T) {
+	var buf bytes.Buffer
+	classifiers := []classify.APIClassifier{&classify.RESTClassifier{}}
+	// A GET on an api-like path with no captured response and no API Accept
+	// header scores the path boost alone (0.15) — inside the near-miss band
+	// [NearMissFloor, threshold), so it is dropped from the spec but logged.
+	//
+	// The control bytes are percent-encoded, which is how they actually reach
+	// this code: url.Parse REJECTS raw ASCII control characters outright (so a
+	// raw-byte URL would never classify at all), but percent-DECODES %1b/%0a
+	// into raw ESC and newline in u.Path — the decoded form classificationLine
+	// must neutralize.
+	requests := []crawl.ObservedRequest{
+		{Method: "GET", URL: "https://example.com/api/%1b[2J%0aitems"},
+	}
+	logNearMisses(&buf, classifiers, requests, classify.DefaultConfidenceThreshold)
+
+	out := buf.String()
+	if out == "" {
+		t.Fatal("expected a near-miss line for a path-boost-only api-path GET")
+	}
+	if strings.ContainsRune(out, '\x1b') {
+		t.Errorf("raw ESC byte reached terminal output: %q", out)
+	}
+	if !strings.Contains(out, `\x1b`) {
+		t.Errorf("control byte should be escaped as \\x1b: %q", out)
+	}
+	// One header line plus one endpoint line; the path's embedded newline must
+	// not split the record into a third.
+	if got := strings.Count(strings.TrimRight(out, "\n"), "\n"); got != 1 {
+		t.Errorf("path newline was not neutralized (log-splitting), %d line breaks: %q", got, out)
+	}
+}
+
+// TestLogClassificationReasons_RedactsUserinfo pins that no URL shape carrying
+// embedded userinfo reaches the -v Status output with its credential intact.
+//
+// The redaction is delegated to crawl.RedactURL (a pass-through to
+// redactSeedURL, already tested in pkg/crawl), which FAILS CLOSED: whenever it
+// cannot prove the result is credential-free it emits a placeholder rather than
+// attempting to strip. Three hand-rolled strip attempts in this PR each shipped
+// a new reachable defect -- concealing the origin, missing '?'/'#' as authority
+// terminators, and leaking the opaque form where url.Parse leaves credentials in
+// u.Opaque with u.User nil -- which is why the local helper was removed in
+// favor of the reviewed one.
+//
+// Consequence worth naming: for a URL whose '@' is in the path rather than the
+// userinfo, RedactURL cannot cheaply tell the two apart and emits the
+// placeholder, and the operator loses host/path context. Note this applies only
+// where RedactURL is reached at all: a '@' in the path of an otherwise VALID URL
+// takes the u.Path arm and is printed verbatim ("/x@/api/v1/users"), so the
+// context loss is confined to the opaque and parse-error shapes. That is a
+// deliberate, documented false positive (see redactSeedURL's doc comment) and a
+// strictly better failure mode than the alternative this PR shipped twice:
+// silently rendering a truncated path that READ as legitimate while the
+// attacker-controlled origin had been discarded.
+//
+// NOTE for alert triage: titus/kingfisher reports "Credentials in a URL"
+// against the rawURL fixtures in the table below (e.g. code-scanning alert 112
+// against the `http://user:pass@example.com` row). Every one is a synthetic
+// `user:pass` against example.com or a syntactically invalid host, no host is
+// ever dialed -- these rows never leave logClassificationReasons, which writes
+// to an in-memory buffer here -- and the credential IS the input under test:
+// this table exists precisely to prove a userinfo-bearing URL never renders its
+// credential. Removing or masking the userinfo would delete the test's subject,
+// and building the string from concatenated parts to slip past the scanner
+// would hide the fixture from readers while defeating a control the repository
+// relies on. The values are therefore retained deliberately; the alerts are
+// expected and should be dismissed as used-in-tests.
+//
+// (Deliberately not enumerating the host forms: two prior attempts at that list
+// were both wrong, once naming a loopback row that does not exist and once a
+// .test domain no fixture uses.)
+func TestLogClassificationReasons_RedactsUserinfo(t *testing.T) {
+	const placeholder = "<URL with userinfo redacted>"
+	for _, tc := range []struct{ name, rawURL, want string }{
+		// NOTE: this row does NOT reach crawl.RedactURL. It parses cleanly with
+		// a host and no path, so it takes the switch's u.Host arm, which builds
+		// scheme://u.Host directly (u.Host excludes userinfo). Kept here because
+		// it is the one userinfo-bearing shape that still renders a real value
+		// rather than the placeholder -- useful contrast -- but the arm itself is
+		// pinned by TestLogClassificationReasons_SwitchArmsRenderExpectedValue,
+		// not by this row. Verified: mutating `u.User = nil` out of redactSeedURL
+		// is caught by the authority-only row below, not by this one.
+		{"host arm renders the origin (not via RedactURL)", "http://user:pass@example.com", "http://example.com"},
+		// Authority-only userinfo.
+		// Go's URL.String() omits the "//" once u.User is nil and Host is
+		// empty, so this renders as "http:" -- credential-free.
+		{"authority-only userinfo", "http://user:pass@", "http:"},
+		// Opaque: credentials live in u.Opaque, u.User is nil -> fail closed.
+		{"opaque form fails closed", "weird:user:pass@first@final.example.com/api/x", placeholder},
+		// Opaque with a "//" later in the PATH -- the shape my authority-scoped
+		// helper leaked verbatim.
+		{"opaque with // in path fails closed", "https:user:pass@example.com//api/x", placeholder},
+		// url.Parse error (invalid port) + "@" -> fail closed.
+		{"parse error with userinfo fails closed", "http://user:pass@host:8o8/pkg.Svc/Method", placeholder},
+		// A '@' in the PATH, indistinguishable from userinfo, so fail closed.
+		// Reaches RedactURL via the url.Parse-ERROR branch (the ":8o8" port is
+		// invalid), NOT the default arm -- both entry points are covered, this
+		// row being one of the two error-branch cases. Deliberate false
+		// positive -- reached here only because the invalid port forces a parse
+		// error; the same path-'@' in a valid URL prints verbatim via arm 1.
+		// The operator loses host/path context, but the origin is
+		// never CONCEALED behind a plausible-looking path, which is the
+		// regression this replaces.
+		{"path @ fails closed rather than concealing the origin",
+			"http://evil.attacker.example:8o8/x@/api/v1/users", placeholder},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logClassificationReasons(&buf, []classify.ClassifiedRequest{
+				cr("POST", tc.rawURL, "grpc", "content-type", 0.95),
+			})
+			out := buf.String()
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("expected %q in output, got: %q", tc.want, out)
+			}
+			for _, cred := range []string{"user:pass", "u:p@", "user%3Apass"} {
+				if strings.Contains(out, cred) {
+					t.Errorf("credential %q leaked: %q", cred, out)
+				}
+			}
+		})
+	}
+}
+
 // TestLogClassificationReasons_NoOutput verifies the no-op guards: a nil writer
 // must not panic, and an empty slice produces no output.
 func TestLogClassificationReasons_NoOutput(t *testing.T) {
@@ -145,5 +361,38 @@ func TestLogClassificationReasons_NoOutput(t *testing.T) {
 	logClassificationReasons(&buf, nil)
 	if buf.Len() != 0 {
 		t.Errorf("empty input should produce no output, got: %q", buf.String())
+	}
+}
+
+// TestLogNearMisses_ReportsRecoveredNextRoutes is the end-to-end half of the
+// Next.js reporting fix. README.md, AGENTS.md and pkg/analyze/jsstatic/doc.go all
+// state that routes recovered from App Router chunk URLs are surfaced under -v.
+// Asserting the classifier's confidence band is not enough — logNearMisses applies
+// its own floor, so the claim is only true if the route actually reaches this
+// output. It did not: a page route scored 0, below classify.NearMissFloor, so it
+// was filtered out here and the feature produced nothing an operator could see.
+//
+// /vaults/{vaultId} is the case the README leads with. The braces arrive
+// percent-encoded because jsstatic resolves the route through
+// url.ResolveReference, which is the form that actually reaches this code.
+func TestLogNearMisses_ReportsRecoveredNextRoutes(t *testing.T) {
+	var buf bytes.Buffer
+	classifiers := []classify.APIClassifier{&classify.RESTClassifier{}}
+	requests := []crawl.ObservedRequest{
+		{Method: "GET", URL: "https://app.test/vaults/%7BvaultId%7D", Source: crawl.SourceNextPageRoute},
+		{Method: "GET", URL: "https://app.test/api/files", Source: crawl.SourceNextRouteHandler},
+	}
+	logNearMisses(&buf, classifiers, requests, classify.DefaultConfidenceThreshold)
+
+	out := buf.String()
+	for _, want := range []string{"/vaults/{vaultId}", "/api/files"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("recovered route %q is not reported under -v, so the Next.js "+
+				"recovery feature has no observable output for it.\ngot:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, "next-route-chunk") {
+		t.Errorf("the -v line must name chunk-URL provenance as the reason, so an "+
+			"operator can tell a recovered route from a genuine weak-signal endpoint.\ngot:\n%s", out)
 	}
 }

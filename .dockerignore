@@ -1,0 +1,68 @@
+# Build context exclusions for the REPO ROOT build context.
+#
+# Scoped to the context, not to a named Dockerfile: any `docker build` rooted
+# here reads this file, so it governs BOTH .devcontainer/Dockerfile (whose
+# devcontainer.json sets "context": "..") and the release Dockerfile at the repo
+# root. That is currently harmless for the release build — its `COPY . .` needs
+# none of the entries below, and the module is not vendored — but an entry added
+# for the devcontainer's benefit can silently strip something the release build
+# copies. Check both before adding one.
+#
+# The devcontainer build uses the REPO ROOT as its context ("context": ".." in
+# .devcontainer/devcontainer.json, and the same root in the devcontainer-image
+# CI job) because the Dockerfile COPYs test/install-chrome.sh and test/common.sh
+# out of test/. That means the whole working tree is tarred and sent to the
+# daemon on every build.
+#
+# Nothing here changes what lands IN the image — the Dockerfile COPYs exactly
+# two named files, so the wider context was never a leakage risk. What this
+# avoids is re-sending a contributor's local build output on every rebuild:
+# after following CONTRIBUTING.md's live-test setup you have compiled target
+# binaries and two node_modules trees on disk, none of which the build reads.
+#
+# Kept deliberately in step with .gitignore's build-artifact entries. It is not
+# a copy of the whole file: source that git ignores but a build might need must
+# not be excluded here, so entries are added only for things the Dockerfile
+# provably does not COPY.
+.git/
+.github/
+.worktrees/
+
+# Go build output (.gitignore: "Build output", "Binaries", "Test binary")
+bin/
+dist/
+vendor/
+*.test
+*.exe
+*.so
+*.dylib
+/vespasian
+
+# Coverage profiles (.gitignore: "Output of the go coverage tool")
+*.out
+
+# Live-test artifacts and compiled targets (.gitignore: "Live test artifacts")
+test/.live-test-config
+test/.results/
+test/.*.pid
+test/.*.pids
+test/.*.log
+test/rest-api/rest-api
+test/soap-service/soap-service
+test/grpc-server/grpc-server
+test/concat-spa/concat-spa
+test/forms-target/forms-target
+test/graphql-server/node_modules/
+test/spec-validators/node_modules/
+
+# IDE / OS / local tooling
+.idea/
+.vscode/
+.claude/
+.capability-development/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+.env
+.env.local

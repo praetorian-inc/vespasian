@@ -288,8 +288,10 @@ func (p *GraphQLProbe) sendIntrospection(ctx context.Context, targetURL, query s
 		return nil, nil
 	}
 	defer func() {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck,gosec // best-effort drain
-		resp.Body.Close()                                    //nolint:errcheck,gosec // best-effort close
+		// #nosec G104
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)) //nolint:errcheck // best-effort drain
+		// #nosec G104
+		resp.Body.Close() //nolint:errcheck // best-effort close
 	}()
 
 	if resp.StatusCode >= 400 {

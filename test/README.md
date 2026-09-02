@@ -17,10 +17,134 @@ End-to-end live tests that spin up intentionally simple target applications, run
 
 ## Prerequisites
 
-- **Go 1.25+** — [https://go.dev/dl/](https://go.dev/dl/)
-- **Chrome/Chromium** — Required for headless crawling
+- **Go 1.27.0+** — [https://go.dev/dl/](https://go.dev/dl/)
+- **Chrome/Chromium** — Required for headless crawling (see below)
 - **python3** — Required for test validation scripts
 - **Node.js** — Required for the graphql-server target
+
+### Chrome in containers
+
+A stock Ubuntu devcontainer ships `/usr/bin/chromium-browser` as a **snap
+launcher stub**, and snapd is unavailable inside the container. The stub
+satisfies `command -v` and `-x` but fails the moment it runs, so `setup-live-targets.sh`
+reports it as *"found … but it is not runnable"* rather than passing preflight
+and failing later mid-crawl.
+
+**In this repo's devcontainer there is nothing to do.**
+[`.devcontainer/Dockerfile`](../.devcontainer/Dockerfile) runs
+`test/install-chrome.sh` as an image layer, so a fresh container comes up with a
+real, non-snap Chrome already installed, plus the `python3` and `yq` the guard
+suites need, the Node 20 the `graphql-server` target and the spec validators
+need, and the Go 1.27.0 `go.mod` requires. Go is installed by the Dockerfile
+rather than inherited from the base image, which ships a release too old for
+`go.mod` — under `GOTOOLCHAIN=local` every Go step in the container fails
+otherwise. The four guard suites themselves need none of Go, Node or Chrome. [`.devcontainer/devcontainer.json`](../.devcontainer/devcontainer.json)
+sets `VESPASIAN_NO_SANDBOX=true` for you, and its `onCreateCommand` installs the
+spec-validator deps the live and generator targets parse specs with.
+
+The `devcontainer-image` CI job builds that image **through `devcontainer.json`**
+(via `@devcontainers/cli`, not a hand-written `docker build`), then runs the
+assertions inside it as the `vscode` user with that same environment — so the
+configuration CI measures is the one you get, rather than a similar one. It
+asserts the browser resolves and launches, that two of the four guard suites
+(`test-runner-args.sh` and `preflight-selftest.sh`) run in the image, and that
+`./test/run-live-tests.sh --group live` runs there with the rod-backed targets
+reporting PASS rather than SKIP.
+
+Outside that image — macOS, a bare Ubuntu host, your own container — install a
+real, non-snap Chrome (`.deb`, amd64 or arm64) yourself:
+
+```bash
+./test/install-chrome.sh          # idempotent; if a runnable browser exists it skips the
+                                  # install but still clears this script's own apt
+                                  # leftovers (and, in a container, the package's
+                                  # phone-home artifacts). Uses sudo.
+export VESPASIAN_NO_SANDBOX=true  # containers generally cannot use the Chrome sandbox
+```
+
+The script is idempotent and exits 0 when a runnable browser is already present,
+so running it inside the devcontainer anyway is harmless — it re-clears its own
+apt leftovers and exits.
+
+**How the package is trusted.** Google's apt repository is added *temporarily*,
+with its signing key pinned by primary-key fingerprint. apt then verifies the
+chain — Release signature → `Packages` digest → `.deb` digest — before dpkg runs
+the package's maintainer scripts as root. Downloading the `.deb` directly would
+leave TLS as the only control: `apt-get install ./local.deb` does **not**
+authenticate a local file argument, and Google's `.deb` carries no embedded
+`debsigs` signature to check instead. The fingerprint pin is what makes the
+check meaningful — a key fetched over the same channel as the package, unpinned,
+buys nothing against an attacker who controls that channel. If Google rotates
+its primary key the script fails loudly and the constant must be updated
+deliberately.
+
+**No background egress.** The temporary repo and keyring this script itself
+adds are removed once the install completes (via an `EXIT` trap, so an aborted
+run cannot leave them behind). The `google-chrome-stable` package's own
+permanent apt source and daily update pinger (`/etc/cron.daily/google-chrome`)
+are always suppressed via `repo_add_once=false`, so the package never creates
+them in the first place. Inside a throwaway image the script goes further and
+also removes and verifies absent whatever the package planted anyway — that
+pair is the "no phone-home from the devcontainer image" acceptance criterion,
+and `.devcontainer/Dockerfile` is what makes it apply: it names
+`container=docker` for the install layer, so the removal AND the
+verify-absent pass both run, and a survivor fails the image build.
+Outside a container (a developer's own machine), removing artifacts the
+package owns is not this script's call, so they are left alone as Chrome's
+normal update channel. Chrome's telemetry is separately disabled on every
+browser vespasian launches (LAB-4999), and the live suite always launches
+through vespasian, so it inherits those flags.
+
+**Version policy.** The script tracks Chrome *stable* rather than pinning a
+version — for a test-only layer that is the right trade, since a pinned version
+goes stale and eventually 404s. The installed version is logged on success so an
+image build record identifies exactly what landed.
+
+`apt install chromium` / `chromium-browser` are **not** alternatives on Ubuntu
+noble — both are transitional packages that pre-depend on snapd.
+
+The non-privileged surface (argument handling, architecture resolution, the
+pinned fingerprint) is covered by `test/install-chrome-selftest.sh`, which runs
+in CI on every push. The download / apt / privileged-mutation paths are not
+reachable from that suite — they need root, network, and destructive system
+changes — so they are covered separately by the `install-chrome-e2e` CI job,
+which runs the installer end-to-end as root inside a disposable `ubuntu:24.04`
+container. That job is opt-in (`workflow_dispatch`) and also runs on every push
+to `main`, rather than on every PR, because it is slow and depends on Google's
+apt repo being reachable.
+
+### Running without a browser
+
+Browser-free work does not require a browser to be present:
+
+```bash
+./test/run-live-tests.sh --group offline   # importers, generators, fixtures — no setup run needed
+./test/setup-live-targets.sh --skip-start  # build binaries only
+```
+
+The offline group talks to no service, so it needs neither `.live-test-config`
+nor a browser and runs on a fresh checkout. Likewise, `setup-live-targets.sh`
+treats a missing browser as fatal only when the selected targets actually drive
+the headless backend — `--skip-start` and a `grpc-server`-only setup warn and
+continue. Selections that do need a browser still fail loudly at preflight.
+
+### Dynamic (integration) tests
+
+Separate from this live suite, `pkg/crawl` carries `//go:build integration`
+tests that launch a real browser to exercise `NewBrowserManager`'s launch / kill
+/ close lifecycle. They are excluded from `make test` by the build tag and need
+the same non-snap Chrome as above — which the devcontainer already provides, so
+inside it the export is redundant:
+
+```bash
+export VESPASIAN_NO_SANDBOX=true   # already set in the devcontainer
+go test -tags integration ./pkg/crawl/...
+```
+
+`TestConfigureLauncher_PinsSystemBrowser` is the exception: it only needs a
+browser binary to exist on disk (it asserts go-rod's `.Bin` is pinned so no
+Chromium is auto-downloaded — LAB-4999), so it runs even where Chrome cannot
+launch, and skips cleanly when no browser is present at all.
 
 ## Targets
 
@@ -41,7 +165,7 @@ For each target:
 3. **Crawl** — `vespasian crawl <url> --dangerous-allow-private -o capture.json`
 4. **Validate capture** — Check request count and expected URLs
 5. **Generate** — `vespasian generate <type> capture.json -o spec.<ext>`
-6. **Validate spec** — Path/operation coverage, schema structure, no static assets
+6. **Validate spec** — Path/operation coverage, schema structure, no static assets. For `rest-api` and `scan-rest`, this additionally asserts an exact path count (the generated spec has exactly the number of paths the fixture declares — not merely "at least"), that each POST-only form action (`/api/subscribe`) carries a `post` operation and no `get` (`assert_post_get_operations`), and that each urlencoded POST form's input names (`email`, `name`) surface as request-body schema properties under that action's own endpoint (`assert_form_body_fields`) — the same operation- and body-field-level checks documented for `forms-target` below
 7. **Print summary** — Pass/fail status with endpoint counts and durations
 
 > **Why `--dangerous-allow-private`?** All live targets run on `localhost`, which the crawler's SSRF gate treats as a private host. The flag is required on every `vespasian crawl` invocation in this suite; running without it will exit non-zero with `seed URL rejected by frontier ...`. The flag name reflects production-risk semantics — pass it only when you intend to crawl a known-private host (e.g., this suite, or an internal-network assessment).
@@ -52,6 +176,23 @@ For the GraphQL live test (`graphql-server`):
 2. **Capture** traffic as a vespasian capture file
 3. **Generate** — `vespasian generate graphql capture.json --dangerous-allow-private` (with introspection probe)
 4. **Validate** — SDL structure, expected operations, introspection-quality checks (schema block, non-null types, enums)
+
+For the gRPC live test (`grpc-server`):
+
+1. **Synthesize** a minimal capture so the classifier tags the request as gRPC and the reflection probe dials the right host:port
+2. **Generate** — `vespasian generate grpc capture.json --dangerous-allow-private -o spec.proto` (via Server Reflection)
+3. **Validate services** — expected services and methods are present, each RPC scoped to its own `service` body, and server-streaming methods keep their `stream` return marker
+4. **Compile the emitted `.proto`** — `test/proto-validate` compiles the generated file and fails the target on any syntax, duplicate-tag, or unresolved-reference error (AC4 of LAB-2778)
+
+> **No `protoc` required.** The compile check runs in-process via `bufbuild/protocompile`
+> rather than shelling out. It used to call `protoc` behind `command -v protoc`, which
+> meant the assertion proving the emitted spec compiles passed by never running: `protoc`
+> ships on no GitHub-hosted `ubuntu-24.04` image, and `live-tests.yml` runs under
+> `disable-sudo: true`, so it could not be installed from a later step either. Removing
+> the external dependency — rather than provisioning it — makes the check behave
+> identically on CI and on a developer machine (LAB-5549). `grpcurl` remains optional:
+> the reachability probe uses it when present for a stronger signal (reflection answers,
+> not just an open port) and falls back to a TCP connect otherwise.
 
 For deterministic GraphQL tests (`generate-graphql`, `generate-graphql-imports`):
 
@@ -97,7 +238,8 @@ For importer tests:
 
 Options:
   --targets <list>   Comma-separated targets (default: all)
-                     Valid: rest-api,soap-service,graphql-server,grpc-server
+                     Valid: rest-api,soap-service,graphql-server,grpc-server,
+                            concat-spa,forms-target
   --skip-start       Only build, don't start services
   --teardown         Stop all running targets and clean up
   --sweep            With --teardown, also sweep untracked orphans by name/port
@@ -137,17 +279,17 @@ Options:
   --group <name>        Run a predefined target group: offline, live, or all (default: all)
   --targets <list>      Comma-separated targets to test (overrides --group)
                         Valid targets:
-                          Service:    rest-api, soap-service, graphql-server, concat-spa,
-                                      concat-spa-two-stage
-                          Config:     grpc-server (included via TARGETS_SETUP when set up)
+                          Service:    rest-api, scan-rest, soap-service, graphql-server,
+                                      grpc-server, concat-spa, concat-spa-two-stage,
+                                      forms-target
                           Generate:   generate-rest, generate-wsdl, generate-wsdl-matrix,
                                       generate-graphql, generate-graphql-imports,
                                       generate-js-static, generate-merge-slugs
                           Import:     import-burp, import-har, import-base64,
                                       import-mitmproxy, import-mitmproxy-native,
                                       import-unicode, import-duplicates,
-                                      import-malformed, import-empty
-                          Crawl:      crawl-depth, crawl-unreachable, no-download
+                                      import-malformed, import-empty, auth-capture
+                          Crawl:      crawl-depth, crawl-unreachable, ssrf-rejection, no-download
                           Edge cases: edge-cases, classifier-edge, spec-edge
   --verbose             Enable verbose vespasian output
   --no-build            Skip building vespasian and target binaries
@@ -172,17 +314,112 @@ For Linux devcontainers without Docker Desktop, use the detected host gateway (e
 
 `setup-live-targets.sh` does not read `TEST_HOST` — run it on the host that actually runs the target binaries.
 
+> **Accepted values.** `run-live-tests.sh` validates `TEST_HOST` before it runs anything and
+> **refuses to start** on a value outside the grammar, with
+> `refusing to run: TEST_HOST is not a plain hostname, IPv4, or bracketed IPv6 literal`.
+> Accepted: a plain hostname (`localhost`, `host.docker.internal`), an IPv4 literal, or a
+> **bracketed** IPv6 literal (`[::1]`). The brackets are required because `curl` and `grpcurl`
+> take a `host:port` authority and need them to disambiguate the colons; the gRPC preflight
+> strips them again for `nc` and bash's `/dev/tcp`, which take a bare host. Anything carrying a
+> leading dash, whitespace, or a shell metacharacter is rejected — those values reach a URL, a
+> command operand and a `bash -c` argv, so they are screened once here rather than at each sink.
+>
+> The same check applies to an environment-supplied `GRPC_SERVER_PORT`, which must be 1-65535.
+> (Ports read from `.live-test-config` were already validated; this closes the environment path.)
+
 ### `FORMS_TARGET_BIND_HOST` (optional)
 
-The `forms-target` server binds `127.0.0.1` by default (via its `BIND_HOST` env var). `setup-live-targets.sh` starts it with `BIND_HOST=${FORMS_TARGET_BIND_HOST:-0.0.0.0}` so a crawler running inside a devcontainer (reaching the host via `TEST_HOST=host.docker.internal`) can connect. For host-only local runs, pin it back to loopback:
+The `forms-target` server binds `127.0.0.1` by default (via its `BIND_HOST` env var), and `setup-live-targets.sh` now honours that default rather than overriding it. It is an unauthenticated HTTP app serving login / register / feedback forms, so it has no business listening on every interface of the operator's machine unless asked.
+
+Widen it explicitly when the crawler runs inside a devcontainer and reaches the host via `TEST_HOST=host.docker.internal`:
 
 ```bash
-FORMS_TARGET_BIND_HOST=127.0.0.1 ./test/setup-live-targets.sh --targets forms-target
+FORMS_TARGET_BIND_HOST=0.0.0.0 ./test/setup-live-targets.sh --targets forms-target
 ```
+
+Nothing else needs this variable: the other four rod-backed targets share `LIVE_TARGET_BIND_HOST` (below), and `grpc-server` hard-pins loopback in its own Go source. Every target defaults to loopback — this variable exists because `forms-target` reads its own `BIND_HOST` rather than the shared one.
 
 ### `CONFIG_FILE` (optional)
 
 `run-live-tests.sh` reads resolved ports and `TARGETS_SETUP` from `CONFIG_FILE`, which defaults to `test/.live-test-config` (written by `setup-live-targets.sh`). Override it with the `CONFIG_FILE` environment variable — an internal test-harness knob that `test/test-runner-args.sh` uses to point `--dry-run` invocations at a throwaway stub config, so the group-resolution tests need no real setup. Only an allowlisted set of keys (the `*_PORT` values and `TARGETS_SETUP`) is honored from the file.
+
+The config file is loaded only when a selected target actually talks to a live service, so `--group offline` runs on a fresh checkout with no config and no prior setup.
+
+### `RESULTS_DIR` (optional)
+
+Where per-target result files are written; defaults to `test/.results/`. Override it to keep a run's output out of the repo — `test/test-runner-args.sh` sets it to a temp dir for the one block that really executes the runner, so the guard suite leaves nothing behind.
+
+### `LIVE_TARGET_BIND_HOST` (optional — widens an exposure)
+
+Bind address for `rest-api`, `soap-service`, `concat-spa` and `graphql-server`. Defaults to
+`127.0.0.1`.
+
+These four targets are unauthenticated by design — they exist to give the scanner something to
+discover — so they bind loopback and stay unreachable from the network. Setting this to `0.0.0.0`
+exposes all four on every interface for as long as the run lasts.
+
+The one legitimate reason to set it is the devcontainer flow, where the crawler runs inside a
+container and reaches the host through `TEST_HOST` rather than loopback:
+
+```bash
+LIVE_TARGET_BIND_HOST=0.0.0.0 ./test/setup-live-targets.sh
+```
+
+`forms-target` has its own equivalent (`FORMS_TARGET_BIND_HOST`, below) and `grpc-server` hardcodes
+loopback. Both halves of this seam are asserted — that `setup-live-targets.sh` passes the value, and
+that each target's own source reads it — because either half alone is inert.
+
+### `LIVE_TESTS_ALLOW_NO_EXECUTION` (optional — disables a merge gate)
+
+Set to any non-empty value to make `run-live-tests.sh` treat a run in which **every** selected target
+skipped as a success instead of a failure.
+
+Leave it unset. The check it disables is what makes this ticket's AC3 — "rod-backed targets, including
+`no-download`, execute rather than SKIP" — enforceable at all: without it a `--group live` run of three
+SKIPs and zero passes exits 0, and CI stays green while proving nothing. Setting this variable in CI
+therefore retires AC3's enforcement silently, which is the opposite of what a green build would imply.
+
+The legitimate use is interactive and local: a developer deliberately running the live group on a
+browserless box who wants the skips reported without a non-zero exit. Prefer running
+`./test/install-chrome.sh` instead, so the targets actually execute. `--group offline` needs no browser
+and is unaffected by this variable either way.
+
+### `VESPASIAN` (optional)
+
+Path to the `vespasian` binary under test; defaults to `bin/vespasian`. Override it to test a binary built elsewhere. Note this is **not** settable from `CONFIG_FILE`: `VESPASIAN` is deliberately absent from `load_config`'s allowlist, so a config file cannot redirect which binary the suite executes.
+
+### `VESPASIAN_TEST_ROOT` (internal, test-only)
+
+Read by `install-chrome.sh` to reroot every absolute system path it reads or
+writes — the pinned keyring, the temporary apt source, `/etc/default/google-chrome`,
+the phone-home artifacts it may remove, and the version record — under a
+caller-supplied directory instead of the real filesystem. It exists solely so
+`test/install-chrome-selftest.sh` can drive the installer's privileged branches
+(the defaults-file rewrite, the container gate, phone-home removal and
+verification) against fixtures, unprivileged. **No production caller sets
+it** — `install-chrome.sh` itself, `setup-live-targets.sh`,
+[`.devcontainer/Dockerfile`](../.devcontainer/Dockerfile), and the CI jobs all
+leave it unset. That is not left as prose: `test/test-runner-args.sh` asserts it,
+greping each of those callers for an assignment and failing if one appears — the
+citation AGENTS.md's "comments that claim a state is impossible must cite a test"
+convention asks for.
+
+The script validates the value before using it — it must be an absolute,
+existing directory containing only `[A-Za-z0-9._/-]`, with no `..` component,
+and must not resolve to `/` or `//` — which closes the obvious ways a
+caller-controlled value could redirect a root-privileged write onto the real
+system. It does **not** defend against a symlink planted inside the root
+*after* validation, a bind mount at the root, or the root being swapped out
+from under it between validation and the write (TOCTOU): those are accepted
+residuals, because the variable's whole trust model assumes its caller is
+*already* privileged — either the process runs as root, or it runs
+unprivileged and already holds the `sudo` rights the script would use anyway.
+
+Because it feeds root-privileged writes, it must never be exposed through a
+narrowly-scoped `sudoers` grant that also permits environment passing
+(`SETENV`, `sudo -E`, or an `env_keep` entry) — default `sudoers`
+(`Defaults env_reset`) already drops it, and that default must not be loosened
+for this script.
 
 ### `.live-test-config`
 
@@ -193,13 +430,23 @@ REST_API_PORT=8990
 SOAP_SERVICE_PORT=8991
 GRAPHQL_SERVER_PORT=8992
 GRPC_SERVER_PORT=50051
-TARGETS_SETUP=rest-api,soap-service,graphql-server,grpc-server
+CONCAT_SPA_PORT=8993
+FORMS_TARGET_PORT=8994
+TARGETS_SETUP=rest-api,soap-service,graphql-server,grpc-server,concat-spa,forms-target
 ```
+
+That is what a **default** `./test/setup-live-targets.sh` writes: all six port keys
+and every member of the setup script's `ALL_TARGETS`. A partial run
+(`--targets <subset>`) writes an empty value for each port it did not configure,
+which is why `load_config` skips empty values rather than treating them as
+invalid.
 
 > **`TARGETS_SETUP` is additive, not restrictive.** A bare `./test/run-live-tests.sh`
 > resolves the full `all` group (every `OFFLINE_TARGETS` + `LIVE_TARGETS`).
-> `TARGETS_SETUP` only *adds* config-only targets such as `grpc-server` to that run —
-> it does **not** narrow it. To run only the targets you set up, pass
+> `TARGETS_SETUP` only *adds* targets to that run — it does **not** narrow it.
+> Every shipped target is in `OFFLINE_TARGETS` or `LIVE_TARGETS`, so a default run
+> already covers all of them and `TARGETS_SETUP` is only a hook for out-of-tree
+> additions. To run only the targets you set up, pass
 > `--targets <list>` (or use `--group offline` / `--group live`). After a partial
 > `setup-live-targets.sh --targets <subset>`, the setup script prints the exact
 > `--targets` command to use.
@@ -212,6 +459,7 @@ TARGETS_SETUP=rest-api,soap-service,graphql-server,grpc-server
 | soap-service | 8991 |
 | graphql-server | 8992 |
 | grpc-server | 50051 |
+| concat-spa | 8993 |
 | forms-target | 8994 |
 
 Ports are auto-resolved if the default is in use (searches up to 20 ports ahead).
@@ -265,14 +513,18 @@ Results are saved to `test/.results/` with one subdirectory per test:
 │   └── (empty on success)  # Validates graceful failure on bad input
 ├── import-empty/
 │   └── imported.json       # Imported from empty Burp/HAR
+├── auth-capture/
+│   └── imported.json       # Authorization header preserved through import (LAB-3890 A5)
 ├── edge-cases/
-│   └── (crawl artifacts)   # Timeout, error handling, auth header tests
+│   └── (crawl artifacts)   # Timeout, redirects, HTTP errors, encoding
 ├── crawl-depth/
 │   ├── shallow.json        # Depth-limited crawl
 │   ├── limited.json        # Max-pages-limited crawl
 │   └── loop.json           # Infinite loop detection
 ├── crawl-unreachable/
 │   └── capture.json        # Crawl of unreachable host
+├── ssrf-rejection/
+│   └── (no artifact)       # Asserts SSRF gate rejects a private target (LAB-3890 A4)
 ├── classifier-edge/
 │   ├── capture.json        # Synthetic edge case requests
 │   └── spec.yaml           # Spec from classifier edge cases
@@ -283,11 +535,12 @@ Results are saved to `test/.results/` with one subdirectory per test:
 
 ## Expected Results
 
-All 28 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest). The sample below is a default `--group all` run (19 offline + 9 live targets); the config-only `grpc-server` target runs additionally only when `TARGETS_SETUP` is configured.
+All 32 tests should pass. Order is non-deterministic and durations vary by machine (live crawl tests take the longest). The sample below is a default `--group all` run (21 offline + 11 live targets). `grpc-server` is part of the live group as of LAB-5549 — it runs on a bare `--group live` with no `TARGETS_SETUP` or `--targets` override, so CI exercises it on every PR.
 
 ```text
   TARGET                      STATUS    ENDPOINTS   EXPECTED   DURATION
   --------------------------  --------  ----------  ---------  --------
+  auth-capture                PASS      1           1          0s
   classifier-edge             PASS      -           -          0s
   concat-spa                  PASS      2           2          90s
   concat-spa-two-stage        PASS      2           2          92s
@@ -299,10 +552,11 @@ All 28 tests should pass. Order is non-deterministic and durations vary by machi
   generate-graphql-imports    PASS      2           2          0s
   generate-js-static          PASS      3           3          1s
   generate-merge-slugs        PASS      3           3          0s
-  generate-rest               PASS      8           8          0s
+  generate-rest               PASS      10          10         0s
   generate-wsdl               PASS      3           3          1s
   generate-wsdl-matrix        PASS      3           3          1s
   graphql-server              PASS      8           8          1s
+  grpc-server                 PASS      3           3          1s
   import-base64               PASS      2           2          0s
   import-burp                 PASS      5           5          0s
   import-duplicates           PASS      2           2          0s
@@ -313,11 +567,13 @@ All 28 tests should pass. Order is non-deterministic and durations vary by machi
   import-mitmproxy-native     PASS      3           3          1s
   import-unicode              PASS      3           3          0s
   no-download                 PASS      -           -          80s
-  rest-api                    PASS      8           8          79s
+  rest-api                    PASS      11          11         79s
+  scan-rest                   PASS      11          11         84s
   soap-service                PASS      3           3          51s
   spec-edge                   PASS      -           -          0s
+  ssrf-rejection              PASS      -           -          0s
 
-  Total: 28 passed, 0 failed, 0 skipped
+  Total: 32 passed, 0 failed, 0 skipped
 ```
 
 Some tests emit warnings (`[WARN]`) for soft behavioral checks. These are informational and do not cause failures.
@@ -328,10 +584,22 @@ Some tests emit warnings (`[WARN]`) for soft behavioral checks. These are inform
 test/
 ├── setup-live-targets.sh    # Setup script
 ├── run-live-tests.sh        # Test runner
+├── install-chrome.sh        # Provisions a real non-snap Chrome (see "Chrome in containers")
+├── common.sh                # Shared logging + Chrome detection (detect_chrome_binary)
 ├── validate.sh              # Shared validation functions
 ├── README.md                # This file
 ├── .live-test-config        # Auto-generated (gitignored)
 ├── .results/                # Test output (gitignored)
+│
+│   # Guard suites — CI-run regression nets, no Go/Node/Chrome needed
+├── preflight-selftest.sh        # Chrome/Chromium detection (LAB-3893)
+├── install-chrome-selftest.sh   # install-chrome.sh's non-privileged surface
+├── setup-live-targets_test.sh   # Teardown / orphan-PID hardening (LAB-2893)
+├── test-runner-args.sh          # Target-group vs dispatch drift, CI step lists
+├── validate_test.sh             # Spec validators still reject malformed specs
+│
+├── internal/
+│   └── target/              # Shared bind-host + server-timeout helper for the Go targets
 │
 ├── rest-api/
 │   ├── main.go              # REST API server
@@ -354,6 +622,14 @@ test/
 ├── grpc-server/
 │   ├── main.go              # gRPC server (UserService, OrderService, AccountService)
 │   └── expected-paths.json  # Expected services/methods for validation
+│
+├── proto-validate/          # NESTED MODULE (own go.mod, no workspace) — keeps
+│   │                        # protocompile out of the shipped module's requires
+│   ├── go.mod               # Its own module; root `go test ./...` does NOT reach it
+│   ├── go.sum
+│   ├── doc.go               # Package docs + the exit-code contract run-live-tests.sh consumes
+│   ├── main.go              # Compiles a generated .proto in-process (protocompile); AC4 check
+│   └── main_test.go         # Reject cases + the exit-code contract
 │
 ├── forms-target/
 │   ├── main.go              # HTML forms server (POST/GET <form> endpoints)
@@ -399,26 +675,37 @@ processes holding the port window so you can see what to stop. Use `--teardown`
 Install Chrome or Chromium:
 
 ```bash
-# Ubuntu/Debian
-sudo apt install chromium-browser
+# Ubuntu/Debian — installs a real, non-snap Chrome (see "Chrome in containers" above).
+# Do NOT use `apt install chromium-browser`: on recent Ubuntu that package is the
+# snap stub described below, which installs cleanly and then fails at runtime.
+./test/install-chrome.sh
 
 # macOS
 brew install --cask google-chrome
 ```
 
-**Found but not runnable:** on recent Ubuntu / WSL2 (and many CI base images),
-`/usr/bin/chromium-browser` is a snap *stub* — a launcher that satisfies
-`command -v` / `-x` but fails at runtime with "requires the chromium snap to
-be installed". `setup-live-targets.sh` probes each candidate binary with
-`--version` before accepting it, so this now fails preflight with `Found
-<path> but it is not runnable` instead of failing later during `vespasian
-crawl`. Fix with `snap install chromium`, or install `google-chrome` instead.
+**Found but not runnable:** this is the snap-stub case described under
+[Chrome in containers](#chrome-in-containers) above — the same cause, seen from the
+troubleshooting side. `setup-live-targets.sh` probes each candidate binary with
+`--version` before accepting it, so it fails preflight with `Found <path> but it is
+not runnable` instead of failing later during `vespasian crawl`. Fix with
+`./test/install-chrome.sh` or install `google-chrome` directly. `snap install
+chromium` is **not** a fix for the container case described here — snapd is
+unavailable inside the container (see [Chrome in containers](#chrome-in-containers)),
+which is what produced the stub in the first place; it only applies on a host
+where snapd is actually running.
 
 **macOS note:** the runnability probe uses `timeout` (falling back to
 `gtimeout` from Homebrew coreutils) to guard against a hanging binary. Stock
 macOS ships neither, so on an unpatched macOS install the probe runs without a
 timeout — a binary that hangs on `--version` would block preflight rather
 than failing fast.
+
+**Slow hosts:** the probe gives each candidate 2 seconds to answer
+`--version`. On a cold or throttled container mount a healthy browser's first
+exec can take longer, which surfaces as a spurious `Found <path> but it is not
+runnable`. Set `CHROME_PROBE_TIMEOUT` (seconds, fractions allowed) to widen
+the budget: `CHROME_PROBE_TIMEOUT=10 ./test/setup-live-targets.sh`.
 
 ### Crawl produces empty capture
 

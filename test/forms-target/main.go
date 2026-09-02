@@ -43,10 +43,10 @@ package main
 import (
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
-	"time"
+
+	"github.com/praetorian-inc/vespasian/test/internal/target"
 )
 
 func main() {
@@ -87,16 +87,12 @@ func main() {
 		fmt.Fprint(w, `{"results":[],"query":""}`) //nolint:errcheck // test target best-effort
 	})
 
-	// Bind loopback by default. The devcontainer flow (a crawler inside a
-	// container reaching this host via TEST_HOST=host.docker.internal) needs a
-	// wider bind; setup-live-targets.sh opts into that explicitly via BIND_HOST.
-	host := os.Getenv("BIND_HOST")
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	addr := net.JoinHostPort(host, port)
-	log.Printf("forms-target listening on http://%s/", addr) //nolint:gosec // G706: host/port come from controlled BIND_HOST/PORT env vars for a local test target, not attacker input
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	// Loopback default and the shared server timeout both
+	// live in test/internal/target. forms-target keeps its own FORMS_TARGET_BIND_HOST
+	// seam in setup-live-targets.sh; only the in-process resolution is shared.
+	addr := target.Addr(port)
+	log.Printf("forms-target listening on http://%s/", addr) // #nosec G706 -- host/port come from controlled BIND_HOST/PORT env vars for a local test target, not attacker input
+	srv := target.Server(addr, mux)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}

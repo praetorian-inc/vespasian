@@ -16,16 +16,72 @@ package classify
 
 import (
 	"net/url"
+	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 )
 
-// staticExtensions lists file extensions that indicate static assets.
+// staticExtensions lists file extensions that indicate static assets. Rule 1 of
+// every classifier rejects on these, so an entry here excludes by URL regardless
+// of what content-type the server sent. .webmanifest is the belt to
+// documentContentTypes' braces: a manifest served with a wrong or missing
+// content-type is still not an endpoint.
+//
+// .mjs and .cjs are here because crawl.isRetainedForStaticAnalysis admits both into
+// the capture past the passive-capture scope filter, and only .js was excluded. An
+// out-of-scope GET https://cdn.example/api/data.mjs served as application/json with a
+// JSON body therefore cleared every rule and became an operation on an out-of-scope
+// host. crawl.nonPageExtensions already listed all three (LAB-4678 review, REQ-005).
 var staticExtensions = []string{
-	".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".ico",
-	".woff", ".woff2", ".ttf", ".eot", ".svg", ".map",
+	".js", ".mjs", ".cjs", ".css", ".png", ".jpg", ".jpeg", ".gif", ".ico",
+	".woff", ".woff2", ".ttf", ".eot", ".svg", ".map", ".webmanifest",
+}
+
+// responseContentType resolves a response's media type, preferring the parsed
+// ContentType field and falling back to the raw header. Importers populate one or the
+// other depending on source, so both classifiers and Rule 1 need the same fallback.
+func responseContentType(req crawl.ObservedRequest) string {
+	if ct := req.Response.ContentType; ct != "" {
+		return ct
+	}
+	return mediatype.Header(req.Response.Headers, "content-type")
+}
+
+// isStaticAssetRequest is Rule 1's static-asset test, shared by every classifier so
+// the exclusion cannot be widened in one and left narrow in the others.
+//
+// It tests the URL extension AND the response media type. The media-type half exists
+// because the extension half does not cover what actually reaches the classifier:
+// crawl.isRetainedForStaticAnalysis keeps an out-of-scope response in the capture when
+// it looks like JavaScript, and it decides that from the CONTENT-TYPE first, falling
+// back to the path suffix only when the content-type is missing. So a bundle served
+// from an extensionless URL as application/javascript was retained by the filter with
+// no path suffix for Rule 1 to match, and a bundler output whose first non-space byte
+// is '{' or '[' then scored JSONBodyConfidence on the JSON-body rule — above the
+// default threshold — putting an out-of-scope host into the emitted spec and its
+// servers list. Both sides now call mediatype.IsJavaScript, so the scope exemption
+// cannot admit a media type this exclusion misses (LAB-4678 review, REQ-005).
+//
+// The cost is JSONP: an endpoint that answers with application/javascript is now
+// excluded on media type where it previously could classify on its path. That is the
+// stance Rule 1 already took — a JSONP endpoint served at /api/data.js was excluded by
+// the extension list before this — so extending it to the media type is consistent
+// rather than new, and it is the direction that keeps the scope exemption honest. A
+// JSONP-only API is not discoverable by this classifier; that is a known limitation,
+// not an oversight.
+//
+// respCT is passed in rather than re-derived because each caller already resolves the
+// content-type from Response.ContentType with a Headers fallback.
+func isStaticAssetRequest(lowerPath, respCT string) bool {
+	for _, ext := range staticExtensions {
+		if strings.HasSuffix(lowerPath, ext) {
+			return true
+		}
+	}
+	return mediatype.IsJavaScript(respCT)
 }
 
 // staticPathSegments lists path segments that indicate static asset directories.
@@ -33,16 +89,30 @@ var staticPathSegments = []string{
 	"/static/", "/assets/", "/dist/", "/bundle/",
 }
 
-// apiContentTypes lists content types that indicate API responses.
+// apiContentTypes lists exact content types that indicate API responses. It is
+// the first matching tier only — matchAPIContentType also accepts any
+// application/*+json or application/*+xml structured syntax suffix, so this list
+// does not bound what classifies as an API media type.
 var apiContentTypes = []string{
 	"application/json", "application/xml", "text/xml", "application/problem+json",
 	"application/vnd.api+json", "application/hal+json",
 }
 
-// apiPathSegments lists path segments that indicate API endpoints.
+// apiPathSegments lists literal path segments that indicate API endpoints.
+// Versioned segments (/v1/, /v2/, …) are matched separately by
+// apiVersionPathPattern so any version number is recognized, not a fixed few.
 var apiPathSegments = []string{
-	"/api/", "/v1/", "/v2/", "/v3/", "/rest/", "/rpc/", "/graphql",
+	"/api/", "/rest/", "/rpc/", "/graphql",
 }
+
+// apiVersionPathPattern matches a versioned API path segment for ANY version
+// number (/v1/, /v2/, …/v4/…/v12/). It mirrors the v[1-9][0-9]*/ alternation in
+// crawl.APIIndicatorAlternation so the classifier's API-indicator recognition
+// does not drift below the extraction side — otherwise offline concat/service-
+// prefix candidates on /v4+/ paths (which crawl extracts) would fail Rule 3,
+// so Rule 7's static-JS floor would never fire and they would be dropped at the
+// default confidence (LAB-4992).
+var apiVersionPathPattern = regexp.MustCompile(`/v[1-9][0-9]*/`)
 
 // Confidence scores assigned by each heuristic rule.
 const (
@@ -50,13 +120,35 @@ const (
 	PathHeuristicBoost    = 0.15 // Rule 3: API path segment boost.
 	HTTPMethodConfidence  = 0.7  // Rule 4: Non-GET HTTP method signal.
 	JSONBodyConfidence    = 0.85 // Rule 5: JSON response structure.
-	// RequestSignalConfidence is assigned by Rule 6 when a request shows API
-	// intent (an API path together with a JSON/XML Accept or request
-	// content-type) even if no response was captured. It is deliberately set at
+	// RequestSignalConfidence is assigned by Rule 6 when a request shows explicit
+	// API intent — a JSON/XML Accept or request content-type — even if no response
+	// was captured, and regardless of whether the path is in apiPathSegments
+	// (Phase 3 un-gated this from the path allowlist). It is deliberately set at
 	// or above DefaultConfidenceThreshold so a JSON API reached by GET whose
 	// response arrived too late to capture still classifies — the REST-vs-not
 	// verdict then depends on the request, not on response timing (LAB-4678, B2).
 	RequestSignalConfidence = 0.6
+	// NextRouteProvenanceConfidence is assigned by Rule 6a to a route recovered from a
+	// Next.js App Router chunk URL. It is a REPORTING level, not an API signal: it
+	// sits at NearMissFloor so the route is listed among the -v near-misses, and far
+	// below DefaultConfidenceThreshold so it can never become a spec operation with a
+	// guessed verb. TestNextRouteProvenanceConfidence_IsReportingOnly pins both
+	// bounds, so neither constant can drift into swallowing the other.
+	NextRouteProvenanceConfidence = NearMissFloor
+	// StaticJSConfidence is the floor for an offline JS-static candidate whose
+	// path carries an API indicator (Rule 7). It is DEFINED AS the default
+	// --confidence threshold so these unprobed candidates survive fully-offline
+	// generation instead of being dropped at Rule 3's 0.15 (LAB-4992).
+	//
+	// TEST-003: this is deliberately an alias rather than a second 0.5 literal.
+	// The floor clears the threshold only because the two values are equal, and
+	// RunClassifiers compares with `>=` — so the invariant sits exactly on a
+	// knife edge. As independent literals, moving the default to 0.6 would
+	// silently drop every offline concat endpoint while every Rule 7 test
+	// (which asserts against this symbol) stayed green. Binding them here makes
+	// the invariant hold by construction; TestStaticJSFloorClearsDefaultThreshold
+	// guards against someone re-inlining a literal.
+	StaticJSConfidence = DefaultConfidenceThreshold
 )
 
 // RESTClassifier classifies REST API requests using ordered heuristic rules.
@@ -75,12 +167,29 @@ func (c *RESTClassifier) Classify(req crawl.ObservedRequest) (bool, float64) {
 
 // ClassifyDetail returns classification result with a detailed reason string.
 //
-// Heuristic rules applied in order:
-//  1. Static asset exclusion → (false, 0, "")
-//  2. Content-type filter → confidence 0.8
-//  3. Path heuristics → boost +0.15 (cap 1.0)
-//  4. HTTP method signal → confidence max(current, 0.7)
-//  5. Response structure → confidence max(current, 0.85)
+// Heuristic rules applied in order. Rules 1, 1a, 1b and 6a are DISQUALIFIERS:
+// they return outright, so no later rule can promote an identified non-endpoint.
+//
+//	Rule 1  static asset (extension, path segment)   -> (false, 0, "")
+//	Rule 1a well-known document path (documentPaths) -> (false, 0, "")
+//	Rule 1b document media type                      -> (false, 0, "")
+//	Rule 2  response content-type       -> confidence 0.8
+//	Rule 3  path heuristics             -> boost +0.15 (cap 1.0)
+//	Rule 4  non-GET method              -> max(current, 0.7)
+//	Rule 5  JSON response structure     -> max(current, 0.85)
+//	Rule 6  request-side API signal     -> max(current, RequestSignalConfidence),
+//	        no longer gated on the path allowlist (LAB-4678 Phase 3)
+//	Rule 6a Next.js chunk provenance    -> (false, max(current,
+//	        NextRouteProvenanceConfidence), "next-route-chunk"), a reporting-only
+//	        floor deliberately far below the API threshold
+//	Rule 7  offline JS-static floor     -> max(current, StaticJSConfidence) when
+//	        the path carries an API indicator
+//
+// Rule 6a must stay AHEAD of Rule 7. Both Next.js chunk sources satisfy
+// crawl.IsJSStaticSource, so a recovered route reaching Rule 7 on an /api/-style
+// path would be floored to StaticJSConfidence — the default --confidence — and
+// reported as a near-miss at the threshold it is supposed to sit far below.
+// TestNextRoute_NotPromotedByStaticJSFloor pins the ordering.
 func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float64, string) { //nolint:gocyclo // multi-signal heuristic classifier
 	parsedURL, err := url.Parse(req.URL)
 	if err != nil {
@@ -89,16 +198,36 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 
 	lowerPath := strings.ToLower(parsedURL.Path)
 
-	// Rule 1: Static asset exclusion.
-	for _, ext := range staticExtensions {
-		if strings.HasSuffix(lowerPath, ext) {
-			return false, 0, ""
-		}
+	respCT := responseContentType(req)
+
+	// Rule 1: Static asset exclusion, by URL extension or JavaScript media type.
+	if isStaticAssetRequest(lowerPath, respCT) {
+		return false, 0, ""
 	}
 	for _, seg := range staticPathSegments {
 		if strings.Contains(lowerPath, seg) {
 			return false, 0, ""
 		}
+	}
+	// Rule 1a: Well-known document PATHS, for documents whose served content-type
+	// cannot be relied on. See documentPaths for why the extension rule and the
+	// content-type rule both miss the common case.
+	if isDocumentPath(lowerPath) {
+		return false, 0, ""
+	}
+
+	// Rule 1b: Document media types DISQUALIFY, they are not merely a missing
+	// signal. Keeping them out of matchAPIContentType only silences Rule 2; Rule 5
+	// still scores any JSON-object body at JSONBodyConfidence (0.85), which clears
+	// the threshold on its own. A web app manifest and a JSON Feed both have JSON
+	// object bodies, so without this early return /manifest.json still landed in
+	// the spec after being excluded from the content-type tier — the exclusion set
+	// alone was not the fix (LAB-4678 review, QUAL-003).
+	//
+	// This mirrors Rule 1: an identified non-endpoint is rejected outright rather
+	// than left for a later rule to promote.
+	if isDocumentContentType(respCT) {
+		return false, 0, ""
 	}
 
 	var confidence float64
@@ -107,25 +236,30 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 	// Rule 2: Content-type filter. rule2CT records the API media type matched
 	// on the response so Rule 6 can avoid re-reporting the same content type as
 	// a request-side signal (QUAL-005).
-	respCT := req.Response.ContentType
-	if respCT == "" {
-		respCT = mediatype.Header(req.Response.Headers, "content-type")
-	}
 	rule2CT := matchAPIContentType(respCT)
 	if rule2CT != "" {
 		confidence = ContentTypeConfidence
 		reason = appendReason(reason, "content-type:"+rule2CT)
 	}
 
-	// pathIsAPI is computed once here and reused by Rule 3 (confidence boost)
-	// and Rule 6 (request-side signal gate) so the API-path scan runs once
-	// rather than twice in the same call (QUAL-003).
+	// pathIsAPI is computed once here and reused by Rule 3 (confidence boost) and
+	// Rule 7 (offline JS-static floor) so the API-path scan runs once rather than
+	// repeatedly in the same call (QUAL-003). Rule 6 no longer consults it: Phase 3
+	// deliberately un-gated the request-side signal from the path allowlist.
 	pathIsAPI := false
 	for _, seg := range apiPathSegments {
 		if strings.Contains(lowerPath, seg) {
 			pathIsAPI = true
 			break
 		}
+	}
+	// A bare version segment (/v1/, /v2/, ...) is an API indicator too, even
+	// with no "api"-style word in the path. Offline JS-static candidates from
+	// SPA bundles routinely look like /v2/users, and without this they would
+	// never satisfy Rule 7's gate and would be dropped at the default
+	// confidence (LAB-4992).
+	if !pathIsAPI && apiVersionPathPattern.MatchString(lowerPath) {
+		pathIsAPI = true
 	}
 
 	// Rule 3: Path heuristics.
@@ -163,41 +297,142 @@ func (c *RESTClassifier) ClassifyDetail(req crawl.ObservedRequest) (bool, float6
 		}
 	}
 
-	// Rule 6: Request-side API signal (LAB-4678, B2).
+	// Rule 6: Request-side API signal (LAB-4678, B2 + Phase 3 "beyond allowlists").
 	// Rules 2 and 5 need a fully-arrived response, so a JSON API reached by GET
 	// whose response was captured half-finished (empty content-type and body)
 	// falls to the path boost alone (0.15) and is dropped — making the
 	// REST-vs-not verdict a function of response timing rather than a property
-	// of the app. When the request itself shows API intent on an API path,
-	// classify it regardless of whether the response was captured, so the
-	// verdict is stable for a given input. Non-GET methods are already covered
-	// by Rule 4 (0.7) independent of response timing; this rule closes the
-	// GET-with-JSON-intent gap. The API-path match alone is NOT sufficient (that
-	// stays at the Rule 3 boost) to avoid classifying plain navigations under
-	// api-like paths.
-	if pathIsAPI {
-		signal := ""
-		if apiCT := acceptSignalsAPI(mediatype.Header(req.Headers, "accept")); apiCT != "" {
-			signal = "accept:" + apiCT
-		}
-		if signal == "" {
-			// Only surface a request content-type signal that Rule 2 did not
-			// already record for the same media type; otherwise the -v reason
-			// would carry both "content-type:X" and "request-signal:content-type:X",
-			// which convey the same fact (QUAL-005).
-			if apiCT := matchAPIContentType(mediatype.Header(req.Headers, "content-type")); apiCT != "" && apiCT != rule2CT {
-				signal = "content-type:" + apiCT
-			}
-		}
-		if signal != "" {
-			if confidence < RequestSignalConfidence {
-				confidence = RequestSignalConfidence
-			}
-			reason = appendReason(reason, "request-signal:"+signal)
+	// of the app.
+	//
+	// An EXPLICIT API media type in the request itself — a JSON/XML Accept the
+	// client asked for, or a JSON/XML request Content-Type it sent — is API
+	// intent on ANY path, not only allowlisted ones (Phase 3). The hardcoded
+	// apiPathSegments are not exhaustive, so gating this signal on them was
+	// blind by construction to APIs on non-standard paths. Dropping the path
+	// gate is guarded against over-classification: acceptSignalsAPI treats
+	// text/html and application/xhtml+xml as navigation and never matches the
+	// */* wildcard, so plain page loads and non-committal fetches contribute
+	// nothing here. Non-GET methods are already covered by Rule 4 (0.7); this
+	// closes the GET-with-explicit-JSON-intent gap regardless of path.
+	signal := ""
+	if apiCT := acceptSignalsAPI(mediatype.Header(req.Headers, "accept")); apiCT != "" {
+		signal = "accept:" + apiCT
+	}
+	if signal == "" {
+		// Only surface a request content-type signal that Rule 2 did not
+		// already record for the same media type; otherwise the -v reason
+		// would carry both "content-type:X" and "request-signal:content-type:X",
+		// which convey the same fact (QUAL-005).
+		if apiCT := matchAPIContentType(mediatype.Header(req.Headers, "content-type")); apiCT != "" && apiCT != rule2CT {
+			signal = "content-type:" + apiCT
 		}
 	}
+	if signal != "" {
+		if confidence < RequestSignalConfidence {
+			confidence = RequestSignalConfidence
+		}
+		reason = appendReason(reason, "request-signal:"+signal)
+	}
+
+	// Rule 6a: Next.js App Router provenance — a REPORTING signal only, deliberately
+	// far below the threshold.
+	//
+	// This must stay ahead of Rule 7. Both chunk sources satisfy
+	// crawl.IsJSStaticSource, so falling through to the static-JS floor on an
+	// /api/-style route would raise the score to the default --confidence, undoing
+	// the band this rule exists to hold. TestNextRoute_NotPromotedByStaticJSFloor
+	// pins the ordering.
+	//
+	// An App Router chunk URL proves the PATH is served but says nothing about which
+	// verbs the module exports. Classifying it as an API on provenance alone made the
+	// generator emit a `get` operation for a route that may export only POST, and
+	// nothing downstream corrects that: the OPTIONS probe records
+	// ClassifiedRequest.AllowedMethods, but pkg/generate/rest does not read it, so the
+	// invented verb survives into the spec (Codex review, PR #189). So this must not
+	// reach DefaultConfidenceThreshold, and NextRouteProvenanceConfidence is asserted
+	// against that bound by test.
+	//
+	// It cannot be ZERO either, which is where this rule's absence left it. Keeping a
+	// recovered route out of the spec is correct; scoring it 0 ALSO put it below
+	// classify.NearMissFloor, so NearMisses dropped it and it appeared in no output at
+	// all. That hit the headline case squarely: /vaults/{vaultId} matches no
+	// apiPathSegments entry, so it had no path boost to fall back on either. The only
+	// recovered routes an operator could see were the ones that happened to sit under
+	// /api/, visible via the path heuristic rather than via anything this feature
+	// contributed. Meanwhile README.md, AGENTS.md, pkg/analyze/jsstatic/doc.go and this
+	// rule's own predecessor comment all asserted that recovered routes surface as
+	// sub-threshold near-misses under -v. Pinning the score to the near-miss floor is
+	// what makes those four claims true.
+	//
+	// Restoring them as real operations means teaching the generator to emit from
+	// AllowedMethods, which is still a separate change.
+	//
+	// The isAPI=false return is what makes "never an operation" true, and a
+	// confidence band alone did not. RunClassifiers gates on isAPI (requireAPI),
+	// NearMisses does not, so returning false keeps the route out of the spec at
+	// ANY threshold while still reporting it under -v. Scoring it at
+	// NearMissFloor and relying on DefaultConfidenceThreshold to exclude it made
+	// the exclusion depend on --confidence, which is an operator flag: at
+	// --confidence 0.1 the routes classified and the generator emitted
+	//
+	//	/vaults/{vaultId}:
+	//	    get:                              <- verb invented, route may be POST-only
+	//	        x-vespasian-source: dynamic   <- false, never requested
+	//
+	// which is both harms this rule exists to prevent, reachable by widening
+	// recall — the ordinary reason to touch --confidence.
+	// TestNextRoute_NeverAnOperationAtAnyThreshold pins it across the range.
+	if req.Source == crawl.SourceNextRouteHandler || req.Source == crawl.SourceNextPageRoute {
+		if confidence < NextRouteProvenanceConfidence {
+			confidence = NextRouteProvenanceConfidence
+		}
+		return false, confidence, appendReason(reason, "next-route-chunk")
+	}
+
+	// Rule 7: Offline JS-static candidate floor.
+	confidence, reason = staticJSFloor(req, pathIsAPI, confidence, reason)
 
 	return confidence > 0, confidence, reason
+}
+
+// staticJSFloor implements Rule 7 (LAB-4992): the offline JS-static confidence
+// floor. A path reconstructed from a JS bundle carries an API indicator but,
+// when generated fully offline, has no probed response — Rules 2/4/5 never
+// fire and Rule 3 alone (0.15) leaves it below the default 0.5 threshold,
+// silently dropping the very concat/service-prefix endpoints jsstatic
+// recovered. Floor such candidates to StaticJSConfidence so they survive
+// default-confidence generation as unprobed candidates. Gated on the shared
+// path heuristic (pathIsAPI) so non-API-looking static:js entries are not
+// promoted.
+//
+// QUAL-002: this floor applies to EVERY IsJSStaticSource candidate — the
+// AST-literal source (SourceStaticJS), sourcemap-recovered source, AND
+// concat/service-prefix reconstructions (SourceStaticJSConcat) alike. Only
+// SourceStaticJSConcat is ever superseded by the reached-filter in
+// ReplayJSExtracted (which drops a concat mirror once the live probe 404s
+// the same reconstructed path); a plain SourceStaticJS AST literal has no
+// such supersession and stays floored even if a probe elsewhere 404s it.
+// This is deliberate, not an oversight: an AST literal is recovered from a
+// real call site in the bundle (fetch/axios/etc.), so a 404 there is more
+// likely auth/param-gated than a wrong-guess decoy, unlike an unvalidated
+// concat/service-prefix combinatorial reconstruction. Do not extend the
+// concat reached-filter supersession to plain static:js literals without
+// revisiting this reasoning.
+//
+// SEC-BE-001: floored candidates were originally handed to pkg/probe with no
+// origin check, so a hostile bundle literal carrying an attacker-controlled
+// absolute URL (e.g. fetch("https://attacker.example/api/collect")) could
+// reach exactly this floor and get probed — an outbound request to a
+// public, attacker-chosen host. The probe stage now gates every probe target
+// on the scan's own origin (internal/pipeline, composed onto
+// probe.Config.URLValidator), so a cross-origin candidate promoted by this
+// floor is skipped before any request is made, regardless of confidence.
+func staticJSFloor(req crawl.ObservedRequest, pathIsAPI bool, confidence float64, reason string) (float64, string) {
+	if pathIsAPI && confidence < StaticJSConfidence && crawl.IsJSStaticSource(req.Source) {
+		confidence = StaticJSConfidence
+		reason = appendReason(reason, "static-js-candidate")
+	}
+	return confidence, reason
 }
 
 // appendReason joins classification signal tags with "+" so the reason string
@@ -210,24 +445,178 @@ func appendReason(existing, sig string) string {
 	return existing + "+" + sig
 }
 
+// Structured-syntax-suffix families (RFC 6839). Returned as the match token for
+// any application/<vendor>+json or +xml media type so the -v reason string stays
+// a fixed vocabulary instead of echoing an unbounded vendor type.
+const (
+	SuffixFamilyJSON = "application/*+json"
+	SuffixFamilyXML  = "application/*+xml"
+)
+
+// navigationContentTypes are document media types that must never count as an
+// API signal even though one of them carries a +xml structured suffix.
+// application/xhtml+xml is a page, not an API, and browsers send it on every
+// navigation; without this exclusion the suffix rule below would classify every
+// HTML page load as REST.
+var navigationContentTypes = []string{
+	"text/html", "application/xhtml+xml",
+}
+
+// soapContentTypes are SOAP media types that carry a +xml structured suffix but
+// belong to WSDLClassifier, not this one. Without this exclusion the suffix tier
+// would make every SOAP response count as REST as well as WSDL, inflating the
+// REST tally that DetectAPIType weighs against the WSDL tally and making a
+// genuinely SOAP-dominant capture unable to win its own type.
+//
+// text/xml is deliberately NOT here: it is a generic XML type shared by REST and
+// SOAP, it predates this rule as an exact apiContentTypes entry, and removing it
+// would change long-standing REST classification behavior.
+var soapContentTypes = []string{
+	"application/soap+xml",
+}
+
+// documentContentTypes are media types that carry a +json/+xml structured suffix
+// but are DOCUMENTS rather than endpoint responses, so the suffix tier must not
+// classify them. Vespasian maps APIs; a document in an OpenAPI spec is noise.
+//
+// Membership rule, so this set stops growing one incident at a time: a type
+// belongs here when its payload is consumed as a standalone document by the
+// browser or a reader application, and fetching it tells you nothing about an
+// endpoint's request/response contract. That is the test to apply before adding
+// an entry, and the reason each entry below is present.
+//
+// Deliberately NOT here: application/ld+json, application/geo+json, and vendor
+// types like application/vnd.github+json. Those are endpoint response bodies —
+// JSON-LD served as a response IS the API's data (Hydra, ActivityPub) — and
+// matchAPIContentType's whole purpose is to stop hardcoding an allowlist that
+// excludes them. A <script type="application/ld+json"> block is not seen here: this
+// matches response and request Content-Type headers, not markup, so a JSON-LD block
+// embedded in an HTML page reaches the classifier as text/html.
+var documentContentTypes = []string{
+	// Syndication feeds: a feed is a document for feed readers. Without this the
+	// suffix rule pulls in every blog feed on the target. The classifier-edge
+	// live test asserts a feed stays out.
+	"application/rss+xml", "application/atom+xml", "application/feed+json",
+	// Web app manifest: browser install metadata, served at /manifest.json or
+	// /site.webmanifest by essentially every modern SPA, which is this tool's
+	// target class. Omitting it added a false operation to most REST specs and
+	// inflated the restCount DetectAPIType weighs (LAB-4678 review, QUAL-003).
+	"application/manifest+json",
+}
+
+// documentPaths are exact request paths that are always a standalone document
+// rather than an endpoint, matched at the END of the path so a subdirectory
+// deployment still hits.
+//
+// This exists because the other two manifest defenses BOTH miss the common case.
+// documentContentTypes rejects application/manifest+json, and staticExtensions
+// rejects .webmanifest — so /site.webmanifest is covered either way. But the web
+// app manifest is conventionally named /manifest.json, and a .json file is very
+// commonly served as plain application/json (that is the default mapping in most
+// servers and CDNs; only some frameworks set application/manifest+json). In that
+// combination nothing fired: .json is not a static extension, application/json is
+// obviously not a document type, and Rule 2 scored it 0.8 while Rule 5's JSON
+// object body took it to 0.85. Measured before this rule: /manifest.json served as
+// application/json classified at 0.85 and became an operation in the spec.
+//
+// The rest.go comment on staticExtensions called .webmanifest "the belt to
+// documentContentTypes' braces: a manifest served with a wrong or missing
+// content-type is still not an endpoint" — true only for the filename almost
+// nobody uses. This is the belt for the one they do.
+//
+// Membership rule, same as documentContentTypes: the payload is consumed as a
+// standalone document, and fetching it says nothing about an endpoint's contract.
+// Add a path here only when the content-type cannot be trusted to identify it,
+// otherwise documentContentTypes is the right place. An app with a real API at
+// /manifest.json would be misclassified; that is the same accepted asymmetry as
+// skipping a read-only "Payment history" control in the --interact list.
+var documentPaths = []string{
+	"/manifest.json",
+}
+
+// isDocumentPath reports whether lowerPath ends in one of documentPaths. Every
+// entry begins with "/", so the suffix test also covers an exact match and matches
+// only on a whole final segment — "/app-manifest.json" does not hit "/manifest.json".
+func isDocumentPath(lowerPath string) bool {
+	for _, p := range documentPaths {
+		if strings.HasSuffix(lowerPath, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isDocumentContentType reports whether ct is one of the documentContentTypes,
+// canonicalized the same way matchAPIContentType canonicalizes. Callers treat a
+// true result as a disqualifier for the whole request, not just as the absence of
+// a content-type signal — see Rule 1b in ClassifyDetail for why the distinction
+// matters.
+func isDocumentContentType(ct string) bool {
+	base := mediatype.Base(ct)
+	return base != "" && slices.Contains(documentContentTypes, base)
+}
+
 // matchAPIContentType canonicalizes ct (lowercase + charset/parameter strip via
-// mediatype.Base) and returns the matching apiContentTypes entry, or "" if none
-// matches. Shared by Rule 2 (response content-type) and Rule 6 (request
-// content-type) so both apply one matching rule (QUAL-004).
+// mediatype.Base) and returns a stable token identifying the API media type, or
+// "" if it is not an API type. Shared by Rule 2 (response content-type) and
+// Rule 6 (request content-type) so both apply one matching rule (QUAL-004).
+//
+// Two tiers, in order:
+//  1. Exact match against apiContentTypes, returning the entry itself.
+//  2. RFC 6839 structured syntax suffix: any application/<vendor>+json or
+//     application/<vendor>+xml, returning the suffix family token.
+//
+// Tier 2 exists because apiContentTypes is a closed hand-maintained list and was
+// therefore blind by construction to the large open set of real API media types
+// built on the +json/+xml suffixes — application/ld+json, application/geo+json,
+// application/vnd.github+json, application/atom+xml and so on (LAB-4678: the
+// Success criterion is that classification is not limited to hardcoded
+// content-type allowlists). Matching the suffix rather than enumerating vendors
+// is what removes the hardcoding.
+//
+// The suffix tier is narrow on purpose: it requires the application/ top-level
+// type, so text/* and image/* cannot match, and three exclusion sets run first —
+// navigationContentTypes (application/xhtml+xml is a page), soapContentTypes
+// (owned by WSDLClassifier), and documentContentTypes (feeds and web app
+// manifests, which are documents rather than endpoint responses; see that set's
+// membership rule before adding to it).
 func matchAPIContentType(ct string) string {
 	base := mediatype.Base(ct)
+	if base == "" {
+		return ""
+	}
+	for _, nav := range navigationContentTypes {
+		if base == nav {
+			return ""
+		}
+	}
 	for _, apiCT := range apiContentTypes {
 		if base == apiCT {
 			return apiCT
 		}
+	}
+	if !strings.HasPrefix(base, "application/") {
+		return ""
+	}
+	if slices.Contains(soapContentTypes, base) || slices.Contains(documentContentTypes, base) {
+		return ""
+	}
+	switch {
+	case strings.HasSuffix(base, "+json"):
+		return SuffixFamilyJSON
+	case strings.HasSuffix(base, "+xml"):
+		return SuffixFamilyXML
 	}
 	return ""
 }
 
 // acceptSignalsAPI parses an Accept header and returns the API media type the
 // client is explicitly asking for, or "" if none. It splits into media ranges,
-// ignores q-parameters and the "*/*" wildcard, and exact-matches against
-// apiContentTypes. Crucially, a header that accepts text/html or
+// ignores q-parameters, and matches each range with [matchAPIContentType] — so it
+// accepts the exact apiContentTypes entries AND the RFC 6839 structured-suffix
+// tier, and inherits that function's navigation/SOAP/document exclusions. "*/*"
+// matches nothing there, so a non-committal fetch contributes no signal.
+// Crucially, a header that accepts text/html or
 // application/xhtml+xml is treated as a document navigation, NOT API intent —
 // browsers always send those on page loads, and the standard navigation Accept
 // header also contains application/xml (which would otherwise substring-match).
@@ -244,9 +633,13 @@ func acceptSignalsAPI(accept string) string {
 			mt = mt[:i]
 		}
 		mt = strings.ToLower(strings.TrimSpace(mt))
-		if mt == "text/html" || mt == "application/xhtml+xml" {
+		if slices.Contains(navigationContentTypes, mt) {
 			// A document-navigation marker anywhere in the header disqualifies
-			// the whole request as API intent.
+			// the whole request as API intent. This is stronger than
+			// matchAPIContentType's own exclusion, which only rejects the single
+			// type it is handed: here one navigation marker poisons the entire
+			// Accept header, so "text/html, application/json" is a page load
+			// rather than API intent. Both read the same list.
 			return ""
 		}
 		if match == "" {

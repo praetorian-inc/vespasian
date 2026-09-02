@@ -457,6 +457,812 @@ func TestOpenAPIGenerator_MultipleServers(t *testing.T) {
 	}
 }
 
+// TestExtractServers_ProductionOriginShapeStripsDefaultPort is TEST-001
+// (LAB-4992 review): crawl.ResolveTargetOrigin -> originOf ALWAYS makes the
+// port explicit, so in production TargetOrigin arrives as "https://host:443"
+// or "http://host:80", never a bare "https://host". Without
+// canonicalizeOrigin's default-port strip, that explicit-port TargetOrigin
+// would never string-equal the port-free origin originFromURL derives from
+// the SAME host's observed endpoint URL, producing two server entries for one
+// host and a titleHost with the port baked in (doc comment's exact claim).
+// This test uses that PRODUCTION shape directly, rather than a bare-host
+// TargetOrigin as most other tests do.
+func TestExtractServers_ProductionOriginShapeStripsDefaultPort(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://www.example.com/api/users", ""),
+	}
+
+	servers, titleHost, _ := extractServers(endpoints, "https://www.example.com:443")
+
+	require.Len(t, servers, 1, "the explicit-port TargetOrigin must dedupe against the same host's observed origin, not produce a second entry")
+	assert.Equal(t, "https://www.example.com", servers[0].URL, "the default port must be stripped from the server URL")
+	assert.Equal(t, "www.example.com API", titleHost, "the default port must be stripped from info.title's host")
+}
+
+// SEC-BE-003/SEC-BE-002: a cross-origin static:js candidate is never probed
+// (the probe egress gate only prevents the REQUEST; extractServers must
+// independently exclude it from the DELIVERABLE). The attacker host is chosen
+// to sort FIRST alphabetically ("a.attacker.example" < "www.example.com") so
+// this test fails under the pre-fix behavior, which always used servers[0]
+// for both the servers list membership and the title — proving the exploit
+// this fix closes. No TargetOrigin is supplied, so the primary origin falls
+// back to the lowest-sorted DYNAMICALLY OBSERVED endpoint (www.example.com).
+func TestExtractServers_JSStaticCrossOriginExcluded(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://www.example.com/api/users", ""),
+		makeClassified("GET", "https://a.attacker.example/api/collect", "static:js"),
+	}
+
+	servers, titleHost, excluded := extractServers(endpoints, "")
+
+	require.Len(t, servers, 1, "unprobed JS-static host must not be added to servers")
+	assert.Equal(t, "https://www.example.com", servers[0].URL)
+	assert.Equal(t, "www.example.com API", titleHost, "info.title must not be captured by the unprobed JS-static host")
+	assert.True(t, excluded["https://a.attacker.example"], "attacker origin must be reported as excluded from the global list")
+}
+
+// TestExtractServers_FullyOfflineAllJSStatic_NoTargetOriginExcludesAttacker is
+// the SEC-BE-002 regression guard (LAB-4992 review): a FULLY-OFFLINE capture
+// (every endpoint is JS-static — no dynamically observed endpoint exists at
+// all) containing both a legitimate host and an attacker-planted host, with NO
+// TargetOrigin supplied. This is the flagship LAB-4992 scenario: the pre-fix
+// code's "observed == 0 -> fall back to the FULL unfiltered endpoint set"
+// branch trusted the entirely offline, attacker-controlled JS-static set, and
+// picked the alphabetically-first host for both servers[0] and info.title.
+// "a.attacker.example" sorts before "www.example.com", so this test fails
+// under the pre-fix behavior.
+//
+// TEST-003 fix (LAB-4992 review): the original version of this test asserted
+// only `for _, s := range servers { assert.NotEqual(...) }` and
+// `assert.NotContains(titleHost, "attacker")`. In this exact branch — no
+// TargetOrigin, zero dynamically observed endpoints — servers is empty, so
+// the range loop body never executes and its assertion is vacuous (asserts
+// nothing). This version asserts the ACTUAL, POSITIVE contract instead: with
+// no vouched origin available at all, choosePrimaryOrigin returns "" and
+// BOTH JS-static origins are excluded (neither can be admitted as
+// same-origin with an empty primary) — servers is empty and titleHost falls
+// back to the bare default. This is a deliberately defensive branch: in the
+// real pipeline, crawl.ResolveTargetOrigin's third fallback means primary is
+// essentially always non-empty, so a fully-offline capture with a TRULY empty
+// primary is an edge case exercised directly by this unit test, not the
+// common path. Whether "no vouched origin -> empty servers" is the right
+// call is pinned here deliberately, positively, and explicitly — not left
+// implicit.
+func TestExtractServers_FullyOfflineAllJSStatic_NoTargetOriginExcludesAttacker(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://www.example.com/api/x", "static:js"),
+		makeClassified("GET", "https://a.attacker.example/api/collect", "static:js"),
+	}
+
+	servers, titleHost, excluded := extractServers(endpoints, "")
+
+	assert.Empty(t, servers, "with no vouched origin at all, servers must be empty rather than trusting any unprobed JS-static host")
+	assert.True(t, excluded["https://www.example.com"], "the legitimate host must be reported as excluded (unprobed, no primary to be same-origin with)")
+	assert.True(t, excluded["https://a.attacker.example"], "the attacker host must be reported as excluded")
+	assert.Len(t, excluded, 2, "both origins, and only both, must be reported as excluded")
+	assert.Equal(t, "API", titleHost, "with no usable origin, title must fall back to the bare default")
+}
+
+// TestExtractServers_FullyOfflineAllJSStatic_WithTargetOriginPinsLegit is the
+// companion to the test above: the SAME fully-offline, all-JS-static endpoint
+// set, but this time the caller supplies the trusted TargetOrigin (as the
+// pipeline does via crawl.ResolveTargetOrigin, derived from the capture's own
+// HTML page or --target-url — never from bundle content). With a vouched
+// origin available, the legitimate host must become both servers[0] and the
+// title host, and the attacker host must still never surface.
+func TestExtractServers_FullyOfflineAllJSStatic_WithTargetOriginPinsLegit(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://www.example.com/api/x", "static:js"),
+		makeClassified("GET", "https://a.attacker.example/api/collect", "static:js"),
+	}
+
+	servers, titleHost, excluded := extractServers(endpoints, "https://www.example.com")
+
+	require.NotEmpty(t, servers)
+	assert.Equal(t, "https://www.example.com", servers[0].URL, "the vouched TargetOrigin must be servers[0]")
+	assert.Equal(t, "www.example.com API", titleHost, "title must derive from the vouched TargetOrigin")
+	for _, s := range servers {
+		assert.NotEqual(t, "https://a.attacker.example", s.URL, "attacker origin must never appear in servers")
+	}
+	assert.True(t, excluded["https://a.attacker.example"], "attacker origin must be reported as excluded from the global list")
+}
+
+// TestExtractServers_HostlessSchemeLiteralRejected pins the LAB-4992 review
+// fix: a scheme-only literal like "https:/api/x" (single slash — not an
+// authority marker) parses via url.Parse to Scheme="https", Host="". The
+// pre-fix loop only checked the scheme, so this produced a degenerate
+// "https://" server entry — which sorts before every real hostname and, via
+// the title-from-servers[0] logic, blanked info.title (firstURL.Host == "").
+func TestExtractServers_HostlessSchemeLiteralRejected(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https:/api/x", ""),
+	}
+
+	servers, titleHost, _ := extractServers(endpoints, "")
+
+	for _, s := range servers {
+		assert.NotEqual(t, "https://", s.URL, "a scheme-only literal must not produce a degenerate \"https://\" server entry")
+	}
+	assert.Equal(t, "API", titleHost, "with no usable origin, title must fall back to the default rather than blank")
+}
+
+// TestExtractServers_HostlessTargetOriginRejected pins the TARGET-ORIGIN
+// path's host-less rejection. This function (choosePrimaryOrigin) and the
+// ENDPOINT path (collectEndpointOrigins, pinned by
+// TestExtractServers_HostlessSchemeLiteralRejected above) both go through
+// the single crawl.CanonicalOrigin (SEC-BE-001/QUAL-001) — there is no
+// longer a "separate arm" per input; both call sites share one guard.
+//
+// CanonicalOrigin itself carries a `u.Host == ""` check, and originOf (which
+// CanonicalOrigin delegates to) has its own independent `u.Host == ""`
+// check. These are NOT a symmetric pair of equivalent mutants — verified by
+// deleting each in isolation and running TestOriginOf, TestCanonicalOrigin,
+// and this test:
+//   - Deleting CanonicalOrigin's own guard alone IS semantically equivalent
+//     for all three tests: CanonicalOrigin still calls originOf
+//     unconditionally, and originOf's guard alone already makes
+//     originOf("https:/api/x") — and so CanonicalOrigin("https:/api/x") —
+//     return "". All three tests stay green.
+//   - Deleting originOf's own guard alone is NOT equivalent: TestOriginOf
+//     fails directly, because it exercises originOf itself (same package),
+//     not only through CanonicalOrigin. `originOf("/relative/path")` then
+//     returns "://" instead of "" (confirmed: `expected: "" / actual:
+//     "://"`). TestCanonicalOrigin and this test still stay green, because
+//     CanonicalOrigin's OWN guard short-circuits before ever calling
+//     originOf for a host-less URL — originOf's guard is never reached from
+//     that path, so its deletion is invisible to any test that only goes
+//     through CanonicalOrigin.
+//
+// Deleting BOTH guards is the mutation that kills every one of the three:
+// CanonicalOrigin then returns the degenerate "https://" for "https:/api/x",
+// which becomes the PRIMARY server — occupying servers[0] and displacing the
+// real observed host — the same degenerate-origin failure SEC-BE-002 closed
+// for bundle literals, just reached through --target-url instead. Verified:
+// removing both guards makes this test fail with servers[0] == "https://"
+// and titleHost == "API" instead of the real observed origin; restoring
+// either guard alone is enough to make this test (and TestCanonicalOrigin)
+// pass again — though, per above, restoring originOf's guard alone is also
+// required for TestOriginOf specifically.
+func TestExtractServers_HostlessTargetOriginRejected(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://legit.example/api/users", ""),
+	}
+
+	servers, titleHost, _ := extractServers(endpoints, "https:/api/x")
+
+	require.NotEmpty(t, servers, "the observed origin must still populate servers")
+	assert.Equal(t, "https://legit.example", servers[0].URL,
+		"an unusable targetOrigin must not become the primary server; the observed origin must")
+	for _, s := range servers {
+		assert.NotEqual(t, "https://", s.URL, "a host-less targetOrigin must not produce a degenerate \"https://\" entry")
+	}
+	assert.Equal(t, "legit.example API", titleHost,
+		"title must come from the real observed origin, not from the unusable targetOrigin")
+}
+
+// TestExtractServers_StaticHTMLCarveOut pins the doc-comment claim (computeSourceTag,
+// extractServers) that static:html is deliberately NOT filtered like a JS-static
+// source: the page carrying the <form> was fetched over the wire during the
+// crawl, unlike a JS-static candidate whose entire existence is reconstructed
+// offline. This asserts the concrete consequence: a dynamic endpoint and a
+// static:html endpoint on DIFFERENT hosts both reach the global servers list,
+// and (with no TargetOrigin) the primary/title is the lowest-sorted of the two
+// — exercising crawl.IsJSStaticSource's exclusion of "static:html" in both
+// directions (present in servers, eligible as primary).
+func TestExtractServers_StaticHTMLCarveOut(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://real.example.com/api/x", ""),
+		makeClassified("POST", "https://forms.example.com/api/submit", "static:html"),
+	}
+
+	servers, titleHost, excluded := extractServers(endpoints, "")
+
+	urls := make([]string, 0, len(servers))
+	for _, s := range servers {
+		urls = append(urls, s.URL)
+	}
+	assert.Contains(t, urls, "https://real.example.com", "the dynamic endpoint's origin must be in servers")
+	assert.Contains(t, urls, "https://forms.example.com", "the static:html endpoint's origin must be in servers (not treated as JS-static)")
+	assert.Equal(t, "forms.example.com API", titleHost, "\"forms.example.com\" sorts before \"real.example.com\" and static:html is eligible as the primary fallback")
+	assert.Empty(t, excluded, "static:html must never be reported as an excluded (cross-origin JS-static) origin")
+}
+
+// TestExtractServers_SameOriginJSStaticAdmitted is TEST-002 (LAB-4992
+// review), retargeted (round-23 review, finding B): the common offline-SPA
+// case is a JS-static endpoint recovered on the SAME origin as the trusted
+// primary (e.g. a bundle literal for a same-host API path never triggered
+// during the crawl). Its fixture uses "https://www.example.com" for the
+// observed dynamic endpoint, the static:js endpoint, AND TargetOrigin, so
+// this origin is already in serverSet (added for primary, before the
+// exclusion loop runs) by the time the loop reaches it — execution stops at
+// the `serverSet[origin]` arm ("already vouched for; a bundle naming it
+// changes nothing"), NOT at a same-origin admission arm (that arm was
+// removed as unreachable dead code; see TestCanonicalOrigin_SameOriginImpliesEquality
+// in pkg/crawl for why it could never fire). What this test still correctly
+// pins is the observable BEHAVIOR: a JS-static endpoint on the same origin as
+// the trusted primary must not produce a second `servers` entry and must not
+// be reported as excluded — regardless of which arm of the switch admits it.
+func TestExtractServers_SameOriginJSStaticAdmitted(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://www.example.com/api/users", ""),
+		makeClassified("GET", "https://www.example.com/api/offline-only", "static:js"),
+	}
+
+	servers, _, excluded := extractServers(endpoints, "https://www.example.com")
+
+	require.Len(t, servers, 1, "the same-origin JS-static endpoint must not produce a second server entry")
+	assert.Equal(t, "https://www.example.com", servers[0].URL)
+	assert.False(t, excluded["https://www.example.com"], "the trusted, same-origin host must never be reported as excluded")
+}
+
+// TestGenerate_IPv6TargetEmitsBracketedServersURL is SEC-BE-001 (LAB-4992
+// review): a bracket-less "servers" URL for an IPv6 host
+// ("https://2001:db8::1:8443") is not a valid URL — RFC 3986 requires the
+// literal to be wrapped in "[...]" so ":" inside the address isn't parsed as
+// the port delimiter. crawl.CanonicalOrigin/originOf re-bracket the host when
+// rebuilding it from url.URL.Hostname() (which strips brackets), so the
+// generated spec's servers[0] and info.title must both keep the brackets.
+func TestGenerate_IPv6TargetEmitsBracketedServersURL(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://[2001:db8::1]:8443/api/users", ""),
+	}
+
+	gen := &OpenAPIGenerator{Format: "yaml", TargetOrigin: "https://[2001:db8::1]:8443"}
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err)
+
+	var parsed struct {
+		Info struct {
+			Title string `yaml:"title"`
+		} `yaml:"info"`
+		Servers []struct {
+			URL string `yaml:"url"`
+		} `yaml:"servers"`
+	}
+	require.NoError(t, yaml.Unmarshal(spec, &parsed))
+
+	require.Len(t, parsed.Servers, 1)
+	assert.Equal(t, "https://[2001:db8::1]:8443", parsed.Servers[0].URL, "the IPv6 host must stay bracketed in the servers URL")
+	assert.Equal(t, "[2001:db8::1]:8443 API", parsed.Info.Title, "the IPv6 host must stay bracketed in info.title")
+}
+
+// TestExtractServers_ExplicitPortDedupesWithBareHostTargetOrigin is
+// SEC-BE-001/QUAL-001 (LAB-4992 review): originFromURL preserved an
+// endpoint's port EXACTLY as written while canonicalizeOrigin (applied only
+// to TargetOrigin) stripped a redundant default port — two different
+// normalizations of the same origin. An endpoint spelled with an explicit
+// ":443" therefore never string-equalled a bare-host TargetOrigin for the
+// SAME host, producing two server entries for one host. Both sides now go
+// through the single crawl.CanonicalOrigin, so they agree.
+func TestExtractServers_ExplicitPortDedupesWithBareHostTargetOrigin(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://www.example.com:443/api/users", ""),
+	}
+
+	servers, titleHost, _ := extractServers(endpoints, "https://www.example.com")
+
+	require.Len(t, servers, 1, "the explicit-port endpoint origin must dedupe against the bare-host TargetOrigin, not produce a second entry")
+	assert.Equal(t, "https://www.example.com", servers[0].URL)
+	assert.Equal(t, "www.example.com API", titleHost)
+}
+
+// TestExtractServers_MixedCaseHostDedupes is QUAL-001 (LAB-4992 review): a
+// mixed-case endpoint host (as commonly seen in captured traffic) must
+// canonicalize to the same lower-cased origin as the TargetOrigin, not
+// produce a second, case-distinct server entry.
+func TestExtractServers_MixedCaseHostDedupes(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://App.Example.com/api/users", ""),
+	}
+
+	servers, titleHost, _ := extractServers(endpoints, "https://app.example.com")
+
+	require.Len(t, servers, 1, "a mixed-case host must dedupe against the lower-cased TargetOrigin, not produce two entries")
+	assert.Equal(t, "https://app.example.com", servers[0].URL)
+	assert.Equal(t, "app.example.com API", titleHost)
+}
+
+// TestBuildOperation_CrossOriginJSStaticGetsPerOperationServersOverride is the
+// SEC-BE-001 regression guard: groupEndpoints groups purely by normalized path
+// and method, ignoring host, so a JS-static endpoint recovered on a different
+// host than the primary origin still produces a path entry in the spec even
+// though its origin is excluded from the global servers list. Without a
+// per-operation override, that path is silently attributed to the primary
+// host in every client that reads only the global servers list — sending
+// follow-up testing at the wrong target. This asserts the operation carries
+// its own servers override naming its actual origin, and that the global
+// servers list never contains that origin.
+//
+// Both halves of buildOperation's membership test are asserted here. The
+// positive half is that the excluded operation gets a per-operation servers
+// override; the negative half is that the non-excluded operation on the primary
+// origin gets none. Without the negative assertion, dropping the
+// `&& excludedOrigins[origin]` conjunct would give every operation a spurious
+// override and nothing here would fail.
+func TestBuildOperation_CrossOriginJSStaticGetsPerOperationServersOverride(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://app.example.com/api/users", ""),
+		makeClassified("GET", "https://api.example.com/api/orders", "static:js"),
+	}
+
+	gen := &OpenAPIGenerator{Format: "yaml", TargetOrigin: "https://app.example.com"}
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err)
+
+	var parsed struct {
+		Servers []struct {
+			URL string `yaml:"url"`
+		} `yaml:"servers"`
+		Paths map[string]struct {
+			Get struct {
+				Servers []struct {
+					URL string `yaml:"url"`
+				} `yaml:"servers"`
+			} `yaml:"get"`
+		} `yaml:"paths"`
+	}
+	require.NoError(t, yaml.Unmarshal(spec, &parsed))
+
+	for _, s := range parsed.Servers {
+		assert.NotEqual(t, "https://api.example.com", s.URL, "cross-origin JS-static host must not appear in the global servers list")
+	}
+
+	ordersOp, ok := parsed.Paths["/api/orders"]
+	require.True(t, ok, "expected /api/orders path in the spec")
+	require.Len(t, ordersOp.Get.Servers, 1, "cross-origin operation must carry a per-operation servers override")
+	assert.Equal(t, "https://api.example.com", ordersOp.Get.Servers[0].URL)
+
+	usersOp, ok := parsed.Paths["/api/users"]
+	require.True(t, ok, "expected /api/users path in the spec")
+	assert.Empty(t, usersOp.Get.Servers, "a non-excluded (primary-origin) operation must carry NO servers override")
+}
+
+// TestGenerate_CollisionTrustedOriginWinsSlot is the SEC-BE-001 fix
+// verification. classify.Deduplicate, NormalizePathsWithNames, and (pre-fix)
+// groupEndpoints all key host-agnostically, so a REAL endpoint observed on the
+// trusted origin and an attacker-planted JS-static literal on a different
+// origin can normalize to the exact same path+method. Pre-fix, both
+// observations landed in a single group and buildOperation derived the
+// per-operation override from group[0].URL alone — sort order decided
+// whether the attacker origin silently overrode the trusted one, or the
+// attacker path was silently attributed to the trusted host, depending only
+// on which hostname happened to sort first.
+//
+// With origin folded into endpointKey, these two observations can no longer
+// share a group — they now collide on the same (path, method) SLOT in
+// doc.Paths instead. This test asserts the deterministic resolution: the
+// trusted (primary) origin's operation always wins the slot regardless of
+// which hostname sorts first, and the attacker origin never appears in any
+// operation's servers override anywhere in the document.
+func TestGenerate_CollisionTrustedOriginWinsSlot(t *testing.T) {
+	// "a.evil.example" sorts BEFORE "app.example.com" alphabetically, so this
+	// case would have made the attacker origin win under the old
+	// group[0]-based logic.
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://app.example.com/api/users/42", ""),
+		makeClassified("GET", "https://a.evil.example/api/users/7", "static:js"),
+	}
+
+	gen := &OpenAPIGenerator{Format: "yaml", TargetOrigin: "https://app.example.com:443"}
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err)
+
+	var parsed struct {
+		Servers []struct {
+			URL string `yaml:"url"`
+		} `yaml:"servers"`
+		Paths map[string]struct {
+			Get struct {
+				Servers []struct {
+					URL string `yaml:"url"`
+				} `yaml:"servers"`
+			} `yaml:"get"`
+		} `yaml:"paths"`
+	}
+	require.NoError(t, yaml.Unmarshal(spec, &parsed))
+
+	for _, s := range parsed.Servers {
+		assert.NotEqual(t, "https://a.evil.example", s.URL, "attacker origin must never appear in the global servers list")
+	}
+	for path, pathItem := range parsed.Paths {
+		for _, s := range pathItem.Get.Servers {
+			assert.NotEqual(t, "https://a.evil.example", s.URL, "attacker origin must never appear in any operation's servers override (path %s)", path)
+		}
+	}
+
+	// Both endpoints normalize to the same path+method, so exactly one Get
+	// operation slot must exist for it, and it must belong to the trusted
+	// origin (no per-operation override needed since it IS the primary).
+	require.Len(t, parsed.Paths, 1, "both observations must collide onto a single path slot")
+	for _, pathItem := range parsed.Paths {
+		assert.Empty(t, pathItem.Get.Servers, "the trusted-origin operation that wins the slot must not carry a spurious servers override")
+	}
+
+	// The suppressed attacker-origin group must not be silently discarded —
+	// the collision loss must be recorded visibly on the winning operation.
+	assert.Contains(t, string(spec), "x-vespasian-collision-origins", "the suppressed cross-origin group's loss must be recorded visibly, not silently dropped")
+	assert.Contains(t, string(spec), "a.evil.example", "the recorded collision must name the suppressed origin")
+}
+
+// TestGenerate_ExplicitPortTrustedOriginWinsSlotAndDedupes is SEC-BE-001
+// (LAB-4992 review): reproduces the exact scenario from the finding — the
+// trusted endpoint is captured with an explicit ":443" while TargetOrigin
+// arrives in the same production shape (crawl.ResolveTargetOrigin always
+// makes the port explicit). Before the fix, originFromURL preserved the
+// endpoint's port verbatim while canonicalizeOrigin stripped TargetOrigin's,
+// so the two never string-equalled: the trusted host lost its own
+// tie-break to the attacker origin, AND the spec listed both
+// "https://app.example.com" and "https://app.example.com:443" as separate
+// servers. With both sides canonicalized identically, the trusted host must
+// win its slot and appear exactly once in servers.
+func TestGenerate_ExplicitPortTrustedOriginWinsSlotAndDedupes(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://app.example.com:443/api/users/42", ""),
+		makeClassified("GET", "https://a.evil.example/api/users/7", "static:js"),
+	}
+
+	gen := &OpenAPIGenerator{Format: "yaml", TargetOrigin: "https://app.example.com:443"}
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err)
+
+	var parsed struct {
+		Servers []struct {
+			URL string `yaml:"url"`
+		} `yaml:"servers"`
+		Paths map[string]struct {
+			Get struct {
+				Servers []struct {
+					URL string `yaml:"url"`
+				} `yaml:"servers"`
+			} `yaml:"get"`
+		} `yaml:"paths"`
+	}
+	require.NoError(t, yaml.Unmarshal(spec, &parsed))
+
+	require.Len(t, parsed.Servers, 1, "the explicit-port trusted origin must dedupe to a single server entry, not two")
+	assert.Equal(t, "https://app.example.com", parsed.Servers[0].URL)
+	for _, s := range parsed.Servers {
+		assert.NotEqual(t, "https://a.evil.example", s.URL, "attacker origin must never appear in the global servers list")
+	}
+
+	require.Len(t, parsed.Paths, 1, "both observations must collide onto a single path slot")
+	for _, pathItem := range parsed.Paths {
+		assert.Empty(t, pathItem.Get.Servers, "the trusted-origin operation that wins the slot must not carry a spurious servers override")
+	}
+
+	assert.Contains(t, string(spec), "x-vespasian-collision-origins", "the suppressed attacker group's loss must be recorded, not silently dropped")
+	assert.Contains(t, string(spec), "a.evil.example", "the recorded collision must name the suppressed attacker origin")
+}
+
+// TestGenerate_CollisionNeitherOriginPrimary_TrustRankPicksObservedOverExcluded
+// is the SEC-BE-002 fix verification. The prior tie-break compared each
+// colliding origin to primaryOrigin as a single boolean — when NEITHER
+// colliding origin IS the primary, it abstained and fell through to a plain
+// byte-compare of the (attacker-controlled) origin string. Here the REAL
+// endpoint is observed on a non-primary, non-excluded origin
+// (api.example.com — a page other than the primary served this API, but it
+// WAS actually seen on the wire) and the attacker endpoint is an unprobed,
+// cross-origin JS-static literal. Neither equals the primary
+// (app.example.com). The real, non-excluded origin must win regardless of
+// which hostname sorts first alphabetically — that is the whole point of
+// ranking by trust rather than by origin string.
+func TestGenerate_CollisionNeitherOriginPrimary_TrustRankPicksObservedOverExcluded(t *testing.T) {
+	cases := []struct {
+		name         string
+		attackerHost string
+	}{
+		{name: "attacker hostname sorts before the real observed host", attackerHost: "a.evil.example"},
+		{name: "attacker hostname sorts after the real observed host", attackerHost: "zzz.evil.example"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			attackerOrigin := "https://" + tc.attackerHost
+			endpoints := []classify.ClassifiedRequest{
+				makeClassified("GET", "https://api.example.com/api/users/42", ""),
+				makeClassified("GET", attackerOrigin+"/api/users/7", "static:js"),
+			}
+
+			gen := &OpenAPIGenerator{Format: "yaml", TargetOrigin: "https://app.example.com:443"}
+			spec, err := gen.Generate(endpoints)
+			require.NoError(t, err)
+			specStr := string(spec)
+
+			var parsed struct {
+				Servers []struct {
+					URL string `yaml:"url"`
+				} `yaml:"servers"`
+				Paths map[string]struct {
+					Get struct {
+						Servers []struct {
+							URL string `yaml:"url"`
+						} `yaml:"servers"`
+					} `yaml:"get"`
+				} `yaml:"paths"`
+			}
+			require.NoError(t, yaml.Unmarshal(spec, &parsed))
+
+			serverURLs := make([]string, 0, len(parsed.Servers))
+			for _, s := range parsed.Servers {
+				serverURLs = append(serverURLs, s.URL)
+				assert.NotEqual(t, attackerOrigin, s.URL, "attacker origin must never appear in the global servers list")
+			}
+			assert.Contains(t, serverURLs, "https://api.example.com", "the real observed endpoint's origin must remain in the global servers list")
+
+			require.Len(t, parsed.Paths, 1, "both observations must collide onto a single path slot")
+			for path, item := range parsed.Paths {
+				assert.Empty(t, item.Get.Servers,
+					"the winning operation is the real observed (non-excluded) origin, which needs no per-operation override (path %s)", path)
+			}
+
+			assert.Contains(t, specStr, "x-vespasian-collision-origins", "the suppressed attacker group's loss must be recorded, not silently dropped")
+			assert.Contains(t, specStr, tc.attackerHost, "the recorded collision must name the suppressed attacker origin")
+		})
+	}
+}
+
+// TestExtractServers_ObservedOriginNamedInBundleStaysVouched is SEC-BE-002
+// (LAB-4992 review). collectEndpointOrigins buckets an origin into `observed`
+// and `jsStatic` INDEPENDENTLY, so an origin can appear in both: dynamically
+// observed on the wire AND merely named by a bundle literal. The exclusion
+// loop used to mark every jsStatic origin that is not same-origin with primary
+// as excluded, without subtracting the origins it had just added to `servers`.
+// So `excludedOrigins` meant "appeared in a bundle", not "cannot be vouched
+// for", and a bundle that merely NAMES a real observed host demoted that host
+// to trustRank 2 — tying it with genuinely untrusted origins and dropping back
+// to the attacker-steerable byte compare the rank exists to eliminate.
+//
+// The attacker's cost is zero: a normal SPA bundle served from app.example.com
+// references https://api.example.com/... constantly, so in the ORDINARY case
+// every non-primary observed origin was already unprotected.
+func TestExtractServers_ObservedOriginNamedInBundleStaysVouched(t *testing.T) {
+	const observedAPI = "https://api.example.com"
+
+	servers, _, excluded := extractServers([]classify.ClassifiedRequest{
+		makeClassified("GET", "https://app.example.com/", ""),
+		makeClassified("GET", observedAPI+"/api/users/42", ""),
+		// The poison: the bundle names the very origin observed above.
+		makeClassified("GET", observedAPI+"/api/health", crawl.SourceStaticJS),
+	}, "https://app.example.com")
+
+	assert.False(t, excluded[observedAPI],
+		"an origin observed on the wire must stay vouched for even when a bundle also names it; otherwise trustRank demotes the real endpoint to untrusted")
+
+	var urls []string
+	for _, s := range servers {
+		urls = append(urls, s.URL)
+	}
+	assert.Contains(t, urls, observedAPI, "the observed origin must remain in the global servers list")
+}
+
+// TestGenerate_BundleNamingObservedHostCannotHandSlotToAttacker is the
+// end-to-end half of SEC-BE-002: with the poison line present, an attacker
+// origin that sorts first must still lose the (path, method) slot to the real
+// observed endpoint.
+func TestGenerate_BundleNamingObservedHostCannotHandSlotToAttacker(t *testing.T) {
+	const attacker = "https://0.evil.example"
+
+	g := &OpenAPIGenerator{Format: "yaml", TargetOrigin: "https://app.example.com"}
+	spec, err := g.Generate([]classify.ClassifiedRequest{
+		makeClassified("GET", "https://app.example.com/", ""),
+		makeClassified("GET", "https://api.example.com/api/users/42", ""),
+		makeClassified("GET", "https://api.example.com/api/health", crawl.SourceStaticJS),
+		makeClassified("GET", attacker+"/api/users/7", crawl.SourceStaticJS),
+	})
+	require.NoError(t, err)
+	specStr := string(spec)
+
+	assert.NotContains(t, specStr, "- url: "+attacker,
+		"an attacker origin must never define a server, globally or per-operation")
+	assert.Contains(t, specStr, attacker,
+		"the attacker group must still be RECORDED as suppressed rather than silently dropped")
+
+	parsed, err := openapi3.NewLoader().LoadFromData(spec)
+	require.NoError(t, err)
+	users := parsed.Paths.Find("/api/users/{userId}")
+	require.NotNil(t, users, "the real observed endpoint must own the collided slot")
+	require.NotNil(t, users.Get)
+	assert.Empty(t, users.Get.Servers,
+		"the winner is the real observed origin, which needs no per-operation override")
+	assert.Equal(t, "dynamic", users.Get.Extensions["x-vespasian-source"],
+		"the surviving operation must be the dynamically observed one, not the bundle-derived candidate")
+}
+
+// TestGenerate_ThreeOriginCollision_RecordsAllSuppressedOrigins is TEST-001
+// (LAB-4992 review): every prior collision test produced exactly ONE
+// suppressed origin, so recordCollisionOrigin's "existing" slice was always
+// nil and the append-to-existing branch never ran. Here three origins
+// collide on one (path, method) slot, so the SECOND recordCollisionOrigin
+// call must append to (not replace) the first. Asserts the full recorded
+// value, not merely that it Contains one of the two losers.
+func TestGenerate_ThreeOriginCollision_RecordsAllSuppressedOrigins(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://app.example.com/api/thing", ""),
+		makeClassified("GET", "https://other.example.com/api/thing", ""),
+		makeClassified("GET", "https://evil.example/api/thing", "static:js"),
+	}
+
+	gen := &OpenAPIGenerator{Format: "yaml", TargetOrigin: "https://app.example.com"}
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err)
+
+	var parsed map[string]any
+	require.NoError(t, yaml.Unmarshal(spec, &parsed))
+
+	paths, ok := parsed["paths"].(map[string]any)
+	require.True(t, ok, "expected a paths map")
+	require.Len(t, paths, 1, "all three observations must collide onto a single path slot")
+
+	var getOp map[string]any
+	for _, pathItemAny := range paths {
+		pathItem, ok := pathItemAny.(map[string]any)
+		require.True(t, ok)
+		getOp, ok = pathItem["get"].(map[string]any)
+		require.True(t, ok)
+	}
+	require.NotNil(t, getOp)
+
+	rawOrigins, ok := getOp["x-vespasian-collision-origins"].([]any)
+	require.True(t, ok, "expected x-vespasian-collision-origins on the winning operation")
+
+	origins := make([]string, 0, len(rawOrigins))
+	for _, o := range rawOrigins {
+		s, ok := o.(string)
+		require.True(t, ok)
+		origins = append(origins, s)
+	}
+	assert.Equal(t, []string{"https://evil.example", "https://other.example.com"}, origins,
+		"both suppressed origins must be recorded in full, not just the last one (TEST-001)")
+}
+
+// TestTrustRank_EmptyOriginIsUntrusted is TEST-001 (LAB-4992 review): an
+// empty origin (crawl.CanonicalOrigin's result for a host-less literal such
+// as "https:/api/x") is unknown provenance and must rank as the LEAST
+// trusted (2), never as trusted as the primary (0) or as an ordinary
+// non-excluded origin (1). collectEndpointOrigins skips empty origins, so ""
+// never enters excludedOrigins — the empty-origin case must be handled by
+// trustRank itself, not by excludedOrigins[""].
+//
+// The primaryOrigin == "" case is the "additional hole": choosePrimaryOrigin
+// returns "" when the run cannot vouch for any origin at all (no usable
+// TargetOrigin and no dynamically observed endpoint). Before the fix,
+// origin == primaryOrigin was checked FIRST, so "" == "" matched that arm
+// and ranked an unknown-provenance origin as rank 0 — the MOST trusted of
+// all, worse than the plain default-arm bug.
+func TestTrustRank_EmptyOriginIsUntrusted(t *testing.T) {
+	assert.Equal(t, 2, trustRank("", "https://app.example.com", map[string]bool{}),
+		"an empty origin must never rank as trusted as an ordinary non-excluded origin")
+	assert.Equal(t, 2, trustRank("", "", map[string]bool{}),
+		"an empty origin must rank untrusted even when primaryOrigin is itself empty (the run cannot vouch for any origin)")
+	assert.Equal(t, 0, trustRank("https://app.example.com", "https://app.example.com", map[string]bool{}),
+		"the primary origin itself must still rank 0")
+}
+
+// TestGenerate_HostlessOriginLiteralNeverWinsCollision is TEST-001 (LAB-4992
+// review), the end-to-end reproduction: a host-less literal such as
+// "https:/api/thing/7" (single slash — not an authority marker) canonicalizes
+// to "" via crawl.CanonicalOrigin. TargetOrigin is set to a THIRD origin
+// (app.example.com — the page the crawl actually ran against) so the real
+// observed endpoint (api.example.com) is non-primary, non-excluded, i.e.
+// rank 1 under the fixed code — exactly matching the empty origin's OLD
+// (buggy) default-arm rank of 1. At that tie, the buggy string tie-break
+// ("" sorts before every real origin string) let the attacker's host-less,
+// js-bundle-concat candidate win the (path, method) slot outright, silently
+// suppressing the real endpoint. The real endpoint must win regardless.
+func TestGenerate_HostlessOriginLiteralNeverWinsCollision(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://api.example.com/api/thing/42", ""),
+		makeClassified("GET", "https:/api/thing/7", "static:js-concat"),
+	}
+
+	gen := &OpenAPIGenerator{Format: "yaml", TargetOrigin: "https://app.example.com"}
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err)
+	specStr := string(spec)
+
+	var parsed map[string]any
+	require.NoError(t, yaml.Unmarshal(spec, &parsed))
+	paths, ok := parsed["paths"].(map[string]any)
+	require.True(t, ok, "expected a paths map")
+	require.Len(t, paths, 1, "both observations must collide onto a single path slot")
+
+	// The winning operation must be the real, observed endpoint — pinned via
+	// its x-vespasian-source: an operation built from the host-less
+	// js-bundle-concat candidate would carry x-vespasian-source:
+	// js-bundle-concat; the real endpoint (empty Source) carries no
+	// x-vespasian-source extension at all under a single-member group, but a
+	// COLLISION winner keeps its own group's tag, which for the real
+	// endpoint's group is "" (empty Source, non-JS-static) -> "dynamic" is
+	// only emitted when staticPresent is true (it is here, since the other
+	// group is JS-static), so assert the tag directly.
+	assert.NotContains(t, specStr, "js-bundle-concat",
+		"the host-less, never-probed candidate must not win the slot (its x-vespasian-source tag must not appear)")
+	assert.Contains(t, specStr, "x-vespasian-source: dynamic",
+		"the real, dynamically observed endpoint must win the slot")
+
+	// The suppressed candidate's loss must still be visible, not silently
+	// dropped, even though its own origin is "" (empty). This is the
+	// deliberate choice this code makes (recordCollisionOrigin's doc
+	// comment): the suppressed group's origin is recorded as-is, including
+	// when that origin is "" — the empty string itself communicates WHICH
+	// candidate lost (an unknown-provenance one), consistent with trustRank
+	// ranking "" as least trusted rather than a special "unknown" sentinel.
+	var getOp map[string]any
+	for _, pathItemAny := range paths {
+		pathItem, ok := pathItemAny.(map[string]any)
+		require.True(t, ok)
+		getOp, ok = pathItem["get"].(map[string]any)
+		require.True(t, ok)
+	}
+	require.NotNil(t, getOp)
+	rawOrigins, ok := getOp["x-vespasian-collision-origins"].([]any)
+	require.True(t, ok, "expected x-vespasian-collision-origins on the winning operation")
+	require.Len(t, rawOrigins, 1)
+	assert.Equal(t, "", rawOrigins[0], "the suppressed host-less candidate's loss must be recorded as the empty origin, not silently dropped")
+}
+
+// TestGenerate_PrimarySortsLaterStillWinsCollision is TEST-002 (LAB-4992
+// review): mutating trustRank's primary arm (`return 0` -> `return 1`)
+// survives the rest of the suite because every existing collision test gives
+// the primary a hostname that already sorts first alphabetically among the
+// non-excluded (rank-1) origins, so rank and string order agree and the
+// mutant is indistinguishable from correct code. Here the primary's hostname
+// ("zzz.example.com") sorts LATER than a competing non-excluded, dynamically
+// observed origin ("aaa.example.com"). Correct code (rank 0 for the primary)
+// must still make the primary win; the mutant (rank 1, tying with the
+// competitor's rank 1) would let the competitor win via the string
+// tie-break instead.
+func TestGenerate_PrimarySortsLaterStillWinsCollision(t *testing.T) {
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://zzz.example.com/api/thing/42", ""),
+		makeClassified("GET", "https://aaa.example.com/api/thing/7", ""),
+	}
+
+	gen := &OpenAPIGenerator{Format: "yaml", TargetOrigin: "https://zzz.example.com"}
+	spec, err := gen.Generate(endpoints)
+	require.NoError(t, err)
+
+	var parsed map[string]any
+	require.NoError(t, yaml.Unmarshal(spec, &parsed))
+
+	paths, ok := parsed["paths"].(map[string]any)
+	require.True(t, ok, "expected a paths map")
+	require.Len(t, paths, 1, "both observations must collide onto a single path slot")
+
+	var getOp map[string]any
+	for _, pathItemAny := range paths {
+		pathItem, ok := pathItemAny.(map[string]any)
+		require.True(t, ok)
+		getOp, ok = pathItem["get"].(map[string]any)
+		require.True(t, ok)
+	}
+	require.NotNil(t, getOp)
+
+	assert.Nil(t, getOp["servers"],
+		"the primary-origin operation that wins the slot must not carry a per-operation servers override")
+
+	// This is the assertion that actually discriminates the winner: the
+	// collision-origins extension is set only on the WINNING operation and
+	// names the LOSING origin. If the mutant (rank 1 for the primary) let
+	// the alphabetically-first "aaa.example.com" win instead, this
+	// operation's collision-origins would read "zzz.example.com" (the
+	// primary, having lost) rather than "aaa.example.com" — asserting
+	// global servers-list order or "no per-operation override" (checked
+	// above) cannot tell the two outcomes apart, since neither origin is
+	// excluded and extractServers always places the primary at servers[0]
+	// regardless of which one wins the (path, method) slot collision.
+	rawOrigins, ok := getOp["x-vespasian-collision-origins"].([]any)
+	require.True(t, ok, "expected x-vespasian-collision-origins on the winning operation")
+	origins := make([]string, 0, len(rawOrigins))
+	for _, o := range rawOrigins {
+		s, ok := o.(string)
+		require.True(t, ok)
+		origins = append(origins, s)
+	}
+	assert.Equal(t, []string{"https://aaa.example.com"}, origins,
+		"the primary (zzz.example.com) must win the slot despite sorting later alphabetically; the non-primary aaa.example.com must be the one recorded as suppressed")
+}
+
 func TestP0Fixes_ContextAwarePathParams(t *testing.T) {
 	gen := &OpenAPIGenerator{}
 
@@ -1638,6 +2444,64 @@ func TestOpenAPI_XVespasianSource_JSSourcemap(t *testing.T) {
 	}
 }
 
+// LAB-4992 / SEC-BE-001: a group whose only source is the concat reconstruction
+// tag (static:js-concat) must surface x-vespasian-source "js-bundle-concat" so
+// consumers can weight never-probed reconstructions below observed literals.
+func TestOpenAPI_XVespasianSource_JSBundleConcat(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", "static:js-concat"),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	apiX := paths["/api/x"].(map[string]interface{})
+	getOp := apiX["get"].(map[string]interface{})
+	ext, ok := getOp["x-vespasian-source"]
+	if !ok {
+		t.Fatal("expected x-vespasian-source extension to be present")
+	}
+	if ext != "js-bundle-concat" {
+		t.Errorf("expected x-vespasian-source=js-bundle-concat, got %v", ext)
+	}
+}
+
+// QUAL-003: a group mixing static:js-concat and static:js (both all-JS-static)
+// must resolve to the least-confident member, "js-bundle-concat" — not
+// "dynamic" (the pre-fix behavior; the closed allow-list still treats a
+// genuinely non-JS-static source as dynamic, but an all-JS-static mixed group
+// now resolves to its least-confident member instead). Pins that concat is a
+// distinct, lowest-confidence member of the allow-list. See
+// TestComputeSourceTag_MixedJSStaticGroups for the full confidence-ordering
+// table.
+func TestOpenAPI_XVespasianSource_MixedConcatAndBundle(t *testing.T) {
+	gen := &OpenAPIGenerator{}
+	endpoints := []classify.ClassifiedRequest{
+		makeClassified("GET", "https://h/api/x", "static:js-concat"),
+		makeClassified("GET", "https://h/api/x", "static:js"),
+	}
+	spec, err := gen.Generate(endpoints)
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal(spec, &parsed); err != nil {
+		t.Fatalf("yaml parse failed: %v", err)
+	}
+	paths := parsed["paths"].(map[string]interface{})
+	apiX := paths["/api/x"].(map[string]interface{})
+	getOp := apiX["get"].(map[string]interface{})
+	if ext := getOp["x-vespasian-source"]; ext != "js-bundle-concat" {
+		t.Errorf("expected x-vespasian-source=js-bundle-concat (least-confident of js-bundle/js-bundle-concat) for mixed group, got %v", ext)
+	}
+}
+
 func TestOpenAPI_XVespasianSource_OmittedForEmptySource(t *testing.T) {
 	gen := &OpenAPIGenerator{}
 	// No static: source anywhere in the input.
@@ -1767,7 +2631,15 @@ func TestComputeSourceTag_StaticHtmlOnlyGroupInJSCorpus_ResolvesDynamic(t *testi
 	}
 }
 
-// mixed static-only groups (static:js + static:js-sourcemap) must resolve to "dynamic".
+// QUAL-003: a group mixing distinct JS-static friendly tags (static:js +
+// static:js-sourcemap, both all-JS-static — no genuinely dynamic/non-JS-static
+// source present) must resolve to the LEAST-CONFIDENT member ("js-sourcemap"),
+// NOT "dynamic". "dynamic" is the highest-confidence label and must be
+// reserved for groups containing a real non-JS-static source; see
+// TestComputeSourceTag_MixedJSStaticGroups for the full confidence-ordering
+// table and TestComputeSourceTag_MixedEmptyAndStaticInGroup_ResolvesDynamic /
+// TestComputeSourceTag_StaticHtmlOnlyGroupInJSCorpus_ResolvesDynamic for the
+// cases that must still resolve to "dynamic".
 func TestComputeSourceTag_MixedStaticGroups(t *testing.T) {
 	gen := &OpenAPIGenerator{}
 	// Two entries for the same endpoint: one from js bundle, one from sourcemap.
@@ -1790,8 +2662,52 @@ func TestComputeSourceTag_MixedStaticGroups(t *testing.T) {
 	if !ok {
 		t.Fatal("expected x-vespasian-source extension to be present")
 	}
-	if ext != "dynamic" {
-		t.Errorf("expected x-vespasian-source=dynamic for mixed static group, got %v", ext)
+	if ext != "js-sourcemap" {
+		t.Errorf("expected x-vespasian-source=js-sourcemap (least-confident of js-bundle/js-sourcemap) for mixed all-JS-static group, got %v", ext)
+	}
+}
+
+// QUAL-003: computeSourceTag confidence-ordering table (most → least
+// confident: js-bundle > js-sourcemap > js-bundle-concat). An all-JS-static
+// mixed group resolves to the least-confident member present; "dynamic" is
+// reserved for a group containing a genuinely non-JS-static source.
+func TestComputeSourceTag_MixedJSStaticGroups(t *testing.T) {
+	tests := []struct {
+		name    string
+		sources []string
+		want    string
+	}{
+		{
+			name:    "js-bundle + js-bundle-concat -> js-bundle-concat (least confident)",
+			sources: []string{"static:js", "static:js-concat"},
+			want:    "js-bundle-concat",
+		},
+		{
+			name:    "js-sourcemap + js-bundle-concat -> js-bundle-concat (least confident)",
+			sources: []string{"static:js-sourcemap", "static:js-concat"},
+			want:    "js-bundle-concat",
+		},
+		{
+			name:    "js-bundle + js-sourcemap -> js-sourcemap (least confident of the two)",
+			sources: []string{"static:js", "static:js-sourcemap"},
+			want:    "js-sourcemap",
+		},
+		{
+			name:    "js-static mixed with a genuinely non-JS-static source -> dynamic",
+			sources: []string{"static:js", "static:html"},
+			want:    "dynamic",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var group []classify.ClassifiedRequest
+			for _, src := range tt.sources {
+				group = append(group, makeClassified("GET", "https://h/api/x", src))
+			}
+			if got := computeSourceTag(group); got != tt.want {
+				t.Errorf("computeSourceTag(%v) = %q, want %q", tt.sources, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -1856,7 +2772,7 @@ func TestBuildOperation_EmptyValuesQueryParam(t *testing.T) {
 	key := endpointKey{path: "/items", method: "get"}
 
 	// Must not panic.
-	op := buildOperation(key, group, false)
+	op := buildOperation(key, group, false, nil)
 
 	// "foo" must be absent — no observed values means we cannot document it.
 	for _, paramRef := range op.Parameters {
@@ -1892,7 +2808,7 @@ func TestBuildOperation_ScalarQueryParam(t *testing.T) {
 		},
 	}
 	key := endpointKey{path: "/items", method: "get"}
-	op := buildOperation(key, group, false)
+	op := buildOperation(key, group, false, nil)
 
 	require.Len(t, op.Parameters, 1)
 	param := op.Parameters[0].Value
@@ -1922,7 +2838,7 @@ func TestBuildOperation_MultiValueQueryParam_AllInts(t *testing.T) {
 		},
 	}
 	key := endpointKey{path: "/items", method: "get"}
-	op := buildOperation(key, group, false)
+	op := buildOperation(key, group, false, nil)
 
 	require.Len(t, op.Parameters, 1)
 	param := op.Parameters[0].Value
@@ -1956,7 +2872,7 @@ func TestBuildOperation_MultiValueQueryParam_Mixed(t *testing.T) {
 		},
 	}
 	key := endpointKey{path: "/items", method: "get"}
-	op := buildOperation(key, group, false)
+	op := buildOperation(key, group, false, nil)
 
 	require.Len(t, op.Parameters, 1)
 	param := op.Parameters[0].Value
@@ -1978,7 +2894,7 @@ func TestBuildOperation_MultiValueQueryParam_AllBool(t *testing.T) {
 		},
 	}
 	key := endpointKey{path: "/flags", method: "get"}
-	op := buildOperation(key, group, false)
+	op := buildOperation(key, group, false, nil)
 
 	require.Len(t, op.Parameters, 1)
 	param := op.Parameters[0].Value
@@ -2031,7 +2947,7 @@ func TestBuildOperation_ScalarQueryParam_OrderIndependence(t *testing.T) {
 			QueryParams: map[string][]string{"limit": {"1.5"}},
 		}},
 	}
-	op := buildOperation(endpointKey{path: "/items", method: "get"}, group, false)
+	op := buildOperation(endpointKey{path: "/items", method: "get"}, group, false, nil)
 	require.NotNil(t, op)
 	require.Len(t, op.Parameters, 1)
 	p := op.Parameters[0].Value
@@ -2067,7 +2983,7 @@ func TestBuildOperation_PostDedupScalarNotOverWidened(t *testing.T) {
 			MultiValueQueryKeys: map[string]bool{}, // empty: page was scalar in both contributing obs
 		},
 	}
-	op := buildOperation(endpointKey{path: "/items", method: "get"}, group, false)
+	op := buildOperation(endpointKey{path: "/items", method: "get"}, group, false, nil)
 	require.NotNil(t, op)
 	require.Len(t, op.Parameters, 1)
 	p := op.Parameters[0].Value
@@ -2095,7 +3011,7 @@ func TestBuildOperation_PostDedupArrayStillDetected(t *testing.T) {
 			MultiValueQueryKeys: map[string]bool{"tag": true},
 		},
 	}
-	op := buildOperation(endpointKey{path: "/items", method: "get"}, group, false)
+	op := buildOperation(endpointKey{path: "/items", method: "get"}, group, false, nil)
 	require.NotNil(t, op)
 	require.Len(t, op.Parameters, 1)
 	p := op.Parameters[0].Value
@@ -2345,4 +3261,382 @@ func TestGenerate_ResponseSchema_ArraySurvivesEmptyBaseObservation(t *testing.T)
 		assert.Contains(t, string(spec), "array",
 			"populated array response schema must survive regardless of observation order")
 	}
+}
+
+// TestUnionSchemaProperties_RecursiveAdditive verifies the Phase 3 response
+// schema union (LAB-4678): fields present in only one observation are preserved
+// both at the top level and nested under a shared object, and existing fields
+// are never removed or retyped.
+func TestUnionSchemaProperties_RecursiveAdditive(t *testing.T) {
+	strSchema := func() *openapi3.SchemaRef {
+		return &openapi3.SchemaRef{Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}}
+	}
+	objSchema := func(props map[string]*openapi3.SchemaRef) *openapi3.Schema {
+		return &openapi3.Schema{Type: &openapi3.Types{"object"}, Properties: props}
+	}
+
+	// dst: {id, user:{name}}   src: {email, user:{age}}
+	dst := objSchema(map[string]*openapi3.SchemaRef{
+		"id":   strSchema(),
+		"user": {Value: objSchema(map[string]*openapi3.SchemaRef{"name": strSchema()})},
+	})
+	src := objSchema(map[string]*openapi3.SchemaRef{
+		"email": strSchema(),
+		"user":  {Value: objSchema(map[string]*openapi3.SchemaRef{"age": strSchema()})},
+	})
+
+	unionSchemaProperties(dst, src, maxSchemaUnionDepth)
+
+	// Top-level union: id (dst-only) and email (src-only) both present.
+	assert.Contains(t, dst.Properties, "id")
+	assert.Contains(t, dst.Properties, "email")
+	// Nested union under the shared "user": both name and age present.
+	user := dst.Properties["user"].Value
+	require.NotNil(t, user)
+	assert.Contains(t, user.Properties, "name", "existing nested field retained")
+	assert.Contains(t, user.Properties, "age", "src-only nested field added")
+}
+
+// TestUnionSchemaProperties_DepthGuard verifies recursion stops at depth 0
+// without panicking (guards against pathological/cyclic inferred schemas).
+func TestUnionSchemaProperties_DepthGuard(t *testing.T) {
+	obj := &openapi3.Schema{Type: &openapi3.Types{"object"}, Properties: map[string]*openapi3.SchemaRef{
+		"a": {Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}},
+	}}
+	src := &openapi3.Schema{Type: &openapi3.Types{"object"}, Properties: map[string]*openapi3.SchemaRef{
+		"b": {Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}},
+	}}
+	unionSchemaProperties(obj, src, 0) // depth 0 -> no-op
+	assert.NotContains(t, obj.Properties, "b", "depth 0 must not merge")
+}
+
+// TestUnionSchemaProperties_ArrayItems covers the collection case, which is where
+// partial observations are most common. GET /users returning [{"id":1,"name":"a"}]
+// and later [{"id":2,"email":"b@x"}] must document all three item fields. The union
+// previously recursed only through Properties, and an array schema has none of its
+// own, so the item schema was never entered and every field after the first
+// observation was dropped.
+func TestUnionSchemaProperties_ArrayItems(t *testing.T) {
+	strSchema := func() *openapi3.SchemaRef {
+		return &openapi3.SchemaRef{Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}}
+	}
+	arrayOfObject := func(props map[string]*openapi3.SchemaRef) *openapi3.Schema {
+		return &openapi3.Schema{
+			Type: &openapi3.Types{"array"},
+			Items: &openapi3.SchemaRef{Value: &openapi3.Schema{
+				Type: &openapi3.Types{"object"}, Properties: props,
+			}},
+		}
+	}
+
+	dst := arrayOfObject(map[string]*openapi3.SchemaRef{"id": strSchema(), "name": strSchema()})
+	src := arrayOfObject(map[string]*openapi3.SchemaRef{"id": strSchema(), "email": strSchema()})
+
+	unionSchemaProperties(dst, src, maxSchemaUnionDepth)
+
+	items := dst.Items.Value
+	require.NotNil(t, items)
+	assert.Contains(t, items.Properties, "id")
+	assert.Contains(t, items.Properties, "name", "first observation's item field retained")
+	assert.Contains(t, items.Properties, "email", "second observation's item-only field must be unioned in")
+}
+
+// TestUnionSchemaProperties_NestedArrayOfObjects verifies the array recursion is
+// reachable through an object property too, and that Items consumes a depth level
+// like any other nesting step (so the existing bound still applies).
+func TestUnionSchemaProperties_NestedArrayOfObjects(t *testing.T) {
+	str := func() *openapi3.SchemaRef {
+		return &openapi3.SchemaRef{Value: &openapi3.Schema{Type: &openapi3.Types{"string"}}}
+	}
+	withItems := func(props map[string]*openapi3.SchemaRef) *openapi3.Schema {
+		return &openapi3.Schema{Type: &openapi3.Types{"object"}, Properties: map[string]*openapi3.SchemaRef{
+			"rows": {Value: &openapi3.Schema{
+				Type:  &openapi3.Types{"array"},
+				Items: &openapi3.SchemaRef{Value: &openapi3.Schema{Type: &openapi3.Types{"object"}, Properties: props}},
+			}},
+		}}
+	}
+
+	dst := withItems(map[string]*openapi3.SchemaRef{"a": str()})
+	src := withItems(map[string]*openapi3.SchemaRef{"b": str()})
+	unionSchemaProperties(dst, src, maxSchemaUnionDepth)
+	rows := dst.Properties["rows"].Value.Items.Value
+	assert.Contains(t, rows.Properties, "a")
+	assert.Contains(t, rows.Properties, "b")
+
+	// depth 2 reaches the "rows" property (1) and its items (2), so the merge lands;
+	// depth 1 stops before the items and must not.
+	shallowDst := withItems(map[string]*openapi3.SchemaRef{"a": str()})
+	unionSchemaProperties(shallowDst, src, 1)
+	assert.NotContains(t, shallowDst.Properties["rows"].Value.Items.Value.Properties, "b",
+		"array items must consume a depth level")
+}
+
+// jsonObservation builds one classified observation of the same endpoint with
+// the given status and JSON response body. Shared by the buildOperation-level
+// response-merge tests below.
+func jsonObservation(status int, body string) classify.ClassifiedRequest {
+	return classify.ClassifiedRequest{
+		ObservedRequest: crawl.ObservedRequest{
+			Method: "GET",
+			URL:    "https://api.test/users",
+			Response: crawl.ObservedResponse{
+				StatusCode:  status,
+				ContentType: "application/json",
+				Body:        []byte(body),
+			},
+		},
+		IsAPI:      true,
+		APIType:    "rest",
+		Confidence: 0.9,
+	}
+}
+
+// TestBuildOperation_TopLevelArrayResponseUnion pins the LAB-4678 audit item-10
+// fix END TO END through buildOperation, not by calling unionSchemaProperties
+// directly. The direct-call tests above all bypassed the caller guard in
+// buildOperation, which gated the union on Properties != nil — nil for a
+// top-level array — making the array recursion unreachable for exactly the
+// collection-endpoint case it was written for. Later observations' item fields
+// were silently dropped from the spec.
+func TestBuildOperation_TopLevelArrayResponseUnion(t *testing.T) {
+	group := []classify.ClassifiedRequest{
+		jsonObservation(200, `[{"id":1,"name":"a"}]`),
+		jsonObservation(200, `[{"id":2,"email":"b@x"}]`),
+	}
+
+	op := buildOperation(endpointKey{method: "GET", path: "/users"}, group, false, nil)
+
+	resp := op.Responses.Value("200")
+	require.NotNil(t, resp)
+	require.NotNil(t, resp.Value)
+	mt := resp.Value.Content["application/json"]
+	require.NotNil(t, mt)
+	require.NotNil(t, mt.Schema)
+	require.NotNil(t, mt.Schema.Value)
+
+	schema := mt.Schema.Value
+	require.Nil(t, schema.Properties, "a top-level array schema must have nil Properties (the condition that broke the guard)")
+	require.NotNil(t, schema.Items, "top-level array response must expose Items")
+	require.NotNil(t, schema.Items.Value)
+
+	props := schema.Items.Value.Properties
+	assert.Contains(t, props, "id", "field common to both observations must survive")
+	assert.Contains(t, props, "name", "field from the first observation must survive")
+	assert.Contains(t, props, "email", "field from the SECOND observation must survive the union")
+}
+
+// TestBuildOperation_ArrayResponseUnionIsOrderIndependent pins that the array
+// union does not depend on which observation buildOperation sees first, so the
+// emitted spec stays a deterministic function of the observation set.
+func TestBuildOperation_ArrayResponseUnionIsOrderIndependent(t *testing.T) {
+	forward := []classify.ClassifiedRequest{
+		jsonObservation(200, `[{"id":1,"name":"a"}]`),
+		jsonObservation(200, `[{"id":2,"email":"b@x"}]`),
+	}
+	reversed := []classify.ClassifiedRequest{
+		jsonObservation(200, `[{"id":2,"email":"b@x"}]`),
+		jsonObservation(200, `[{"id":1,"name":"a"}]`),
+	}
+
+	itemProps := func(group []classify.ClassifiedRequest) map[string]*openapi3.SchemaRef {
+		op := buildOperation(endpointKey{method: "GET", path: "/users"}, group, false, nil)
+		return op.Responses.Value("200").Value.Content["application/json"].Schema.Value.Items.Value.Properties
+	}
+
+	for _, name := range []string{"id", "name", "email"} {
+		assert.Contains(t, itemProps(forward), name, "forward order must union %q", name)
+		assert.Contains(t, itemProps(reversed), name, "reversed order must union %q", name)
+	}
+}
+
+// TestBuildOperation_PreservesRequestResponsePairingByStatus pins the pairing
+// half of LAB-4678's "spec preserves response fields and request/response
+// pairing across observations". OpenAPI expresses that correspondence only
+// through per-status response entries, so preserving it means two observations
+// of the same endpoint with different statuses keep two distinct response
+// schemas rather than collapsing into one merged shape.
+func TestBuildOperation_PreservesRequestResponsePairingByStatus(t *testing.T) {
+	group := []classify.ClassifiedRequest{
+		jsonObservation(200, `{"id":1,"name":"ok"}`),
+		jsonObservation(422, `{"error":"bad","field":"name"}`),
+	}
+
+	op := buildOperation(endpointKey{method: "GET", path: "/users"}, group, false, nil)
+
+	okResp := op.Responses.Value("200")
+	errResp := op.Responses.Value("422")
+	require.NotNil(t, okResp, "200 observation must keep its own response entry")
+	require.NotNil(t, errResp, "422 observation must keep its own response entry")
+
+	okProps := okResp.Value.Content["application/json"].Schema.Value.Properties
+	errProps := errResp.Value.Content["application/json"].Schema.Value.Properties
+
+	assert.Contains(t, okProps, "name")
+	assert.NotContains(t, okProps, "error", "the 422 body must not leak into the 200 schema")
+	assert.Contains(t, errProps, "error")
+	assert.NotContains(t, errProps, "id", "the 200 body must not leak into the 422 schema")
+}
+
+// TestComputeSourceTag_TotalOverEveryJSStaticSource pins the contract stated on
+// computeSourceTag: for non-empty input it returns exactly one of "dynamic",
+// "js-bundle", "js-sourcemap" — never "".
+//
+// It iterates every Source that crawl.IsJSStaticSource accepts, because that set is
+// what broke the contract: LAB-4678 added static:js-nextroute and static:js-nextpage
+// to IsJSStaticSource without adding them to computeSourceTag's switch, so those
+// groups fell through with friendly == "" and emitted no extension. Enumerating the
+// set here means the next Source added to IsJSStaticSource fails this test instead of
+// silently producing an empty tag.
+func TestComputeSourceTag_TotalOverEveryJSStaticSource(t *testing.T) {
+	jsStaticSources := []string{
+		crawl.SourceStaticJS,
+		crawl.SourceStaticJSSourcemap,
+		crawl.SourceNextRouteHandler,
+		crawl.SourceNextPageRoute,
+	}
+	for _, src := range jsStaticSources {
+		require.True(t, crawl.IsJSStaticSource(src),
+			"%q must be in the IsJSStaticSource set this test enumerates", src)
+	}
+
+	// Every JS-static source now has its OWN name rather than collapsing to
+	// "dynamic". A recovered Next.js route that reaches the generator must not
+	// claim it was dynamically observed — it was read off a chunk URL and never
+	// requested.
+	valid := []string{"dynamic", "js-bundle", "js-sourcemap", "js-nextroute", "js-nextpage"}
+	mk := func(src string) classify.ClassifiedRequest {
+		return classify.ClassifiedRequest{ObservedRequest: crawl.ObservedRequest{Source: src}}
+	}
+
+	for _, src := range jsStaticSources {
+		t.Run("uniform "+src, func(t *testing.T) {
+			got := computeSourceTag([]classify.ClassifiedRequest{mk(src), mk(src)})
+			assert.Contains(t, valid, got,
+				"a uniform %q group returned %q; non-empty input must always yield one of "+
+					"the contract values, and anything else means no extension is emitted at all", src, got)
+			assert.NotEqual(t, "dynamic", got,
+				"a uniform %q group must not report %q: the endpoint was recovered "+
+					"statically and never requested", src, "dynamic")
+		})
+		t.Run("mixed with static:js "+src, func(t *testing.T) {
+			got := computeSourceTag([]classify.ClassifiedRequest{mk(crawl.SourceStaticJS), mk(src)})
+			assert.Contains(t, valid, got)
+		})
+	}
+
+	// The two contract-named sources must still map to their own values, so the
+	// totality fix did not flatten everything to "dynamic".
+	assert.Equal(t, "js-bundle", computeSourceTag([]classify.ClassifiedRequest{mk(crawl.SourceStaticJS)}))
+	assert.Equal(t, "js-sourcemap", computeSourceTag([]classify.ClassifiedRequest{mk(crawl.SourceStaticJSSourcemap)}))
+	assert.Equal(t, "dynamic", computeSourceTag([]classify.ClassifiedRequest{mk("")}))
+	assert.Equal(t, "", computeSourceTag(nil), "the empty-group contract is unchanged")
+}
+
+// allJSStaticSources is every Source constant crawl.IsJSStaticSource accepts.
+// Written out rather than derived, because the point of the two tests below is to
+// fail when pkg/crawl gains a source that pkg/generate/rest was not taught about —
+// deriving the list from the predicate under test would make both vacuous.
+//
+// Adding a source to crawl.IsJSStaticSource means adding it here, to
+// friendlySourceTag, and to jsStaticSourceRank. That three-site edit is the
+// hazard; these tests are what turn a missed site into a failure.
+var allJSStaticSources = []string{
+	crawl.SourceStaticJS,
+	crawl.SourceStaticJSSourcemap,
+	crawl.SourceStaticJSConcat,
+	crawl.SourceNextRouteHandler,
+	crawl.SourceNextPageRoute,
+}
+
+// TestAllJSStaticSources_MatchesIsJSStaticSource keeps the hand-written list above
+// honest in the only direction that matters: it must not be a stale SUBSET of what
+// crawl.IsJSStaticSource accepts, since a missing entry silently narrows both tests
+// below to the sources someone remembered.
+//
+// The reverse direction is also checked — an entry the predicate rejects means the
+// list is describing a source that no longer exists.
+func TestAllJSStaticSources_MatchesIsJSStaticSource(t *testing.T) {
+	for _, src := range allJSStaticSources {
+		assert.True(t, crawl.IsJSStaticSource(src),
+			"%q is in allJSStaticSources but crawl.IsJSStaticSource rejects it", src)
+	}
+	// Every "static:*" constant crawl declares, so a NEW JS-bundle source added
+	// there but not here is caught rather than assumed absent.
+	for _, src := range []string{
+		crawl.SourceStaticJS,
+		crawl.SourceStaticJSSourcemap,
+		crawl.SourceStaticJSConcat,
+		crawl.SourceNextRouteHandler,
+		crawl.SourceNextPageRoute,
+	} {
+		assert.Contains(t, allJSStaticSources, src,
+			"crawl declares JS-static source %q; add it to allJSStaticSources, friendlySourceTag "+
+				"and jsStaticSourceRank", src)
+	}
+}
+
+// TestFriendlySourceTag_TotalOverJSStaticSources asserts the property
+// computeSourceTag's doc comment claims: every source crawl.IsJSStaticSource
+// accepts has a name in the consumer contract.
+//
+// Without this, a source known to IsJSStaticSource but not to friendlySourceTag
+// took the "not named" branch. Before the LAB-4678 x LAB-4992 merge that branch
+// returned "dynamic" outright, so a group recovered entirely from offline JS
+// analysis was labeled directly observed — the highest-confidence label, on an
+// endpoint that was never requested.
+func TestFriendlySourceTag_TotalOverJSStaticSources(t *testing.T) {
+	for _, src := range allJSStaticSources {
+		t.Run(src, func(t *testing.T) {
+			tag, ok := friendlySourceTag(src)
+			assert.True(t, ok, "friendlySourceTag(%q) reported no name; the consumer contract "+
+				"must name every JS-static source", src)
+			assert.NotEmpty(t, tag, "a named source must map to a non-empty tag")
+			assert.NotEqual(t, "dynamic", tag,
+				"a JS-static source must never be labeled dynamic — that claims direct observation")
+		})
+	}
+}
+
+// TestJSStaticSourceRank_CoversEveryFriendlyTag pins the invariant that makes
+// computeSourceTag's least-confident selection work: every tag friendlySourceTag
+// can return needs an explicit jsStaticSourceRank entry.
+//
+// A missing entry does not fail loudly. Map lookup yields 0, which is js-bundle's
+// rank — the MOST-confident label — so the unranked source wins the first
+// comparison (0 > -1) and a later genuine js-bundle then fails 0 > 0. The group's
+// x-vespasian-source extension is either wrong or suppressed entirely. main
+// documented that failure (QUAL-005) for the three tags it knew about; the merge
+// added two more, which is why the invariant is asserted here rather than trusted.
+func TestJSStaticSourceRank_CoversEveryFriendlyTag(t *testing.T) {
+	seen := map[int]string{}
+	for _, src := range allJSStaticSources {
+		tag, ok := friendlySourceTag(src)
+		require.True(t, ok, "friendlySourceTag(%q) must name every JS-static source", src)
+
+		rank, present := jsStaticSourceRank[tag]
+		assert.True(t, present,
+			"tag %q (from source %q) has no jsStaticSourceRank entry; the zero-value lookup "+
+				"collides with js-bundle's rank 0 and corrupts the group's source tag", tag, src)
+
+		if other, dup := seen[rank]; dup {
+			t.Errorf("tags %q and %q share rank %d; the ordering must be total or "+
+				"least-confident selection depends on map iteration order", other, tag, rank)
+		}
+		seen[rank] = tag
+	}
+
+	// leastConfidentJSStaticTag is the fallback for an unranked JS-static source,
+	// so it has to actually be the last tag, not merely a valid one.
+	assert.Equal(t, len(allJSStaticSources), len(jsStaticSourceRank),
+		"jsStaticSourceRank holds an entry for a tag friendlySourceTag cannot return, "+
+			"which lets leastConfidentJSStaticTag point at a tag no source maps to")
+	maxRank := -1
+	for _, r := range jsStaticSourceRank {
+		if r > maxRank {
+			maxRank = r
+		}
+	}
+	assert.Equal(t, maxRank, jsStaticSourceRank[leastConfidentJSStaticTag],
+		"leastConfidentJSStaticTag (%q) is not the highest-ranked tag", leastConfidentJSStaticTag)
 }

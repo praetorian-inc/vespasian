@@ -33,6 +33,7 @@ import (
 
 	"github.com/praetorian-inc/vespasian/internal/pipeline"
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 	"github.com/praetorian-inc/vespasian/pkg/importer"
 )
 
@@ -148,9 +149,7 @@ func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl
 		if err := crawl.ValidateProxyAddr(opts.Proxy); err != nil {
 			return nil, err
 		}
-		if u, err := url.Parse(opts.Proxy); err == nil && u.Port() == "" {
-			fmt.Fprintf(stderr, "warning: --proxy address %q has no explicit port; most proxies require one (e.g., :8080)\n", opts.Proxy) //nolint:errcheck // best-effort warning
-		}
+		warnProxyNoPort(stderr, opts.Proxy)
 	}
 
 	crawler := crawl.NewCrawler(opts)
@@ -207,15 +206,38 @@ func doCrawl(ctx context.Context, stderr io.Writer, targetURL string, opts crawl
 	return requests, nil
 }
 
+// captureFileMode is the mode every file writeOutput produces must end up with.
+//
+// 0600 because capture.json carries per-request Headers and Response.Headers verbatim
+// from the browser and the HTTP backend, so an authenticated crawl (-H "Authorization:
+// ...", session cookies) lands operator and target credentials on disk through this one
+// function. TestWriteOutput_FileModeIs0600 asserts the mode the file actually lands at,
+// on both the fresh and the pre-existing path; before that nothing did, and grep for
+// Mode().Perm() across the module returned nothing (LAB-4678 review, SEC-BE-001).
+const captureFileMode = 0o600
+
 // writeOutput opens the output file (or stdout if path is empty), calls fn to
 // write content, and ensures the file is closed properly.
+//
+// The mode is applied with Chmod after the open, not left to O_CREATE. O_CREATE's perm
+// argument takes effect only when the call actually CREATES the file, so with O_TRUNC
+// and no O_EXCL, re-running a scan over an existing capture.json — one from an older
+// build, a shell redirect, or a copy made under a looser umask — truncated and rewrote
+// it while KEEPING its original mode. The source said 0600 and the credentials landed
+// in a world-readable file. Chmod on the descriptor rather than the path so the mode is
+// set on the file just opened and not on whatever the path resolves to next.
 func writeOutput(path string, fn func(io.Writer) error) error {
 	if path == "" {
 		return fn(os.Stdout)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600) //nolint:gosec // G304: CLI tool, user controls output path
+	// #nosec G304 -- the path IS the operator's -o flag; gosec's os.Root autofix would scope away the feature.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, captureFileMode)
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	if err := f.Chmod(captureFileMode); err != nil {
+		closeErr := f.Close()
+		return errors.Join(fmt.Errorf("failed to set output file permissions: %w", err), closeErr)
 	}
 	writeErr := fn(f)
 	closeErr := f.Close()
@@ -234,16 +256,48 @@ type CrawlOptions struct {
 	Output          string        `short:"o" help:"Output file path"`
 	Depth           int           `default:"3" help:"Maximum crawl depth"`
 	MaxPages        int           `default:"100" help:"Maximum number of pages (URLs visited) to crawl; pages already in flight when the limit is reached still finish"`
+	MaxRequests     int           `name:"max-requests" default:"0" help:"Captured-request budget (0 = unlimited). A rate/politeness bound distinct from --max-pages. A page's estimated request cost is reserved before the page starts and reconciled against the actual count when it finishes, so the total does NOT scale with --concurrency. The estimate is the running mean of requests per page. Overshoot is bounded by the page that crosses the limit, since in-flight pages finish rather than being cut mid-capture; the budget may also be UNDER-spent, because a page not estimated to fit does not start."`
+	Interact        bool          `name:"interact" help:"Click page controls (buttons, [role=button], [onclick]) to surface endpoints that only fire on interaction. Includes form submit buttons, so it submits forms and can mutate state. Headless backend only. Skips destructive, session-ending, and payment-commit labels on a best-effort match. Off by default."`
 	Timeout         time.Duration `default:"10m" help:"Maximum duration for the entire crawl"`
 	Scope           string        `default:"same-origin" enum:"same-origin,same-domain" help:"Crawl scope"`
 	Headless        bool          `default:"true" help:"Use headless browser"`
-	Proxy           string        `help:"Proxy address for the crawl stage (e.g., http://127.0.0.1:8080); http/https/socks5. Routes crawl traffic through the proxy on both crawler backends: Chrome (headless) or the net/http transport (--headless=false). Probe and JS-replay traffic is not proxied. TLS verification stays on by default; use --proxy-insecure to accept an intercepting proxy's MITM certificate on the net/http backend. With --proxy the dial-time SSRF IP pin is skipped for the proxy connection; URL scope is still enforced, so private targets still require --dangerous-allow-private."`
-	ProxyInsecure   bool          `name:"proxy-insecure" help:"Disable TLS certificate verification for an http/https intercepting proxy (Burp/mitmproxy MITM) on the net/http backend (--headless=false). Off by default; no effect on socks5 or the headless backend (there, trust the proxy CA via the OS trust store instead)."`
+	Proxy           string        `help:"Proxy address (e.g., http://127.0.0.1:8080); http/https/socks5. In crawl, routes the crawl stage (Chrome headless or the net/http transport) plus jsstatic sourcemap fetches; in scan, additionally routes the probe (OPTIONS/schema/WSDL-fetch/GraphQL introspection/gRPC reflection) and JS-replay stages (all net/http). TLS verification stays on by default; use --proxy-insecure to accept an http/https intercepting proxy's MITM certificate (socks5 always verifies). With --proxy the dial-time SSRF IP pin is skipped for the proxy connection; URL scope is still enforced against the target's initial hostname resolution, so private targets still require --dangerous-allow-private — but this guard is best-effort and does NOT survive DNS rebinding through the proxy (the proxy re-resolves the host when it dials)."`
+	ProxyInsecure   bool          `name:"proxy-insecure" help:"Disable TLS verification for the net/http stages routed through an http/https intercepting proxy (Burp/mitmproxy MITM): the crawl stage (only with --headless=false) plus — regardless of --headless — jsstatic sourcemap fetch, and (scan only) probe, WSDL discovery, and JS-replay. Off by default. No effect on socks5 (always verifies), on the gRPC target's certificate verification (governed solely by --grpc-insecure-skip-verify) — though for an https-scheme proxy --proxy-insecure DOES disable verification of the proxy's own certificate on that dial's CONNECT leg — or on the headless crawl backend (validate against the OS trust store, so trust the proxy CA out-of-band there)."`
 	Concurrency     int           `default:"10" help:"Number of concurrent browser tabs for headless crawling"`
 	NoRequestID     bool          `name:"no-request-id" help:"Disable automatic X-Vespasian-Request-Id header"`
 	Verbose         bool          `short:"v" help:"Enable verbose logging"`
 	AnalyzeJS       bool          `name:"analyze-js"      default:"true"  help:"Statically analyze captured JS bundles to discover API endpoints, parameters, and request bodies."`
 	FetchSourcemaps bool          `name:"fetch-sourcemaps" default:"true"  help:"When --analyze-js is set, fetch .js.map sourcemaps referenced via //# sourceMappingURL= comments to recover original sources."`
+}
+
+// crawlerOptions maps the shared CLI crawl flags onto crawl.CrawlerOptions.
+//
+// It exists so there is exactly ONE mapping, called by both CrawlCmd.Run and
+// ScanCmd.Run. The two commands previously each built this literal inline, which
+// made "wire the flag into one command and forget the other" a live failure mode:
+// a new flag could work under `vespasian crawl` and silently do nothing under
+// `vespasian scan`, and no test compared the two blocks. That is exactly how
+// --max-requests and --interact shipped with neither wiring asserted (LAB-4678
+// review, TEST-001). With one constructor the divergence is not merely untested,
+// it is unrepresentable.
+//
+// allowPrivate is a parameter rather than a CrawlOptions field because each command
+// declares its own --dangerous-allow-private with command-specific help text: on
+// CrawlCmd it covers the crawl only, on ScanCmd the crawl and the probe path.
+func (o CrawlOptions) crawlerOptions(allowPrivate bool) crawl.CrawlerOptions {
+	return crawl.CrawlerOptions{
+		Depth:         o.Depth,
+		MaxPages:      o.MaxPages,
+		MaxRequests:   o.MaxRequests,
+		Interact:      o.Interact,
+		Timeout:       o.Timeout,
+		Scope:         o.Scope,
+		Headless:      o.Headless,
+		Proxy:         o.Proxy,
+		ProxyInsecure: o.ProxyInsecure,
+		Concurrency:   o.Concurrency,
+		AllowPrivate:  allowPrivate,
+	}
 }
 
 // SlugOptions holds the path-normalization flags shared by GenerateCmd and ScanCmd.
@@ -362,23 +416,39 @@ type CrawlCmd struct {
 	CrawlOptions
 }
 
+// buildAugmentOptions assembles the pipeline.AugmentOptions shared by the crawl,
+// generate, and scan commands' JS-static stage. Centralized (QUAL-001) so a new
+// AugmentOptions field is wired in one place instead of being triplicated across
+// the three per-command augmentOptions builders — a miss there would silently drop
+// the field for one subcommand. Each command's augmentOptions delegates here.
+func buildAugmentOptions(analyzeJS, fetchSourcemaps, allowPrivate, verbose bool, proxy httpx.ProxyConfig) pipeline.AugmentOptions {
+	return pipeline.AugmentOptions{
+		AnalyzeJS:       analyzeJS,
+		FetchSourcemaps: fetchSourcemaps,
+		AllowPrivate:    allowPrivate,
+		Status:          statusWriter(verbose),
+		WarnError:       os.Stderr,
+		Proxy:           proxy,
+	}
+}
+
+// augmentOptions builds the pipeline.AugmentOptions for this command's JS-static
+// stage from its flags plus the already-parsed proxy config threaded in by Run.
+// Delegates to buildAugmentOptions (QUAL-001). Extracted so a CLI-boundary test
+// can assert the proxy (and each other flag) reaches pipeline.AugmentOptions
+// without executing Run().
+func (c *CrawlCmd) augmentOptions(proxy httpx.ProxyConfig) pipeline.AugmentOptions {
+	return buildAugmentOptions(c.AnalyzeJS, c.FetchSourcemaps, c.DangerousAllowPrivate, c.Verbose, proxy)
+}
+
 // Run executes the crawl command.
 func (c *CrawlCmd) Run() error {
 	if err := validateURL(c.URL); err != nil {
 		return err
 	}
 
-	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions, crawl.CrawlerOptions{
-		Depth:         c.Depth,
-		MaxPages:      c.MaxPages,
-		Timeout:       c.Timeout,
-		Scope:         c.Scope,
-		Headless:      c.Headless,
-		Proxy:         c.Proxy,
-		ProxyInsecure: c.ProxyInsecure,
-		Concurrency:   c.Concurrency,
-		AllowPrivate:  c.DangerousAllowPrivate,
-	})
+	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions,
+		c.crawlerOptions(c.DangerousAllowPrivate))
 	if err != nil {
 		return err
 	}
@@ -404,18 +474,15 @@ func (c *CrawlCmd) Run() error {
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
+	// c.Proxy was validated fail-fast by doCrawl above; on the (unreachable) error
+	// parseProxyConfigOrEmpty falls back to no proxy.
+	crawlProxy := parseProxyConfigOrEmpty(c.Proxy, c.ProxyInsecure)
 	// NOTE: running `crawl` (with --analyze-js) followed by `generate` (also
 	// with --analyze-js, the default) does NOT re-analyze the same JS bundles.
 	// AnalyzeJS's idempotency guard (crawl.AnyStaticSource) detects the
 	// static:js entries this stage writes into the capture and short-circuits the
 	// second analysis, so `crawl | generate` is byte-identical to a single `scan`.
-	requests = pipeline.AnalyzeJS(bs.ctx, requests, pipeline.AugmentOptions{
-		AnalyzeJS:       c.AnalyzeJS,
-		FetchSourcemaps: c.FetchSourcemaps,
-		AllowPrivate:    c.DangerousAllowPrivate,
-		Status:          statusWriter(c.Verbose),
-		WarnError:       os.Stderr,
-	})
+	requests = pipeline.AnalyzeJS(bs.ctx, requests, c.augmentOptions(crawlProxy))
 
 	return writeOutput(c.Output, func(w io.Writer) error {
 		return crawl.WriteCapture(w, requests)
@@ -478,16 +545,21 @@ type GenerateCmd struct {
 	Header    []string `short:"H" help:"Custom headers (repeatable, \"Key: Value\") forwarded to same-origin JS-replay bundle fetches and probes (e.g. Authorization). Mirrors scan's -H; needed to recover endpoints behind auth in the two-stage crawl→generate flow. Never forwarded cross-origin."`
 	TargetURL string   `name:"target-url" help:"Origin to run JS-replay against (scheme://host[:port]). Overrides the default heuristic of deriving the origin from the capture's first HTML page. Use for imported/mixed-origin captures (HAR/Burp) whose first entry may be a third-party host."`
 
+	Proxy         string `help:"Proxy address (e.g., http://127.0.0.1:8080); http/https/socks5. Routes the probe (OPTIONS/schema/WSDL-fetch/GraphQL introspection/gRPC reflection), JS-replay, and jsstatic sourcemap-fetch traffic through the proxy. TLS verification stays on by default; use --proxy-insecure to accept an http/https intercepting proxy's MITM certificate (socks5 always verifies). The dial-time SSRF IP pin is skipped for the proxy connection; URL scope is still enforced against the target's initial hostname resolution, so private targets still require --dangerous-allow-private — but this guard is best-effort and does NOT survive DNS rebinding through the proxy (the proxy re-resolves the host when it dials)."`
+	ProxyInsecure bool   `name:"proxy-insecure" help:"Disable TLS verification for the net/http stages routed through an http/https intercepting proxy (Burp/mitmproxy MITM): probe, JS-replay, and jsstatic sourcemap fetch. Off by default. No effect on socks5 (always verifies the real target) or on the gRPC target's certificate verification (governed solely by --grpc-insecure-skip-verify) — though for an https-scheme proxy --proxy-insecure DOES disable verification of the proxy's own certificate on that dial's CONNECT leg."`
+
 	SlugOptions
 }
 
 // maxCaptureSize is the maximum capture file size (100MB).
 const maxCaptureSize = 100 * 1024 * 1024
 
-// options builds the pipeline.Options for this command from its flags. Extracted
-// so a CLI-boundary test can assert each flag reaches pipeline.Options (catching a
-// dropped assignment) without executing Run().
-func (c *GenerateCmd) options() pipeline.Options {
+// options builds the pipeline.Options for this command from its flags plus the
+// already-parsed proxy config threaded in by Run (from resolveJSReplayConfig,
+// which fail-fast validates --proxy). Accepting proxy here means GenerateCmd
+// parses --proxy exactly once. Extracted so a CLI-boundary test can assert each
+// flag reaches pipeline.Options (catching a dropped assignment) without Run().
+func (c *GenerateCmd) options(proxy httpx.ProxyConfig) pipeline.Options {
 	return pipeline.Options{
 		APIType:                c.APIType,
 		Confidence:             c.Confidence,
@@ -498,7 +570,25 @@ func (c *GenerateCmd) options() pipeline.Options {
 		MergeSlugs:             c.MergeSlugs,
 		SlugThreshold:          c.SlugThreshold,
 		Status:                 statusWriter(c.Verbose),
+		Proxy:                  proxy,
+		// Warnings is NOT gated on --verbose (unlike Status above): the
+		// SEC-BE-001 cross-origin skip warning must always be visible to the
+		// operator, mirroring buildJSReplayConfig's unconditional Stderr wire.
+		Warnings: os.Stderr,
+		// Reuses the same --target-url value already handed to the JS-replay
+		// stage (see resolveJSReplayConfig) so both stages agree on the scan's
+		// origin for their respective cross-origin gates (SEC-BE-001).
+		TargetURL: c.TargetURL,
 	}
+}
+
+// augmentOptions builds the pipeline.AugmentOptions for this command's
+// static-HTML-forms + JS-static stage from its flags plus the already-parsed
+// proxy config threaded in by Run. Delegates to buildAugmentOptions (QUAL-001).
+// Extracted so a CLI-boundary test can assert the proxy (and each other flag)
+// reaches pipeline.AugmentOptions without Run().
+func (c *GenerateCmd) augmentOptions(proxy httpx.ProxyConfig) pipeline.AugmentOptions {
+	return buildAugmentOptions(c.AnalyzeJS, c.FetchSourcemaps, c.DangerousAllowPrivate, c.Verbose, proxy)
 }
 
 // resolveJSReplayConfig parses --header and validates --target-url, then
@@ -519,7 +609,12 @@ func (c *GenerateCmd) resolveJSReplayConfig() (crawl.JSReplayConfig, error) {
 		return crawl.JSReplayConfig{}, err
 	}
 
-	return buildJSReplayConfig(headers, c.TargetURL, c.DangerousAllowPrivate, c.Verbose), nil
+	proxy, err := parseProxyConfig(c.Proxy, c.ProxyInsecure)
+	if err != nil {
+		return crawl.JSReplayConfig{}, err
+	}
+
+	return buildJSReplayConfig(headers, c.TargetURL, c.DangerousAllowPrivate, c.Verbose, proxy), nil
 }
 
 // Run executes the generate command.
@@ -534,6 +629,7 @@ func (c *GenerateCmd) Run() (err error) {
 	if err != nil {
 		return err
 	}
+	warnProxyNoPort(os.Stderr, c.Proxy)
 
 	f, err := os.Open(c.Capture)
 	if err != nil {
@@ -570,22 +666,18 @@ func (c *GenerateCmd) Run() (err error) {
 	// static analysis in the canonical forms-then-jsstatic order (see
 	// pipeline.Augment). Captures produced by crawl/import (which don't run form
 	// extraction inline) get the same treatment as captures produced by scan.
-	requests = pipeline.Augment(ctx, requests, pipeline.AugmentOptions{
-		AnalyzeJS:       c.AnalyzeJS,
-		FetchSourcemaps: c.FetchSourcemaps,
-		AllowPrivate:    c.DangerousAllowPrivate,
-		Status:          statusWriter(c.Verbose),
-		WarnError:       os.Stderr,
-	})
+	requests = pipeline.Augment(ctx, requests, c.augmentOptions(jsReplayCfg.Proxy))
 
 	warnSSRFDisabled(c.DangerousAllowPrivate, c.Probe)
 
 	// Replay JS-extracted URLs with raw HTTP so the two-stage crawl→generate
 	// workflow recovers SPA endpoints that exist only inside JS bundles (e.g.
 	// concat-style paths), matching what scan does (LAB-3892). Static JS
-	// analysis (pipeline.Augment above) surfaces literal paths, but concat /
-	// service-prefix forms need the active re-fetch to be reconstructed and
-	// confirmed. Gated on c.Probe && c.AnalyzeJS — the same gate scan uses — so
+	// analysis (pipeline.Augment above) already reconstructs literal, concat,
+	// and service-prefix forms fully offline as unprobed candidates; replay
+	// additionally re-fetches them, probes them, 404-filters them, and performs
+	// the speculative service-prefix fan-out the offline pass deliberately
+	// omits. Gated on c.Probe && c.AnalyzeJS — the same gate scan uses — so
 	// --probe=false or --analyze-js=false keeps generate passive (see
 	// maybeReplayJSExtracted). --header/-H supplies the auth headers the capture
 	// can't preserve (forwarded only to same-origin fetches/probes), and
@@ -594,7 +686,7 @@ func (c *GenerateCmd) Run() (err error) {
 	// still be reachable at generate time.
 	requests = maybeReplayJSExtracted(ctx, requests, c.Probe && c.AnalyzeJS, jsReplayCfg)
 
-	spec, err := pipeline.ClassifyProbeGenerate(ctx, requests, c.options())
+	spec, err := pipeline.ClassifyProbeGenerate(ctx, requests, c.options(jsReplayCfg.Proxy))
 	if err != nil {
 		return err
 	}
@@ -622,10 +714,11 @@ type ScanCmd struct {
 // scanOptions builds the pipeline.ScanOptions for this command. The c-derived
 // fields (incl. GRPCInsecureSkipVerify) are collected here so a CLI-boundary test
 // can assert each flag reaches pipeline.ScanOptions (catching a dropped assignment)
-// without executing Run(). The two runtime-derived inputs — the resolved apiType
-// and the AfterWSDL closure (which captures bs.opts.Headers/c/c.URL) — are passed
-// in by Run().
-func (c *ScanCmd) scanOptions(apiType string, afterWSDL func(ctx context.Context, reqs []crawl.ObservedRequest) []crawl.ObservedRequest) pipeline.ScanOptions {
+// without executing Run(). The three runtime-derived inputs — the resolved apiType,
+// the AfterWSDL closure (which captures bs.opts.Headers/c/c.URL), and the parsed
+// proxy — are passed in by Run(), which parses --proxy once (parseProxyConfigOrEmpty)
+// and reuses it across the crawl, sourcemap, JS-replay, and probe stages.
+func (c *ScanCmd) scanOptions(apiType string, afterWSDL func(ctx context.Context, reqs []crawl.ObservedRequest) []crawl.ObservedRequest, proxy httpx.ProxyConfig) pipeline.ScanOptions {
 	return pipeline.ScanOptions{
 		TargetURL:              c.URL,
 		APIType:                apiType,
@@ -637,8 +730,20 @@ func (c *ScanCmd) scanOptions(apiType string, afterWSDL func(ctx context.Context
 		MergeSlugs:             c.MergeSlugs,
 		SlugThreshold:          c.SlugThreshold,
 		Status:                 statusWriter(c.Verbose),
-		AfterWSDL:              afterWSDL,
+		// Not gated on --verbose — see GenerateCmd.options's identical field.
+		Warnings:  os.Stderr,
+		AfterWSDL: afterWSDL,
+		Proxy:     proxy,
 	}
+}
+
+// augmentOptions builds the pipeline.AugmentOptions for this command's
+// static-HTML-forms + JS-static stage from its flags plus the already-parsed
+// proxy config threaded in by Run. Delegates to buildAugmentOptions (QUAL-001).
+// Extracted so a CLI-boundary test can assert the proxy (and each other flag)
+// reaches pipeline.AugmentOptions without Run().
+func (c *ScanCmd) augmentOptions(proxy httpx.ProxyConfig) pipeline.AugmentOptions {
+	return buildAugmentOptions(c.AnalyzeJS, c.FetchSourcemaps, c.DangerousAllowPrivate, c.Verbose, proxy)
 }
 
 // Run executes the scan command (crawl + generate pipeline).
@@ -651,17 +756,8 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 		return err
 	}
 
-	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions, crawl.CrawlerOptions{
-		Depth:         c.Depth,
-		MaxPages:      c.MaxPages,
-		Timeout:       c.Timeout,
-		Scope:         c.Scope,
-		Headless:      c.Headless,
-		Proxy:         c.Proxy,
-		ProxyInsecure: c.ProxyInsecure,
-		Concurrency:   c.Concurrency,
-		AllowPrivate:  c.DangerousAllowPrivate,
-	})
+	bs, err := setupBrowserAndSignals(c.Header, c.CrawlOptions,
+		c.crawlerOptions(c.DangerousAllowPrivate))
 	if err != nil {
 		return err
 	}
@@ -684,18 +780,18 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 		fmt.Fprintf(os.Stderr, "captured %d requests\n", len(requests)) //nolint:gosec // G705: writing to stderr, not web response
 	}
 
+	// Parse --proxy ONCE here (validated fail-fast by doCrawl above) and reuse the
+	// result across every post-crawl stage: sourcemap-fetch (Augment), JS-replay
+	// (afterWSDL), and probe/WSDL (scanOptions). parseProxyConfigOrEmpty falls back
+	// to no proxy on the (unreachable) error.
+	scanProxy := parseProxyConfigOrEmpty(c.Proxy, c.ProxyInsecure)
+
 	// Augment captured requests with static-HTML form analysis + JS bundle
 	// static analysis in the canonical forms-then-jsstatic order (see
 	// pipeline.Augment). Same helper used by GenerateCmd.Run — the order
 	// contract is centralized to prevent the two commands from silently
 	// diverging.
-	requests = pipeline.Augment(bs.ctx, requests, pipeline.AugmentOptions{
-		AnalyzeJS:       c.AnalyzeJS,
-		FetchSourcemaps: c.FetchSourcemaps,
-		AllowPrivate:    c.DangerousAllowPrivate,
-		Status:          statusWriter(c.Verbose),
-		WarnError:       os.Stderr,
-	})
+	requests = pipeline.Augment(bs.ctx, requests, c.augmentOptions(scanProxy))
 
 	// Resolve the API type up front (when auto) so the verbose "detected API
 	// type" line reflects the traffic-derived type *before* any WSDL promotion,
@@ -733,11 +829,12 @@ func (c *ScanCmd) Run() error { //nolint:gocyclo // top-level orchestration
 	// gated on both c.AnalyzeJS (so --analyze-js=false suppresses the JS-bundle
 	// rescan) and c.Probe (so --probe=false stays passive — see
 	// maybeReplayJSExtracted), and is CLI-only (the SDK passes a nil AfterWSDL hook).
+	// scanProxy (parsed above, before Augment) is reused here for JS-replay.
 	afterWSDL := func(ctx context.Context, reqs []crawl.ObservedRequest) []crawl.ObservedRequest {
 		return maybeReplayJSExtracted(ctx, reqs, c.Probe && c.AnalyzeJS,
-			buildJSReplayConfig(bs.opts.Headers, c.URL, c.DangerousAllowPrivate, c.Verbose))
+			buildJSReplayConfig(bs.opts.Headers, c.URL, c.DangerousAllowPrivate, c.Verbose, scanProxy))
 	}
-	spec, apiType, foundWSDL, _, err := pipeline.ResolveAndGenerate(genCtx, requests, c.scanOptions(apiType, afterWSDL))
+	spec, apiType, foundWSDL, _, err := pipeline.ResolveAndGenerate(genCtx, requests, c.scanOptions(apiType, afterWSDL, scanProxy))
 	if err != nil {
 		return err
 	}
@@ -780,15 +877,35 @@ func main() {
 // validateTargetURL rejects a non-empty --target-url that is not an absolute
 // URL. A typo would otherwise silently fall back to the capture-derived origin
 // heuristic, reintroducing the wrong-origin footgun --target-url prevents.
-// Delegates the parse/scheme/host check to validateURL so the two
-// validators can't drift; this also means --target-url now requires http/https
-// like the crawl/scan target URL does.
+// Delegates entirely to validateURL — which already redacts userinfo from
+// every message it returns (SEC-BE-002, LAB-4992 review) — so the two
+// validators can't drift; this also means --target-url now requires
+// http/https like the crawl/scan target URL does.
+//
+// An un-canonicalizable value (duplicated port, IPv6 zone id) is rejected on
+// two independent layers (SEC-BE-001, LAB-4992 review), and this function
+// inherits the first of them rather than implementing either:
+//
+//   - Argv: validateURL itself applies the crawl.CanonicalOrigin check, so the
+//     operator gets an immediate error naming the offending value. That check
+//     is shared with the crawl/scan seed (CrawlCmd.Run, ScanCmd.Run call
+//     validateURL directly), not special-cased for --target-url.
+//   - Runtime: crawl.ResolveTargetOrigin independently fails closed for the
+//     same values, returning "" rather than falling through to a
+//     capture-derived origin. That layer is what protects pkg/sdk and library
+//     callers, which never reach these CLI validators, and it is what
+//     guarantees no --header credential is forwarded to an origin a bundle
+//     chose. See ResolveTargetOrigin's doc comment.
+//
+// Neither layer is redundant: removing the first costs the diagnostic and
+// lets a run crawl, probe nothing, and exit successfully; removing the second
+// reopens the credential-rebind path for every non-CLI caller.
 func validateTargetURL(raw string) error {
 	if raw == "" {
 		return nil
 	}
 	if err := validateURL(raw); err != nil {
-		return fmt.Errorf("invalid --target-url %q: %w", raw, err)
+		return fmt.Errorf("invalid --target-url: %w", err)
 	}
 	return nil
 }
@@ -800,13 +917,66 @@ func validateTargetURL(raw string) error {
 // differ only in where the origin comes from: generate passes --target-url (may
 // be empty, in which case ReplayJSExtracted derives it from the capture's first
 // HTML page), scan passes the crawl's seed URL.
-func buildJSReplayConfig(headers map[string]string, targetURL string, allowPrivate, verbose bool) crawl.JSReplayConfig {
+func buildJSReplayConfig(headers map[string]string, targetURL string, allowPrivate, verbose bool, proxy httpx.ProxyConfig) crawl.JSReplayConfig {
 	return crawl.JSReplayConfig{
 		Headers:      headers,
 		TargetURL:    targetURL,
 		AllowPrivate: allowPrivate,
 		Verbose:      verbose,
 		Stderr:       os.Stderr,
+		Proxy:        proxy,
+	}
+}
+
+// parseProxyConfig validates addr with crawl.ValidateProxyAddr (rejecting
+// embedded credentials and non-http/https/socks5 schemes) and parses it into an
+// httpx.ProxyConfig carrying the --proxy-insecure flag. An empty addr means "no
+// proxy" and yields the zero (disabled) config with no error, so callers can
+// pass it through unconditionally.
+func parseProxyConfig(addr string, insecure bool) (httpx.ProxyConfig, error) {
+	if addr == "" {
+		return httpx.ProxyConfig{}, nil
+	}
+	if err := crawl.ValidateProxyAddr(addr); err != nil {
+		return httpx.ProxyConfig{}, err
+	}
+	u, err := url.Parse(addr)
+	if err != nil {
+		return httpx.ProxyConfig{}, fmt.Errorf("invalid --proxy address %q: %w", addr, err)
+	}
+	return httpx.ProxyConfig{URL: u, Insecure: insecure}, nil
+}
+
+// parseProxyConfigOrEmpty parses addr/insecure and returns the resulting
+// httpx.ProxyConfig, falling back to the zero (disabled) config on error. It
+// encapsulates the fail-safe used by the post-crawl builders (CrawlCmd.Run,
+// GenerateCmd.options, ScanCmd.Run): each command validates --proxy fail-fast
+// earlier in its Run — generate via resolveJSReplayConfig
+// (TestGenerateCmd_ResolveJSReplayConfig_RejectsInvalidProxy), crawl/scan via
+// doCrawl (TestDoCrawl_InvalidProxyRejected) — so on those paths an address
+// reaching here has already passed validation and the fallback guards a case the
+// entry point rejected. Whether every future caller keeps that ordering is not
+// something this function can enforce, which is why it degrades to the disabled
+// config rather than panicking. Fail-fast validation is intentionally NOT done
+// here — that stays at the per-command entry points.
+func parseProxyConfigOrEmpty(addr string, insecure bool) httpx.ProxyConfig {
+	cfg, err := parseProxyConfig(addr, insecure)
+	if err != nil {
+		return httpx.ProxyConfig{}
+	}
+	return cfg
+}
+
+// warnProxyNoPort writes a warning to stderr when a non-empty proxy address has
+// no explicit port (most proxies require one). Extracted from doCrawl so the
+// crawl, scan, and generate commands emit the identical notice. Silent for an
+// empty address or one that already carries a port.
+func warnProxyNoPort(stderr io.Writer, addr string) {
+	if addr == "" {
+		return
+	}
+	if u, err := url.Parse(addr); err == nil && u.Port() == "" {
+		fmt.Fprintf(stderr, "warning: --proxy address %q has no explicit port; most proxies require one (e.g., :8080)\n", addr) //nolint:errcheck // best-effort warning
 	}
 }
 
@@ -861,17 +1031,37 @@ func statusWriter(verbose bool) io.Writer {
 	return nil
 }
 
-// validateURL checks that the given string is a valid URL with scheme and host.
+// validateURL checks that the given string is a valid URL with scheme and
+// host. Every error message echoes crawl.RedactURL(rawURL), never rawURL
+// itself (SEC-BE-002, QUAL-001, LAB-4992 review): this function is reached
+// directly by the crawl/scan URL argument and (via validateTargetURL)
+// --target-url, both of which may carry userinfo credentials that must not be
+// echoed to stderr/CI logs.
+//
+// url.Parse's own returned *url.Error also embeds the raw URL in its message
+// (e.g. `parse "https://user:pass@host": net/url: invalid ...`), so wrapping
+// it directly would re-leak the credential even with %q above redacted;
+// unwrapping to its inner .Err (the cause, without the URL) avoids that while
+// keeping the message useful.
 func validateURL(rawURL string) error {
+	redacted := crawl.RedactURL(rawURL)
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return fmt.Errorf("invalid URL %q: %w", rawURL, err)
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			err = uerr.Err
+		}
+		return fmt.Errorf("invalid URL %q: %w", redacted, err)
 	}
 	if u.Scheme == "" || u.Host == "" {
-		return fmt.Errorf("invalid URL %q: must include scheme and host (e.g., https://example.com)", rawURL)
+		return fmt.Errorf("invalid URL %q: must include scheme and host (e.g., https://example.com)", redacted)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("invalid URL %q: scheme must be http or https", rawURL)
+		return fmt.Errorf("invalid URL %q: scheme must be http or https", redacted)
+	}
+	if crawl.CanonicalOrigin(rawURL) == "" {
+		return fmt.Errorf("invalid URL %q: host is not a usable origin "+
+			"(check for a duplicated port such as \"host:8443:8443\", or an IPv6 zone id)", redacted)
 	}
 	return nil
 }

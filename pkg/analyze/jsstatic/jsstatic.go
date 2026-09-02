@@ -15,20 +15,24 @@
 package jsstatic
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 )
 
 // Aliased to the crawl constants so producer and consumer share one definition.
 const (
 	SourceJS        = crawl.SourceStaticJS
 	SourceSourcemap = crawl.SourceStaticJSSourcemap
+	SourceJSConcat  = crawl.SourceStaticJSConcat
 )
 
 // Applied by withDefaults when the Options field is non-positive.
@@ -39,12 +43,28 @@ const (
 	DefaultConcurrency           = 4
 )
 
+// concatMinReserve is the number of MaxEndpointsPerBundle slots capBundleEndpoints
+// guarantees to concat/service-prefix reconstructions when the cap binds, so
+// AST-recovered endpoints cannot starve them entirely (LAB-4992).
+//
+// A small fixed reserve rather than a proportional share: concat candidates are
+// speculative and never probed, so they must not displace directly AST-recovered
+// literals one-for-one. capBundleEndpoints additionally clamps the reserve to
+// budget/2 so it cannot invert and starve AST on small budgets, and concat still
+// reclaims any budget AST leaves unused — the reserve is a floor, not a quota.
+const concatMinReserve = 16
+
 // Options configures Analyze; zero values resolve to the Default* constants.
+//
+// With HTTPClient nil and FetchSourcemaps true, Analyze builds a default client with
+// a 10s timeout and probe.SSRFSafeDialContext (a permissive dialer when AllowPrivate),
+// mirroring the probe stage's posture.
 type Options struct {
 	// Sourcemap fetches only. Analyze wraps a caller-supplied client in a shallow
-	// copy overlaying noFollowRedirects — a .js.map URL must not 302 past the
+	// copy overlaying httpx.NoFollowRedirects — a .js.map URL must not 302 past the
 	// sameHost pre-flight — and an SSRF-safe DialContext. The caller's client is
-	// never mutated, and a custom Transport is replaced by that overlay.
+	// never mutated, and a custom Transport (mTLS, proxy, TLS config) is replaced by
+	// that overlay at fetch time.
 	HTTPClient *http.Client
 
 	// Fetch .js.map remotely when the sourceMappingURL was not captured. False
@@ -54,6 +74,15 @@ type Options struct {
 	// Disables SSRF protection on sourcemap fetches. Mirrors
 	// --dangerous-allow-private.
 	AllowPrivate bool
+
+	// Proxy routes sourcemap fetches through an intercepting proxy when set, and is
+	// honored ONLY when HTTPClient is nil (the production path — pipeline never sets
+	// HTTPClient): an injected client has its Transport overwritten with
+	// ssrfSafeTransport (see recoverSourcemap), which would clobber a proxied dialer,
+	// so that case warns that fetches will BYPASS the proxy. The proxied client
+	// installs no dial-time SSRF pin, since it dials the proxy rather than the target;
+	// the same-host URL check is unchanged.
+	Proxy httpx.ProxyConfig
 
 	PerBundleTimeout time.Duration // per input, not per Analyze call
 	MaxBundleSize    int           // larger bundles are skipped and counted
@@ -210,7 +239,9 @@ func extractWithTimeout(ctx context.Context, source []byte, sourceURL, kind stri
 // These two test seams live in a production file because the paths that consult
 // them (safeAnalyzeOne, and the extraction goroutine in extractWithTimeout)
 // compile into non-test binaries, where a _test.go variable is not visible. Both
-// are nil in production, so each site costs one nil check.
+// are nil in production, so each site costs one nil check. They are package-level
+// variables rather than Options fields to keep fault injection out of the API
+// callers configure.
 
 // testInjectPanic fires at exactly two sites: the top of safeAnalyzeOne
 // (loc="analyzeOne") and inside the extraction goroutine (loc="bundle" or
@@ -239,11 +270,80 @@ func safeAnalyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options
 	return analyzeOne(ctx, req, opts)
 }
 
+// capBundleEndpoints truncates eps to budget entries WITHOUT letting AST-recovered
+// endpoints starve concat/service-prefix candidates (LAB-4992). ExtractFromBundle
+// appends concat reconstructions (SourceJSConcat) after all AST-recovered endpoints,
+// so a naive `eps[:budget]` prefix truncation drops every concat candidate whenever
+// the AST portion alone reaches budget.
+//
+// Instead concat gets a small floor, AST takes whatever budget remains after it, and
+// concat then reclaims any budget AST did not use. The total kept is therefore always
+// min(len(ast)+len(concat), budget), never under-filled the way a hard budget/2 split
+// on concat alone leaves it when AST is small.
+//
+// The floor is deliberately small (concatMinReserve, additionally capped at budget/2
+// so it can never invert and starve AST — the split is pinned per budget by
+// TestCapBundleEndpoints_SmallBudgetDoesNotStarveAST) rather than a proportional
+// reservation, which would tax AST even when concat is abundant and low-value. Concat
+// is abundant in practice: ExtractStaticConcatPaths composes two independently capped
+// producers (up to 512 candidates from one bundle) and servicePrefixPlusHeadPattern
+// matches any short quoted slash-terminated literal followed by `+`, which is dense in
+// minified output. Trading a directly AST-recovered literal for an unprobed
+// sentinel-substituted guess 1:1 is the wrong direction, so concat gets a guaranteed
+// toehold, not parity.
+func capBundleEndpoints(eps []ExtractedEndpoint, budget int) []ExtractedEndpoint {
+	var ast, concat []ExtractedEndpoint
+	for _, ep := range eps {
+		if ep.SourceTag == SourceJSConcat {
+			concat = append(concat, ep)
+		} else {
+			ast = append(ast, ep)
+		}
+	}
+
+	// A floor, kept well below budget so abundant concat cannot displace
+	// high-fidelity AST literals. The budget/2 clamp keeps the floor from exceeding
+	// the budget on small budgets, which would zero out AST.
+	concatFloor := len(concat)
+	if concatFloor > concatMinReserve {
+		concatFloor = concatMinReserve
+	}
+	if concatFloor > budget/2 {
+		concatFloor = budget / 2
+	}
+
+	// AST gets everything but the floor...
+	astBudget := budget - concatFloor
+	if len(ast) > astBudget {
+		ast = ast[:astBudget]
+	}
+
+	// ...and concat reclaims whatever AST did not use, so the cap stays fully
+	// utilized when AST is scarce.
+	concatBudget := budget - len(ast)
+	if len(concat) > concatBudget {
+		concat = concat[:concatBudget]
+	}
+
+	return append(ast, concat...)
+}
+
 // analyzeOne handles one bundle. No shared mutable state, so it is
 // goroutine-safe.
 func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) perBundleResult {
 	var result perBundleResult
 	body := req.Response.Body
+
+	// Next.js App Router route recovery (LAB-4678). Derived from the bundle URL, not
+	// its body, so it runs before body extraction and still applies to bundles whose
+	// parse times out or panics below. See nextroute.go for why the URL carries the
+	// route.
+	if ep := extractNextRoute(req.URL, req.PageURL); ep != nil {
+		result.stats.EndpointsFound++
+		synth := toRequests([]ExtractedEndpoint{*ep}, req.URL)
+		result.requests = append(result.requests, synth...)
+		result.stats.EndpointsKept += len(synth)
+	}
 
 	// ctx carries through for remote-fetch cancellation.
 	smSources, smStats := recoverSourcemap(ctx, body, req.URL, opts)
@@ -261,12 +361,26 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 	result.stats.BundlesAnalyzed++
 	result.stats.EndpointsFound += len(bundleEps)
 	// The cap is TOTAL across the body and every sourcemap source, re-evaluated as
-	// remaining budget below.
-	if len(bundleEps) > opts.MaxEndpointsPerBundle {
-		bundleEps = bundleEps[:opts.MaxEndpointsPerBundle]
+	// remaining budget below. capBundleEndpoints rather than a prefix truncation
+	// because ExtractFromBundle appends concat reconstructions after every
+	// AST-recovered endpoint, so a prefix cut drops all of them once AST alone reaches
+	// the cap — which is the acceptance criterion that offline generate surfaces
+	// concat endpoints (LAB-4992). The body's budget is the cap MINUS what the Next.js
+	// chunk-URL recovery above already kept; using the full cap let a Next.js chunk
+	// bundle keep cap+1.
+	bodyBudget := opts.MaxEndpointsPerBundle - result.stats.EndpointsKept
+	if bodyBudget < 0 {
+		bodyBudget = 0
+	}
+	if len(bundleEps) > bodyBudget {
+		bundleEps = capBundleEndpoints(bundleEps, bodyBudget)
 	}
 	for i := range bundleEps {
-		bundleEps[i].SourceTag = SourceJS
+		// Preserve the distinct concat reconstruction tag; force everything else
+		// from the bundle body to the plain JS-bundle source.
+		if bundleEps[i].SourceTag != SourceJSConcat {
+			bundleEps[i].SourceTag = SourceJS
+		}
 	}
 	synth := toRequests(bundleEps, req.URL)
 	result.requests = append(result.requests, synth...)
@@ -294,11 +408,23 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 			continue
 		}
 		result.stats.EndpointsFound += len(smEps)
+		// QUAL-011 (LAB-4992): route this through capBundleEndpoints, exactly
+		// like the bundle-body truncation above, rather than taking a bare
+		// prefix slice. ExtractFromBundle runs the same step-5 concat
+		// extraction on each sourcemap source and appends those
+		// reconstructions AFTER all AST-recovered endpoints, so a prefix slice
+		// silently drops every concat candidate from any sourcemap source
+		// whose AST endpoints alone consume the remaining budget — the precise
+		// failure mode capBundleEndpoints exists to prevent.
 		if len(smEps) > remaining {
-			smEps = smEps[:remaining]
+			smEps = capBundleEndpoints(smEps, remaining)
 		}
 		for i := range smEps {
-			smEps[i].SourceTag = SourceSourcemap
+			// Preserve the distinct concat reconstruction tag; force everything
+			// else recovered from the sourcemap to the sourcemap source.
+			if smEps[i].SourceTag != SourceJSConcat {
+				smEps[i].SourceTag = SourceSourcemap
+			}
 		}
 		smSynth := toRequests(smEps, req.URL)
 		result.requests = append(result.requests, smSynth...)
@@ -308,10 +434,61 @@ func analyzeOne(ctx context.Context, req crawl.ObservedRequest, opts Options) pe
 	return result
 }
 
+// synthesizedLess is the deterministic ordering for synthesized static:js entries
+// (LAB-4678): URL, then method, then source tag, then request body, then page URL,
+// then headers. Kept as a named helper so Analyze stays under the cyclomatic gate.
+//
+// The keys are exactly the fields [toRequests] populates, which is what makes this a
+// total order over synthesized entries: any two distinct entries differ in at least
+// one of them. The final tiebreakers are load-bearing — entries equal on the earlier
+// keys compare equal, and sort.SliceStable then preserves their worker-completion
+// order, which is the nondeterminism this sort exists to remove. QueryParams is not a
+// usable key here: toRequests never sets it.
+func synthesizedLess(a, b crawl.ObservedRequest) bool {
+	if a.URL != b.URL {
+		return a.URL < b.URL
+	}
+	if a.Method != b.Method {
+		return a.Method < b.Method
+	}
+	if a.Source != b.Source {
+		return a.Source < b.Source
+	}
+	if c := bytes.Compare(a.Body, b.Body); c != 0 {
+		return c < 0
+	}
+	if a.PageURL != b.PageURL {
+		return a.PageURL < b.PageURL
+	}
+	return headerKey(a.Headers) < headerKey(b.Headers)
+}
+
+// headerKey renders a header map as a canonical, comparable string: entries sorted
+// by name, joined as "name:value". Used only as a sort tiebreaker, so it needs to
+// be stable and total, not parseable.
+func headerKey(h map[string]string) string {
+	if len(h) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(h))
+	for k := range h {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, k := range names {
+		b.WriteString(k)
+		b.WriteByte(':')
+		b.WriteString(h[k])
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
 // Analyze runs static analysis over every JS body in captured. On the normal path
-// it returns a new slice with synthesized entries APPENDED — the order matters,
-// because classify.Deduplicate keeps dynamic entries on ties. The input is never
-// mutated; when there is nothing to analyze it returns captured itself.
+// Result.Requests is a new slice with synthesized entries APPENDED — the order
+// matters, because classify.Deduplicate keeps dynamic entries on ties. The input is
+// never mutated; when there is nothing to analyze it returns captured itself.
 //
 // The error is ctx.Err() on cancellation, with the partial result alongside it.
 // Per-bundle parse failures are logged and counted, not returned.
@@ -396,6 +573,15 @@ func Analyze(ctx context.Context, captured []crawl.ObservedRequest, opts Options
 	if abandoned := len(bundles) - workerProcessed; abandoned > 0 {
 		stats.BundlesAbandonedOnCancel = abandoned
 	}
+
+	// The worker pool fans results into resultCh in completion order, which is
+	// nondeterministic across runs, so sort the synthesized block here (LAB-4678).
+	// Downstream dedup/generate are order-independent for the retained data; sorting
+	// here makes jsstatic's own output a deterministic function of the capture rather
+	// than depending on those downstream sorts.
+	sort.SliceStable(synthesized, func(i, j int) bool {
+		return synthesizedLess(synthesized[i], synthesized[j])
+	})
 
 	out := make([]crawl.ObservedRequest, len(captured), len(captured)+len(synthesized))
 	copy(out, captured)

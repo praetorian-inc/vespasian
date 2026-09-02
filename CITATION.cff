@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+title: "Vespasian: API Discovery and Attack Surface Mapping Tool"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - name: "Praetorian Security, Inc."
+    website: "https://www.praetorian.com"
+repository-code: "https://github.com/praetorian-inc/vespasian"
+url: "https://github.com/praetorian-inc/vespasian"
+license: Apache-2.0
+version: 1.0.0
+date-released: "2026-04-03"
+keywords:
+  - api-discovery
+  - api-enumeration
+  - api-security
+  - api-specification
+  - application-security
+  - attack-surface
+  - burp-suite
+  - capability
+  - golang
+  - graphql
+  - headless-browser
+  - openapi
+  - openapi-generator
+  - penetration-testing
+  - security-tools
+  - soap
+  - traffic-analysis
+  - wsdl
+abstract: >-
+  Vespasian is an API discovery tool that maps attack surfaces from captured
+  HTTP traffic and generates API specifications. It crawls targets with a
+  headless browser or imports external captures (Burp, HAR, mitmproxy),
+  classifies observed requests by API type (REST, GraphQL, SOAP/WSDL, gRPC),
+  optionally probes live endpoints, and emits specifications such as OpenAPI,
+  GraphQL SDL, WSDL, and proto3 for penetration testing and application
+  security assessments.

@@ -34,6 +34,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/praetorian-inc/vespasian/pkg/httpx"
 	"github.com/praetorian-inc/vespasian/pkg/ssrf"
 )
 
@@ -208,6 +209,27 @@ func TestExtractAPIPaths(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+// QUAL-004: extractAPIPaths (the active replay path) must run the shared
+// servicePrefixPlusPaths extractor, not only extractConcatPaths — otherwise the
+// "share one extractor / reconstruct identically" contract with the offline
+// static path holds for concat/+-chain forms but NOT the service-prefix form.
+//
+// The distinguishing input is a service-prefix head with a NON-LITERAL middle
+// operand: "billing/" + id + "/api/invoices" reconstructs (via
+// servicePrefixPlusPaths + parsePlusChain) to /billing/0/api/invoices with the
+// numeric sentinel. The pre-existing extractServicePrefixes + addPath fan-out
+// CANNOT produce this — it only combines discovered prefixes with bare literal
+// paths, never a sentinel-bearing chain — and extractConcatPaths' head anchor
+// requires an API indicator in the head ("billing/" has none). So the sentinel
+// form is recoverable EXCLUSIVELY via the Strategy 5b wiring; deleting that
+// block makes this assertion fail (the test is non-vacuous).
+func TestExtractAPIPaths_ServicePrefixPlusWired(t *testing.T) {
+	js := []byte(`var invoices = "billing/" + id + "/api/invoices";`)
+	got := extractAPIPaths(js, nil)
+	assert.Contains(t, got, "/billing/0/api/invoices",
+		"extractAPIPaths must surface the sentinel-bearing service-prefix chain via the shared servicePrefixPlusPaths extractor (Strategy 5b)")
 }
 
 func TestExtractAPIPaths_TemplateLiteralInterpolation(t *testing.T) {
@@ -1250,6 +1272,104 @@ func TestReplayJSExtracted_EmptyInput(t *testing.T) {
 	})
 }
 
+// TestReplayJSExtracted_UncanonicalizableScanSeedNeverForwardsCredentials
+// pins the structural argument in ResolveTargetOrigin's doc comment
+// (pkg/crawl/jsreplay.go, SEC-BE-001, LAB-4992 review) for why an
+// un-canonicalizable target (here, a duplicated port -- the same shape a
+// ScanCmd crawl-target seed can carry) must never let ReplayJSExtracted fall
+// through to a capture-derived origin: ResolveTargetOrigin resolves to "" for
+// this seed, so the `targetOrigin == ""` early return must fire before any
+// request -- including one carrying the --header credential below -- is ever
+// issued.
+//
+// TEST-002 (LAB-4992 review): the assertion is on EGRESS, not logging. A
+// genuinely reachable httptest.Server stands in for the script the capture
+// references; the request-count assertion proves the early return stopped
+// the fetch from ever reaching that reachable server. An empty Stderr buffer
+// (the prior assertion) only proves logging didn't run -- it would still
+// pass if the early return were deleted but the Verbose-gated logging
+// elsewhere were silenced, so it does not actually prove no request was
+// issued.
+func TestReplayJSExtracted_UncanonicalizableScanSeedNeverForwardsCredentials(t *testing.T) {
+	// Mirrors the duplicated-port shape validateURL now rejects at the CLI
+	// boundary (cmd/vespasian/main.go): passes the parse/scheme/host check
+	// but fails crawl.CanonicalOrigin.
+	seed := "https://host:8443:8443/"
+	require.Empty(t, CanonicalOrigin(seed),
+		"test seed must reproduce the un-canonicalizable shape a validateURL-passing target can still carry")
+
+	// Genuinely reachable server: if the targetOrigin=="" early return did
+	// not fire, script discovery would fetch this URL and hits would be > 0.
+	// Counted atomically because the handler runs on the server's goroutine
+	// (TEST-004 review finding); today the count stays 0 so the race is
+	// latent, but a regression is exactly the case that would trip it, and a
+	// race report is a worse failure signal than a clean assertion.
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Write([]byte(`"/api/v1/data"`)) //nolint:errcheck,gosec // test handler
+	}))
+	defer srv.Close()
+
+	requests := []ObservedRequest{
+		{
+			Method: "GET",
+			URL:    seed,
+			Source: "katana",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<html><script src="` + srv.URL + `/app.js"></script></html>`),
+			},
+		},
+		// A SECOND entry on a canonicalizable origin (TEST-005 review
+		// finding). Without it this fixture could not detect a revert of
+		// ResolveTargetOrigin's fail-closed guard: with only the seed
+		// present, falling back through the capture-derived tiers still
+		// yields no usable origin, so hits would stay 0 either way and the
+		// test would pass against the very regression it exists to catch.
+		// With it, a revert resolves targetOrigin to this origin, the fetch
+		// proceeds, and hits goes above zero.
+		{
+			Method: "GET",
+			URL:    "https://capture.example.test/",
+			Source: "katana",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<html><script src="` + srv.URL + `/app.js"></script></html>`),
+			},
+		},
+	}
+
+	require.Empty(t, ResolveTargetOrigin(seed, requests),
+		"an un-canonicalizable seed must resolve to no usable target origin")
+
+	var stderr bytes.Buffer
+	result := ReplayJSExtracted(context.Background(), requests, JSReplayConfig{
+		TargetURL: seed,
+		Headers:   map[string]string{"Authorization": "Bearer super-secret-token"},
+		Verbose:   true,
+		Stderr:    &stderr,
+		Client:    srv.Client(),
+		// AllowPrivate lets the client reach the httptest.Server's loopback
+		// listener. AllowCrossOrigin isolates the targetOrigin=="" early
+		// return under test from the independent same-origin gate every
+		// fetch call site also applies (SameOrigin(x, "") is unconditionally
+		// false -- see isSameOrigin's doc comment): without it, that gate
+		// alone would keep hits at 0 even if the early return were removed,
+		// masking a mutation to it. Never set true in production (ScanCmd
+		// exposes no such flag).
+		AllowPrivate:     true,
+		AllowCrossOrigin: true,
+	})
+
+	assert.Equal(t, requests, result, "requests must be returned unmodified when targetOrigin cannot be resolved")
+	assert.Equal(t, int32(0), atomic.LoadInt32(&hits),
+		"early return must fire before any HTTP request is issued -- including one that could carry the --header credential")
+}
+
 func TestReplayJSExtracted_MaxEndpoints(t *testing.T) {
 	callCount := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1386,6 +1506,368 @@ func TestReplayJSExtracted_Filters404(t *testing.T) {
 	}
 	assert.Equal(t, []string{srv.URL + "/workshop/api/products"}, jsExtracted,
 		"only the 200-returning path should be appended")
+}
+
+// LAB-4992 regression: when JS-replay reaches the target, its probe verdict is
+// authoritative, so the passive offline concat mirror (SourceStaticJSConcat,
+// emitted by pkg/analyze/jsstatic) must be dropped for every reached path — a
+// 404'd decoy must NOT survive via the mirror. Candidates for paths JS-replay
+// never probed (fully offline / not in the bundle) must be preserved. Without
+// this, the classifier's static-JS confidence floor (Rule 7) would re-admit the
+// decoy, inflating the live concat-spa spec from 2 paths to 3.
+func TestReplayJSExtracted_DropsOfflineConcatMirrorForReachedPaths(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/orders") {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"ok":true}`)) //nolint:errcheck,gosec // test handler
+			return
+		}
+		w.WriteHeader(http.StatusNotFound) // /api/missing/0/gone decoy
+	}))
+	defer srv.Close()
+
+	// Bundle references two concat forms: a real one (200) and a decoy (404).
+	jsBody := []byte(`fetch("/api/users/".concat(uid,"/orders")); fetch("/api/missing/".concat(x,"/gone"));`)
+	requests := []ObservedRequest{
+		{
+			Method:   "GET",
+			URL:      srv.URL + "/app.js",
+			Source:   "katana",
+			Response: ObservedResponse{StatusCode: 200, ContentType: "application/javascript", Body: jsBody},
+		},
+		// Passive offline mirror emitted by jsstatic for the same reconstructions.
+		{Method: "GET", URL: srv.URL + "/api/users/0/orders", Source: SourceStaticJSConcat},
+		{Method: "GET", URL: srv.URL + "/api/missing/0/gone", Source: SourceStaticJSConcat},
+		// A mirror whose URL differs only by a trailing slash from the probed
+		// URL — reachedPathKey normalization must still drop it.
+		{Method: "GET", URL: srv.URL + "/api/missing/0/gone/", Source: SourceStaticJSConcat},
+		// A concat candidate for a path NOT in the bundle — JS-replay never probes
+		// it, so it must be preserved (offline fallback).
+		{Method: "GET", URL: srv.URL + "/api/offline/0/thing", Source: SourceStaticJSConcat},
+	}
+
+	result := ReplayJSExtracted(context.Background(), requests, allowLocal(srv))
+
+	var concatMirror, jsExtract []string
+	for _, r := range result {
+		switch r.Source {
+		case SourceStaticJSConcat:
+			concatMirror = append(concatMirror, r.URL)
+		case "js-extract":
+			jsExtract = append(jsExtract, r.URL)
+		}
+	}
+	// QUAL-004: only the 404-REFUTED paths are superseded. The 200 path keeps its
+	// mirror as well as gaining the probed js-extract observation, because
+	// js-extract is not an IsJSStaticSource and so never receives Rule 7's
+	// confidence floor — dropping the mirror on a non-404 answer is what made
+	// live replay subtractive. The two entries describe one endpoint and
+	// groupEndpoints (normalized path + method, host-agnostic) collapses them
+	// into a single OpenAPI operation.
+	assert.ElementsMatch(t,
+		[]string{
+			srv.URL + "/api/users/0/orders",  // answered 200 -> mirror retained
+			srv.URL + "/api/offline/0/thing", // never probed -> offline fallback
+		},
+		concatMirror,
+		"only 404-refuted mirrors may be dropped; a 200-answered path keeps its mirror (live replay must be additive) and an unprobed path keeps its offline fallback")
+	assert.NotContains(t, concatMirror, srv.URL+"/api/missing/0/gone",
+		"the 404 decoy mirror must be superseded")
+	assert.NotContains(t, concatMirror, srv.URL+"/api/missing/0/gone/",
+		"reachedPathKey normalization must drop the trailing-slash variant of the 404 decoy too")
+	assert.Contains(t, jsExtract, srv.URL+"/api/users/0/orders",
+		"the 200 path should also be added as a probed js-extract observation")
+	assert.NotContains(t, jsExtract, srv.URL+"/api/missing/0/gone",
+		"the 404 decoy must not be present as js-extract either")
+}
+
+// TestReplayJSExtracted_KeepsMirrorForNonDispositiveStatuses is the regression
+// guard for QUAL-004 (LAB-4992). Before the fix, `reached` was recorded for ANY
+// answered status, so each of the statuses below deleted the offline concat
+// mirror and replaced it with a Source "js-extract" entry — which
+// crawl.IsJSStaticSource does not match, so classify Rule 7's StaticJSConfidence
+// floor never applied and the replacement scored only Rule 3's 0.15, below the
+// 0.5 default threshold. The endpoint therefore vanished from the spec, meaning a
+// reachable --target-url produced strictly LESS output than running fully
+// offline.
+//
+// These are not exotic: 200 text/html is the nginx/SPA try_files catch-all,
+// 302 -> /login is the usual auth-gated-API reply, and 204 / HTML-bodied 401 and
+// 403 are ordinary API responses. Only a 404 may supersede the mirror.
+func TestReplayJSExtracted_KeepsMirrorForNonDispositiveStatuses(t *testing.T) {
+	cases := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+	}{
+		{name: "200 text/html SPA catch-all", status: 200, contentType: "text/html", body: "<!doctype html><html></html>"},
+		{name: "204 no content", status: 204, contentType: "", body: ""},
+		{name: "401 with html body", status: 401, contentType: "text/html", body: "<html>login</html>"},
+		{name: "403 with html body", status: 403, contentType: "text/html", body: "<html>denied</html>"},
+		{name: "302 redirect to login", status: 302, contentType: "text/html", body: ""},
+		{name: "500 server error", status: 500, contentType: "text/plain", body: "boom"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/app.js") {
+					w.Header().Set("Content-Type", "application/javascript")
+					w.Write([]byte(`fetch("/api/users/".concat(uid,"/orders"));`)) //nolint:errcheck,gosec // test handler
+					return
+				}
+				if tc.status == 302 {
+					w.Header().Set("Location", "/login")
+				}
+				if tc.contentType != "" {
+					w.Header().Set("Content-Type", tc.contentType)
+				}
+				w.WriteHeader(tc.status)
+				if tc.body != "" {
+					w.Write([]byte(tc.body)) //nolint:errcheck,gosec // test handler
+				}
+			}))
+			defer srv.Close()
+
+			jsBody := []byte(`fetch("/api/users/".concat(uid,"/orders"));`)
+			requests := []ObservedRequest{
+				{
+					Method:   "GET",
+					URL:      srv.URL + "/app.js",
+					Source:   "katana",
+					Response: ObservedResponse{StatusCode: 200, ContentType: "application/javascript", Body: jsBody},
+				},
+				{Method: "GET", URL: srv.URL + "/api/users/0/orders", Source: SourceStaticJSConcat},
+			}
+
+			result := ReplayJSExtracted(context.Background(), requests, allowLocal(srv))
+
+			var mirrorKept bool
+			for _, r := range result {
+				if r.Source == SourceStaticJSConcat && r.URL == srv.URL+"/api/users/0/orders" {
+					mirrorKept = true
+				}
+			}
+			assert.True(t, mirrorKept,
+				"status %d must NOT supersede the offline concat mirror: only a 404 is dispositive, and the js-extract replacement receives no Rule 7 floor, so dropping the mirror loses the endpoint entirely (QUAL-004)", tc.status)
+		})
+	}
+}
+
+// TestReplayJSExtracted_KeepsNonConcatMirrorsForRefutedPaths pins the asymmetry
+// supersedeConcatMirrors and pkg/classify/rest.go's staticJSFloor both document
+// in prose but nothing previously tested (TEST-004, LAB-4992): only
+// SourceStaticJSConcat is superseded by a 404. Plain SourceStaticJS and
+// SourceStaticJSSourcemap mirrors survive, because an AST literal comes from a
+// real call site in the bundle, so a 404 is more likely auth/param-gated than a
+// wrong-guess decoy.
+//
+// Without this test, a plausible "symmetry cleanup" widening the predicate to
+// crawl.IsJSStaticSource(r.Source) — which looks obviously correct given Rule 7
+// floors all three sources identically — passes the entire suite while silently
+// deleting AST-recovered literals that sit behind a 404. Both directions were
+// unprotected: no jsreplay test constructed a non-concat mirror at all.
+func TestReplayJSExtracted_KeepsNonConcatMirrorsForRefutedPaths(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/app.js") {
+			w.Header().Set("Content-Type", "application/javascript")
+			w.Write([]byte(`fetch("/api/gated/".concat(x,"/thing"));`)) //nolint:errcheck,gosec // test handler
+			return
+		}
+		w.WriteHeader(http.StatusNotFound) // refutes /api/gated/0/thing
+	}))
+	defer srv.Close()
+
+	jsBody := []byte(`fetch("/api/gated/".concat(x,"/thing"));`)
+	const path = "/api/gated/0/thing"
+	requests := []ObservedRequest{
+		{
+			Method:   "GET",
+			URL:      srv.URL + "/app.js",
+			Source:   "katana",
+			Response: ObservedResponse{StatusCode: 200, ContentType: "application/javascript", Body: jsBody},
+		},
+		// All three JS-static sources mirror the SAME 404'd path.
+		{Method: "GET", URL: srv.URL + path, Source: SourceStaticJSConcat},
+		{Method: "GET", URL: srv.URL + path, Source: SourceStaticJS},
+		{Method: "GET", URL: srv.URL + path, Source: SourceStaticJSSourcemap},
+	}
+
+	result := ReplayJSExtracted(context.Background(), requests, allowLocal(srv))
+
+	var sawConcat, sawAST, sawSourcemap bool
+	for _, r := range result {
+		if r.URL != srv.URL+path {
+			continue
+		}
+		switch r.Source {
+		case SourceStaticJSConcat:
+			sawConcat = true
+		case SourceStaticJS:
+			sawAST = true
+		case SourceStaticJSSourcemap:
+			sawSourcemap = true
+		}
+	}
+
+	assert.False(t, sawConcat,
+		"the 404-refuted static:js-concat mirror must be superseded (it is an unvalidated combinatorial reconstruction)")
+	assert.True(t, sawAST,
+		"a static:js AST literal must SURVIVE a 404 — it comes from a real call site, so the 404 is more likely auth/param-gated than a decoy; do not widen supersedeConcatMirrors to IsJSStaticSource")
+	assert.True(t, sawSourcemap,
+		"a static:js-sourcemap literal must SURVIVE a 404 for the same reason as static:js")
+}
+
+// LAB-4992 QUAL-001 regression: jsstatic resolves the offline concat mirror
+// against the BUNDLE origin (e.g. a CDN hosting the JS, or an operator-pinned
+// --target-url that differs from the bundle host), while JS-replay always
+// probes against the TARGET origin. The mirror-drop must therefore match on
+// path alone, not origin+path, or a bundle hosted on a different host than
+// the probe target would leave the 404-decoy mirror in place. This is the
+// cross-host counterpart to TestReplayJSExtracted_DropsOfflineConcatMirrorForReachedPaths,
+// which only covers the same-origin case.
+func TestReplayJSExtracted_DropsOfflineConcatMirrorAcrossHosts(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound) // the target 404s the reconstructed path
+	}))
+	defer srv.Close()
+
+	jsBody := []byte(`fetch("/api/missing/".concat(x,"/gone"));`)
+	requests := []ObservedRequest{
+		{
+			Method:   "GET",
+			URL:      srv.URL + "/app.js",
+			Source:   "katana",
+			Response: ObservedResponse{StatusCode: 200, ContentType: "application/javascript", Body: jsBody},
+		},
+		// Offline mirror resolved by jsstatic against a DIFFERENT (bundle/CDN)
+		// origin than the probe target (srv.URL) — same path, different host.
+		{Method: "GET", URL: "https://cdn.example.com/api/missing/0/gone", Source: SourceStaticJSConcat},
+	}
+
+	result := ReplayJSExtracted(context.Background(), requests, allowLocal(srv))
+
+	for _, r := range result {
+		if r.Source == SourceStaticJSConcat {
+			t.Fatalf("expected cross-host offline concat mirror %q to be dropped once the target 404s the reconstructed path, got it retained", r.URL)
+		}
+	}
+}
+
+// TestReplayJSExtracted_DroppedMirrorIsAnnounced is the regression guard for
+// SEC-BE-004 (LAB-4992). A 404 is the best signal available for refuting a
+// speculative concat reconstruction, but it is NOT proof of absence: returning
+// 404 rather than 401/403 for an unauthorized-but-real resource is a
+// widespread anti-enumeration convention, and a hostile target can fingerprint
+// doRequest's fixed User-Agent and 404 every unauthenticated probe to hide its
+// API surface. So an unauthenticated run can drop a real endpoint here.
+//
+// That ambiguity cannot be resolved by probing — a control probe of a random
+// nonexistent path was implemented and reverted, because an honest server 404s
+// such a path precisely BECAUSE it is absent, making it indistinguishable from
+// an anti-enumeration one. What IS achievable is making the loss visible, so
+// this pins that the dropped path is NAMED on Warnings along with both
+// remedies, rather than disappearing silently.
+func TestReplayJSExtracted_DroppedMirrorIsAnnounced(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/app.js" {
+			w.Header().Set("Content-Type", "application/javascript")
+			w.Write([]byte(`fetch("/api/missing/".concat(x,"/gone"));`)) //nolint:errcheck,gosec // test handler
+			return
+		}
+		w.WriteHeader(http.StatusNotFound) // the target 404s the reconstructed path
+	}))
+	defer srv.Close()
+
+	jsBody := []byte(`fetch("/api/missing/".concat(x,"/gone"));`)
+	requests := []ObservedRequest{
+		{
+			Method:   "GET",
+			URL:      srv.URL + "/app.js",
+			Source:   "katana",
+			Response: ObservedResponse{StatusCode: 200, ContentType: "application/javascript", Body: jsBody},
+		},
+		{Method: "GET", URL: srv.URL + "/api/missing/0/gone", Source: SourceStaticJSConcat},
+	}
+
+	var stderr bytes.Buffer
+	cfg := allowLocal(srv)
+	cfg.Stderr = &stderr
+
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	for _, r := range result {
+		if r.Source == SourceStaticJSConcat {
+			t.Fatalf("expected the 404'd offline concat mirror %q to be dropped, got it retained", r.URL)
+		}
+	}
+
+	out := stderr.String()
+	quotedPath := strconv.Quote(srv.URL + "/api/missing/0/gone")
+	assert.Contains(t, out, quotedPath,
+		"the dropped path must be NAMED so the loss is not silent, got: %s", out)
+	assert.Contains(t, out, "--header",
+		"the warning must name the --header remedy for an auth-gated endpoint, got: %s", out)
+	assert.Contains(t, out, "--probe=false",
+		"the warning must name the --probe=false remedy, got: %s", out)
+}
+
+// TestReachedPathKey pins the reached-set normalization that lets the offline
+// concat mirror match the live probe URL despite cosmetic AND host
+// differences: only the (trailing-slash-trimmed) path is compared, so a
+// bundle mirror resolved against the CDN/bundle origin still matches a probe
+// built against the target origin (QUAL-001). It also pins the raw-string
+// fallback branches (TEST-002): an unparseable URL and a URL with no path
+// component both return their input verbatim rather than colliding on "".
+func TestReachedPathKey(t *testing.T) {
+	tests := []struct{ a, b string }{
+		{"http://Example.COM/api/x", "http://example.com/api/x"},            // host case (path-only, host is irrelevant anyway)
+		{"http://example.com/api/x/", "http://example.com/api/x"},           // trailing slash
+		{"http://example.com/api/x", "http://example.com:80/api/x"},         // default http port (path-only, port is irrelevant anyway)
+		{"https://example.com/api/x", "https://example.com:443/api/x"},      // default https port
+		{"http://Example.com:8080/api/x/", "http://example.com:8080/api/x"}, // host case + trailing slash on a non-default port
+		// QUAL-001: same path, entirely different host/scheme — the mirror-drop
+		// must be host-agnostic since jsstatic resolves the mirror against the
+		// bundle/CDN origin while JS-replay probes against the target origin.
+		{"https://cdn.example.com/api/missing/0/gone", "http://127.0.0.1:9999/api/missing/0/gone"},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, reachedPathKey(tt.a), reachedPathKey(tt.b),
+			"expected %q and %q to normalize to the same key", tt.a, tt.b)
+	}
+	// Genuinely different paths must NOT collapse.
+	assert.NotEqual(t, reachedPathKey("http://example.com/api/x"), reachedPathKey("http://example.com/api/y"))
+	assert.NotEqual(t, reachedPathKey("http://a.com/api/x"), reachedPathKey("http://a.com/api/y"))
+
+	// TEST-002: fallback branches. An unparseable URL (control byte breaks
+	// url.Parse) falls back to the raw string verbatim.
+	assert.Equal(t, "not a url\x7f", reachedPathKey("not a url\x7f"))
+	// A URL that parses but has an empty path component falls back to the raw
+	// string verbatim. This input pins the `path == ""` guard load-bearingly:
+	// without it, EscapedPath() == "" would flow through the trailing-slash
+	// trim and collapse to "", colliding every path-less origin on one key.
+	assert.Equal(t, "http://example.com", reachedPathKey("http://example.com"))
+	// The empty string likewise round-trips verbatim.
+	assert.Equal(t, "", reachedPathKey(""))
+
+	// TEST-005: the root-path preservation guard (`path != "/"` around the
+	// trailing-slash trim) was never exercised. Without it, "/" would trim to ""
+	// and every root URL would collide with the empty-path fallback bucket.
+	assert.Equal(t, "/", reachedPathKey("http://example.com/"),
+		"a root path must be preserved as \"/\", not trimmed to \"\"")
+	// And the asymmetry that guard creates: a root path and a path-less origin
+	// are deliberately DIFFERENT keys ("/" vs the raw-string fallback), so a
+	// refuted root probe cannot supersede a mirror that carried no path at all.
+	assert.NotEqual(t, reachedPathKey("http://example.com/"), reachedPathKey("http://example.com"),
+		"root path and path-less origin must not share a key")
+
+	// Documented edge: an all-slashes path collapses to "" (the trim empties it
+	// and the `path == ""` fallback already ran on the pre-trim value). Pinned as
+	// observed rather than as intended — it is unreachable for real mirrors,
+	// because cleanConcatPath collapses "//" to "/", trims it to "", and then
+	// rejects it on hasAPIIndicator, so no such candidate is ever emitted.
+	assert.Equal(t, "", reachedPathKey("http://example.com//"))
 }
 
 // errRoundTripper always returns the configured error from RoundTrip.
@@ -1755,7 +2237,7 @@ func TestAddPath_RejectsURLCredentials(t *testing.T) {
 }
 
 func TestAddPath_RejectsNonHTTPScheme(t *testing.T) {
-	// validateFullURL must reject non-http(s) schemes when they sneak in
+	// ValidateFullURL must reject non-http(s) schemes when they sneak in
 	// via the full-URL pattern.
 	cases := []string{
 		"file:///etc/passwd",
@@ -1763,8 +2245,8 @@ func TestAddPath_RejectsNonHTTPScheme(t *testing.T) {
 		"javascript://api/v2/x",
 	}
 	for _, raw := range cases {
-		_, ok := validateFullURL(raw)
-		assert.False(t, ok, "validateFullURL must reject %s", raw)
+		_, ok := ValidateFullURL(raw)
+		assert.False(t, ok, "ValidateFullURL must reject %s", raw)
 	}
 }
 
@@ -1938,6 +2420,244 @@ func TestOriginOf(t *testing.T) {
 	assert.Equal(t, "https://example.com:443", originOf("HTTPS://Example.COM/api"))
 	assert.Equal(t, "", originOf("not a url"))
 	assert.Equal(t, "", originOf("/relative/path"))
+
+	// SEC-BE-001 (LAB-4992 review): u.Hostname() strips the brackets from an
+	// IPv6 literal host, so the un-bracketed host must be re-bracketed before
+	// being joined with ":" + port — otherwise "[::1]:8443" and a bracketless
+	// rebuild "::1:8443" become indistinguishable from an IPv6 literal that
+	// legitimately ends in ":8443" as part of its own address.
+	assert.Equal(t, "https://[::1]:443", originOf("https://[::1]/x"), "IPv6 host must stay bracketed with the implicit default port made explicit")
+	assert.Equal(t, "https://[::1]:8443", originOf("https://[::1]:8443/x"), "IPv6 host must stay bracketed with an explicit non-default port")
+	// The two spellings below only differ in where the brackets fall — one
+	// puts ":8443" outside the brackets (a real port), the other puts it
+	// inside (part of the IPv6 literal itself, with no port at all, so the
+	// https default of 443 applies). Rebuilding from Hostname() without
+	// re-bracketing collapses both to the bracketless string
+	// "https://2001:db8::1:8443", making them indistinguishable.
+	assert.Equal(t, "https://[2001:db8::1]:8443", originOf("https://[2001:db8::1]:8443/x"))
+	assert.Equal(t, "https://[2001:db8::1:8443]:443", originOf("https://[2001:db8::1:8443]/x"))
+	assert.NotEqual(t, originOf("https://[2001:db8::1]:8443/x"), originOf("https://[2001:db8::1:8443]/x"),
+		"these two distinct IPv6 literals must never canonicalize to the same origin")
+
+	// SEC-BE (LAB-4992 round-23 review): re-bracketing must be driven by
+	// whether url.Parse itself bracketed u.Host, not by whether Hostname()
+	// merely CONTAINS a colon. "foo:bar:80" is a malformed authority (not an
+	// IP literal) where url.Parse splits Hostname()="foo:bar" / Port()="80";
+	// the old `strings.Contains(host, ":")` heuristic re-bracketed it into
+	// "[foo:bar]:80", a string that does not re-parse as the same origin
+	// (loses idempotency) and was never a legitimate host to begin with.
+	// originOf now fails closed ("") for this shape.
+	assert.Equal(t, "", originOf("https://foo:bar:80/api/x"), "malformed non-bracketed authority containing ':' must fail closed, not be re-bracketed")
+
+	// A bracketed IPv6 literal carrying a zone ID (link-local scope, e.g.
+	// "fe80::1%eth0") re-brackets to a host containing a RAW '%', which is
+	// invalid in a URL and does not re-parse. A zone-id address is not a
+	// legitimate scan-target origin, so originOf fails closed for it too.
+	assert.Equal(t, "", originOf("https://[fe80::1%25eth0]/x"), "bracketed IPv6 host carrying a zone ID must fail closed, not emit a raw '%'")
+
+	// TEST (round-22 review, finding E): the early return for a scheme with
+	// no known default port sits BELOW the bracketing switch above, so an
+	// IPv6 host must stay bracketed on that branch too, not just on the
+	// http(s)-with-explicit-port branch. Every current pkg/generate/rest call
+	// site reaches originOf only through crawl.CanonicalOrigin, which rejects
+	// non-http(s) schemes before calling originOf and so never exercises this
+	// branch — but SameOrigin itself has no such scheme gate, and
+	// internal/pipeline calls crawl.SameOrigin(opts.TargetURL, targetOrigin)
+	// directly on the raw --target-url flag value (pipeline.go), which is
+	// unrestricted user input. This is directly observable on originOf too,
+	// since this test lives in the same package. Verified by mutation:
+	// reverting the early return to use the unbracketed u.Hostname() instead
+	// of the bracketed `host` variable breaks this exact assertion.
+	assert.Equal(t, "ws://[::1]", originOf("ws://[::1]/x"), "IPv6 host must stay bracketed on the unknown-scheme/no-default-port early-return branch too")
+}
+
+// TestCanonicalOrigin pins CanonicalOrigin's contract (SEC-BE-001/QUAL-001,
+// LAB-4992 review): the single, shared "what is an origin" definition for
+// both pkg/crawl and pkg/generate/rest. It must agree with originOf on
+// lower-casing and default-port equivalence (so a bare-host and an
+// explicit-default-port spelling of the same origin compare equal), but
+// display the default-port-stripped form (unlike originOf, which always
+// makes the port explicit) so generated output shows "https://example.com"
+// rather than "https://example.com:443". Non-http(s) schemes and host-less
+// URLs are rejected, matching originFromURL/canonicalizeOrigin's prior
+// behavior in pkg/generate/rest.
+func TestCanonicalOrigin(t *testing.T) {
+	assert.Equal(t, "https://example.com", CanonicalOrigin("https://example.com/api"), "bare host, default port implicit")
+	assert.Equal(t, "https://example.com", CanonicalOrigin("https://example.com:443/api"), "explicit default port must strip to match the bare-host form")
+	assert.Equal(t, "http://example.com", CanonicalOrigin("http://example.com:80/api"), "explicit default http port must strip")
+	assert.Equal(t, "https://example.com:8443", CanonicalOrigin("https://example.com:8443/x"), "non-default port must be preserved")
+	assert.Equal(t, "https://example.com", CanonicalOrigin("HTTPS://Example.COM/api"), "scheme and host must lower-case")
+	assert.Equal(t, "", CanonicalOrigin("not a url"))
+	assert.Equal(t, "", CanonicalOrigin("/relative/path"), "relative (host-less) URL rejected")
+	assert.Equal(t, "", CanonicalOrigin("ftp://example.com/x"), "non-http(s) scheme rejected")
+	assert.Equal(t, "", CanonicalOrigin("https:/api/x"), "single slash after scheme is not an authority marker; host-less")
+
+	// SEC-BE-001 (LAB-4992 review): IPv6 literals must keep their brackets
+	// (a bracket-less "servers" URL is syntactically invalid) and the
+	// default-port TrimSuffix must still fire with brackets present.
+	assert.Equal(t, "https://[::1]", CanonicalOrigin("https://[::1]/x"), "bracketed IPv6 host, default port implicit")
+	assert.Equal(t, "https://[::1]:8443", CanonicalOrigin("https://[::1]:8443/x"), "bracketed IPv6 host, non-default port preserved")
+	assert.Equal(t, "https://[::1]", CanonicalOrigin("https://[::1]:443/x"), "explicit default port must strip even with brackets present")
+	// Two distinct IPv6 spellings that previously collapsed to the same
+	// bracket-less string must canonicalize DIFFERENTLY.
+	assert.NotEqual(t, CanonicalOrigin("https://[2001:db8::1]:8443/x"), CanonicalOrigin("https://[2001:db8::1:8443]/x"),
+		"these two distinct IPv6 literals must never canonicalize to the same origin")
+
+	// SEC-BE (LAB-4992 round-23 review): CanonicalOrigin must fail closed
+	// (not fabricate an unparseable origin) for the two non-IP-literal shapes
+	// that reach originOf's bracketing logic — see TestOriginOf for the
+	// underlying mechanism.
+	assert.Equal(t, "", CanonicalOrigin("https://foo:bar:80/api/x"), "malformed authority must fail closed, not become \"https://[foo:bar]:80\"")
+	assert.Equal(t, "", CanonicalOrigin("https://[fe80::1%25eth0]/x"), "zone-id IPv6 literal must fail closed, not become a raw '%' URL")
+
+	// Idempotency (SEC-BE-001/QUAL-001's own invariant): CanonicalOrigin's
+	// output must always re-parse to itself. The two fail-closed shapes above
+	// trivially satisfy this ("" -> ""), but pin it explicitly since it is the
+	// exact property the pre-fix bug violated for "foo:bar:80".
+	for _, raw := range []string{
+		"https://foo:bar:80/api/x",
+		"https://[fe80::1%25eth0]/x",
+		"https://[2001:db8::1]:8443/x",
+		"https://example.com/x",
+	} {
+		once := CanonicalOrigin(raw)
+		twice := CanonicalOrigin(once)
+		assert.Equal(t, once, twice, "CanonicalOrigin(%q) must be idempotent under re-parse", raw)
+	}
+}
+
+// TestCanonicalOrigin_SameOriginImpliesEquality pins the invariant
+// pkg/generate/rest's extractServers relies on to justify dropping its
+// former "SameOrigin but not string-equal" admission arm (SEC-BE-001, round-23
+// review): CanonicalOrigin is idempotent, and both operands SameOrigin
+// compares in extractServers (an endpoint's origin and the run's primary
+// origin) are always themselves CanonicalOrigin outputs. Once both sides of a
+// comparison have already been through the SAME canonicalization function,
+// SameOrigin (scheme+host+port equality after originOf's own, coarser
+// normalization) can only agree with CanonicalOrigin's string equality — it
+// can never report "same origin" for two CanonicalOrigin outputs that are
+// themselves different strings, because there is no further normalization
+// SameOrigin applies that CanonicalOrigin didn't already apply (lower-casing,
+// default-port equivalence, IPv6 bracketing all happen in the shared
+// originOf underneath both). This is why extractServers' admission arm
+// (`primary != "" && crawl.SameOrigin(origin, primary)`) was unreachable:
+// origin and primary are both crawl.CanonicalOrigin(...) results, so
+// SameOrigin(origin, primary) true implies origin == primary, which the
+// preceding `serverSet[origin]` check (primary is always added to serverSet
+// before this arm runs) already caught.
+//
+// The table below covers the shapes named in the round-23 review: bracketed
+// IPv6 (with and without an explicit port), mixed host case, an
+// explicit-vs-implicit default port pair, and a plain hostname — for each,
+// two independently-canonicalized spellings of the SAME origin must satisfy
+// SameOrigin(a, b) == (a == b), with both sides computed from CanonicalOrigin
+// (never from the raw literal), matching how extractServers/choosePrimaryOrigin
+// actually feed these two functions.
+func TestCanonicalOrigin_SameOriginImpliesEquality(t *testing.T) {
+	pairs := []struct {
+		name string
+		a, b string
+	}{
+		{"bracketed IPv6, no port vs explicit default port", "https://[::1]/x", "https://[::1]:443/y"},
+		{"bracketed IPv6, non-default port, identical spelling", "https://[2001:db8::1]:8443/x", "https://[2001:db8::1]:8443/y"},
+		{"mixed host case", "https://EXAMPLE.com/x", "https://example.com/y"},
+		{"explicit vs implicit default port", "https://example.com:443/x", "https://example.com/y"},
+		{"plain hostname, identical", "https://example.com/x", "https://example.com/y"},
+		{"distinct plain hostnames", "https://example.com/x", "https://other.example.com/y"},
+		{"distinct bracketed IPv6 literals (port-absorption ambiguity)", "https://[2001:db8::1]:8443/x", "https://[2001:db8::1:8443]/y"},
+	}
+	for _, tt := range pairs {
+		t.Run(tt.name, func(t *testing.T) {
+			a := CanonicalOrigin(tt.a)
+			b := CanonicalOrigin(tt.b)
+			require.NotEmpty(t, a, "fixture must canonicalize to a usable origin")
+			require.NotEmpty(t, b, "fixture must canonicalize to a usable origin")
+			assert.Equal(t, a == b, SameOrigin(a, b),
+				"SameOrigin(%q, %q) must agree with string equality once both sides are CanonicalOrigin outputs", a, b)
+		})
+	}
+}
+
+// TestResolveTargetOrigin pins the priority order documented on
+// ResolveTargetOrigin: explicit targetURL wins outright; otherwise fall back
+// to the first HTML-response request's origin; otherwise the first
+// non-empty request URL's origin; otherwise "".
+func TestResolveTargetOrigin(t *testing.T) {
+	htmlReq := ObservedRequest{
+		URL:      "http://html.example.test/",
+		Response: ObservedResponse{ContentType: "text/html", Body: []byte("<!DOCTYPE html>")},
+	}
+	firstReq := ObservedRequest{
+		URL:      "http://first.example.test/app.js",
+		Response: ObservedResponse{ContentType: "application/javascript"},
+	}
+
+	tests := []struct {
+		name      string
+		targetURL string
+		requests  []ObservedRequest
+		want      string
+	}{
+		{
+			name:      "explicit targetURL wins over everything else",
+			targetURL: "https://explicit.example.test",
+			requests:  []ObservedRequest{firstReq, htmlReq},
+			want:      "https://explicit.example.test:443",
+		},
+		{
+			name:      "falls back to first-HTML origin when targetURL is empty",
+			targetURL: "",
+			requests:  []ObservedRequest{firstReq, htmlReq},
+			want:      "http://html.example.test:80",
+		},
+		{
+			name:      "falls back to first non-empty request URL when no HTML present",
+			targetURL: "",
+			requests:  []ObservedRequest{firstReq},
+			want:      "http://first.example.test:80",
+		},
+		{
+			// SEC-BE-001 (LAB-4992 review): a non-empty targetURL that fails
+			// to canonicalize must fail closed, NOT fall through to the
+			// capture-derived tiers. Falling through here let bundle-supplied
+			// content (synthetic static:js entries reconstructed from bundle
+			// text) choose the origin that receives --header credentials —
+			// this case used to expect "http://first.example.test:80".
+			name:      "unparseable targetURL fails closed, does not fall through",
+			targetURL: "not a url",
+			requests:  []ObservedRequest{firstReq},
+			want:      "",
+		},
+		{
+			// SEC-BE-001 (LAB-4992 review): a bracketed IPv6 zone-id target
+			// (fails closed in originOf via the zone-id arm) must also fail
+			// closed here rather than rebind to a capture-derived origin,
+			// even when the capture has multiple candidate origins to choose
+			// from.
+			name:      "zone-id targetURL fails closed even with a multi-origin capture",
+			targetURL: "https://[fe80::1%25eth0]/",
+			requests:  []ObservedRequest{firstReq, htmlReq},
+			want:      "",
+		},
+		{
+			name:      "empty request set and empty targetURL yields empty origin",
+			targetURL: "",
+			requests:  nil,
+			want:      "",
+		},
+		{
+			name:      "requests with only empty URLs yield empty origin",
+			targetURL: "",
+			requests:  []ObservedRequest{{URL: ""}, {URL: ""}},
+			want:      "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, ResolveTargetOrigin(tt.targetURL, tt.requests))
+		})
+	}
 }
 
 func TestExtractAPIPaths_CleanPathPassesThrough(t *testing.T) {
@@ -2019,6 +2739,34 @@ func TestExtractConcatPaths_PerBundleCap(t *testing.T) {
 	got := extractConcatPaths([]byte(sb.String()))
 	assert.Equal(t, maxConcatPathsPerBundle, len(got),
 		"extractConcatPaths must not exceed maxConcatPathsPerBundle per bundle")
+}
+
+// TestServicePrefixPlusPaths_PerBundleCap (TEST-003) verifies that
+// servicePrefixPlusPaths — which has its own maxConcatPathsPerBundle guard,
+// separate from extractConcatPaths' — is itself capped when a bundle contains
+// far more distinct literal service-prefix `+`-chains than the limit. Reached
+// via ExtractStaticConcatPaths, the offline entry point that fans out to both
+// extractors.
+func TestServicePrefixPlusPaths_PerBundleCap(t *testing.T) {
+	// Build a bundle with maxConcatPathsPerBundle*2 distinct service-prefix
+	// `+`-concat chains, each with a unique prefix and suffix so none collide
+	// in the seen-dedup map.
+	var sb strings.Builder
+	total := maxConcatPathsPerBundle * 2
+	for i := 0; i < total; i++ {
+		fmt.Fprintf(&sb, `var svc%d = "svc%d/" + "api/endpoint%d";`, i, i, i)
+	}
+	jsBody := []byte(sb.String())
+
+	got := servicePrefixPlusPaths(jsBody)
+	assert.Equal(t, maxConcatPathsPerBundle, len(got),
+		"servicePrefixPlusPaths must not exceed maxConcatPathsPerBundle per bundle")
+
+	// The cap must also be visible through the offline entry point that both
+	// extractConcatPaths and servicePrefixPlusPaths feed into.
+	all := ExtractStaticConcatPaths(jsBody)
+	assert.LessOrEqual(t, len(all), 2*maxConcatPathsPerBundle,
+		"ExtractStaticConcatPaths must not exceed the combined per-extractor caps")
 }
 
 // TestExtractConcatPaths_ConcatArgListCap verifies that a .concat() call
@@ -2173,7 +2921,7 @@ func TestCopyHeaders(t *testing.T) {
 	})
 }
 
-// --- TEST-004: validateFullURL branches ---
+// --- TEST-004: ValidateFullURL branches ---
 
 func TestValidateFullURL(t *testing.T) {
 	cases := []struct {
@@ -2192,8 +2940,8 @@ func TestValidateFullURL(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, ok := validateFullURL(tc.in)
-			assert.Equal(t, tc.ok, ok, "validateFullURL(%q) ok=%v, want %v", tc.in, ok, tc.ok)
+			_, ok := ValidateFullURL(tc.in)
+			assert.Equal(t, tc.ok, ok, "ValidateFullURL(%q) ok=%v, want %v", tc.in, ok, tc.ok)
 		})
 	}
 }
@@ -3103,4 +3851,879 @@ func TestReplayJSExtracted_NoHTMLFallsBackToFirstURL(t *testing.T) {
 	}
 	assert.Contains(t, apiURLs, app.URL+"/api/users/0/orders",
 		"with no HTML response and no TargetURL, replay must bind to the first non-empty request's origin (the JS bundle's)")
+}
+
+// ---------------------------------------------------------------------------
+// Task 5: JSReplayConfig.Proxy field + proxied client in withDefaults (LAB-4993)
+// ---------------------------------------------------------------------------
+
+// TestJSReplayConfig_WithDefaults_ProxyClient verifies that when Proxy is
+// enabled and Client is nil, withDefaults builds a proxied client: transport
+// routes through the proxy, has no SSRF dial pin (we dial the proxy, not the
+// target), and keeps the replay step's noRedirect policy.
+func TestJSReplayConfig_WithDefaults_ProxyClient(t *testing.T) {
+	proxyURL, err := url.Parse("http://127.0.0.1:8080")
+	require.NoError(t, err)
+
+	cfg := JSReplayConfig{Proxy: httpx.ProxyConfig{URL: proxyURL}}.withDefaults()
+
+	require.NotNil(t, cfg.Client)
+	tr, ok := cfg.Client.Transport.(*http.Transport)
+	require.True(t, ok, "Transport must be *http.Transport, got %T", cfg.Client.Transport)
+	assert.NotNil(t, tr.Proxy, "proxied client must set Transport.Proxy")
+	assert.Nil(t, tr.DialContext, "proxied client must NOT install the SSRF dial pin")
+
+	require.NotNil(t, cfg.Client.CheckRedirect)
+	gotErr := cfg.Client.CheckRedirect(nil, nil)
+	assert.True(t, errors.Is(gotErr, http.ErrUseLastResponse),
+		"proxied client must keep the replay step's httpx.NoFollowRedirects policy")
+
+	// TEST-004 parity (see pkg/probe/proxy_internal_test.go): Timeout is the
+	// only bound on a proxied replay request, so it must default to a
+	// non-zero value on the client.
+	assert.Equal(t, defaultTimeout, cfg.Client.Timeout, "proxied client must carry the default per-request Timeout")
+
+	// TEST-011: Config.Proxy.Insecure must survive the
+	// withDefaults->BuildHTTPClient hop for an http/https proxy, but never for
+	// socks5 (a transparent TCP tunnel with no substitute CA to trust).
+	t.Run("http proxy Insecure=true", func(t *testing.T) {
+		insecureURL, err := url.Parse("http://127.0.0.1:8080")
+		require.NoError(t, err)
+
+		insecureCfg := JSReplayConfig{Proxy: httpx.ProxyConfig{URL: insecureURL, Insecure: true}}.withDefaults()
+
+		insecureTr, ok := insecureCfg.Client.Transport.(*http.Transport)
+		require.True(t, ok, "Transport must be *http.Transport, got %T", insecureCfg.Client.Transport)
+		require.NotNil(t, insecureTr.TLSClientConfig, "Insecure=true must install a TLSClientConfig")
+		assert.True(t, insecureTr.TLSClientConfig.InsecureSkipVerify,
+			"Config.Proxy.Insecure must survive the withDefaults->BuildHTTPClient hop for an http/https proxy")
+	})
+
+	t.Run("socks5 proxy Insecure=true stays verified", func(t *testing.T) {
+		socksURL, err := url.Parse("socks5://127.0.0.1:1080")
+		require.NoError(t, err)
+
+		socksCfg := JSReplayConfig{Proxy: httpx.ProxyConfig{URL: socksURL, Insecure: true}}.withDefaults()
+
+		socksTr, ok := socksCfg.Client.Transport.(*http.Transport)
+		require.True(t, ok, "Transport must be *http.Transport, got %T", socksCfg.Client.Transport)
+		if socksTr.TLSClientConfig != nil {
+			assert.False(t, socksTr.TLSClientConfig.InsecureSkipVerify,
+				"socks5 is a transparent tunnel; Insecure must never skip verification of the real target")
+		}
+	})
+}
+
+// TestJSReplayConfig_WithDefaults_WarnsWhenClientInjectedWithProxy is the
+// SEC-BE-004 proof for the JS-replay stage: when a caller injects
+// JSReplayConfig.Client (which owns its own transport) AND enables Proxy,
+// withDefaults must not silently bypass the proxy — it writes a loud warning
+// to cfg.Stderr, mirroring the equivalent probe-stage guard
+// (pkg/probe/proxy_internal_test.go:TestConfig_WithDefaults_WarnsWhenClientInjectedWithProxy).
+func TestJSReplayConfig_WithDefaults_WarnsWhenClientInjectedWithProxy(t *testing.T) {
+	proxyURL, err := url.Parse("http://127.0.0.1:8080")
+	require.NoError(t, err)
+
+	var stderr bytes.Buffer
+	injectedClient := &http.Client{}
+	cfg := JSReplayConfig{
+		Client: injectedClient,
+		Proxy:  httpx.ProxyConfig{URL: proxyURL},
+		Stderr: &stderr,
+	}.withDefaults()
+
+	assert.NotNil(t, cfg.Client, "an injected Client must survive withDefaults even when Proxy is enabled")
+	assert.Contains(t, stderr.String(), "js-extract: warning",
+		"withDefaults must warn on Stderr when a Client is injected alongside a configured Proxy")
+	assert.Contains(t, stderr.String(), "BYPASS the proxy",
+		"the warning must explain that replay traffic will bypass the proxy")
+}
+
+// TestJSReplayConfig_WithDefaults_NoProxyUnchanged verifies that a zero-value
+// Proxy leaves the existing newSSRFSafeClient construction untouched (the
+// default client still installs the SSRF-safe dial guard when !AllowPrivate).
+func TestJSReplayConfig_WithDefaults_NoProxyUnchanged(t *testing.T) {
+	cfg := JSReplayConfig{}.withDefaults()
+
+	require.NotNil(t, cfg.Client)
+	tr, ok := cfg.Client.Transport.(*http.Transport)
+	require.True(t, ok, "Transport must be *http.Transport, got %T", cfg.Client.Transport)
+	require.NotNil(t, tr.DialContext, "unproxied default client must keep the SSRF-safe dial guard")
+	_, dialErr := tr.DialContext(context.Background(), "tcp", "127.0.0.1:1")
+	require.Error(t, dialErr, "DialContext must reject loopback under SSRF protection")
+	assert.Contains(t, dialErr.Error(), "private")
+}
+
+// TestReplayJSExtracted_RoutesThroughProxy is the AC-1 proof for JS-replay:
+// end-to-end, modeled on pkg/crawl/http_crawler_test.go:195 (recording
+// forwarding proxy) and TestReplayJSExtracted_HTMLScriptDiscovery (HTML page
+// referencing an external JS bundle that must be fetched over the network).
+// The config deliberately leaves Client nil so withDefaults' proxied branch is
+// exercised — an injected Client would opt out of Proxy (see architecture.md
+// §1 hazard).
+func TestReplayJSExtracted_RoutesThroughProxy(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/main.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			w.Write([]byte(`var api = "/api/v1/products";`)) //nolint:errcheck,gosec // test handler
+		case "/api/v1/products":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"data":[]}`)) //nolint:errcheck,gosec // test handler
+		default:
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte(`<!DOCTYPE html><html><head><script src="main.js"></script></head></html>`)) //nolint:errcheck,gosec // test handler
+		}
+	}))
+	defer origin.Close()
+
+	proxyURL, hits := newRecordingProxy(t)
+
+	requests := []ObservedRequest{
+		{
+			Method: "GET",
+			URL:    origin.URL + "/",
+			Source: "katana",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<!DOCTYPE html><html><head><script src="main.js"></script></head></html>`),
+			},
+		},
+	}
+
+	cfg := JSReplayConfig{
+		Proxy:        httpx.ProxyConfig{URL: proxyURL},
+		AllowPrivate: true,
+		TargetURL:    origin.URL,
+	}
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	var apiURLs []string
+	for _, r := range result {
+		if r.Source == "js-extract" {
+			apiURLs = append(apiURLs, r.URL)
+		}
+	}
+	assert.Contains(t, apiURLs, origin.URL+"/api/v1/products")
+	assert.NotZero(t, hits.Load(), "JS-replay must route its fetches through the configured proxy")
+}
+
+// TestReplayJSExtracted_ProxiedFetch_AllowPrivateGate is the TEST-002 proof
+// for the URL-level SSRF gate on the proxied JS-replay path (PR #186 round-7
+// review). withDefaults' proxied branch (jsreplay.go ~146-155) deliberately
+// installs no dial-time SSRF pin when a Proxy is configured — we dial the
+// proxy, not the target — so canFetchURL's ssrf.ValidateURLContext call
+// (jsreplay.go ~2018-2021, guarded by !cfg.AllowPrivate) is the only
+// remaining scope guard on that path. It must reject the loopback target
+// BEFORE any HTTP request reaches the proxy — the recording proxy seeing
+// zero hits is the strongest available proof the validator runs before any
+// network I/O. Mirrors TestSourcemap_ProxiedFetch_AllowPrivateGate
+// (jsstatic package) and
+// TestClassifyProbeGenerate_ProxiedLoopback_RequiresAllowPrivate (pipeline
+// package). The AllowPrivate=true side of this gate is already covered by
+// TestReplayJSExtracted_RoutesThroughProxy above, so this test deliberately
+// does NOT add a redundant AllowPrivate=true subtest. Guards against a
+// regression that skips URL validation when a proxy is configured — the
+// exact "the proxy relaxes SSRF" mistake the proxied branch invites — which
+// would otherwise leave this suite green.
+func TestReplayJSExtracted_ProxiedFetch_AllowPrivateGate(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/main.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			w.Write([]byte(`var api = "/api/v1/products";`)) //nolint:errcheck,gosec // test handler
+		case "/api/v1/products":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"data":[]}`)) //nolint:errcheck,gosec // test handler
+		default:
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte(`<!DOCTYPE html><html><head><script src="main.js"></script></head></html>`)) //nolint:errcheck,gosec // test handler
+		}
+	}))
+	defer origin.Close()
+
+	proxyURL, hits := newRecordingProxy(t)
+
+	requests := []ObservedRequest{
+		{
+			Method: "GET",
+			URL:    origin.URL + "/",
+			Source: "katana",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "text/html",
+				Body:        []byte(`<!DOCTYPE html><html><head><script src="main.js"></script></head></html>`),
+			},
+		},
+	}
+
+	// Client is deliberately left nil: this forces withDefaults down the
+	// httpx.BuildHTTPClient proxied branch (the branch with no dial-time
+	// SSRF pin) rather than the injected-Client branch.
+	cfg := JSReplayConfig{
+		Proxy:        httpx.ProxyConfig{URL: proxyURL},
+		AllowPrivate: false, // loopback origin — the SSRF validator must reject it
+		TargetURL:    origin.URL,
+	}
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	var jsExtracted []string
+	for _, r := range result {
+		if r.Source == "js-extract" {
+			jsExtracted = append(jsExtracted, r.URL)
+		}
+	}
+	assert.Empty(t, jsExtracted, "no js-extract entries must be appended when the SSRF gate rejects the loopback target before any fetch")
+	assert.Zero(t, hits.Load(), "the SSRF validator must reject the loopback target before the proxy is ever contacted")
+}
+
+// TestReplayJSExtracted_ProxiedProbe_AllowPrivateGate is the TEST-002 proof
+// for the URL-level SSRF gate on the *probe-loop* half of the proxied
+// JS-replay path (PR #186 independent review). It is the sibling of
+// TestReplayJSExtracted_ProxiedFetch_AllowPrivateGate above, which covers
+// the canFetchURL guard (jsreplay.go ~2019) that gates the JS *fetch*
+// (fetchJSBody, called at ~1994). That sibling test cannot reach the
+// probe-loop guard (jsreplay.go ~1866, immediately before probeURL at
+// ~1874): it supplies an HTML body with a <script src="main.js">, so the JS
+// bundle must be fetched before any endpoint can be extracted — the fetch
+// gate rejects it first, no endpoints are ever discovered, and the probe
+// loop never runs.
+//
+// This test instead supplies the captured request's Response.Body as the
+// JS source itself. jsreplay.go:1761 sets jsBody := req.Response.Body and
+// only re-fetches when that body is empty or truncated at
+// MaxResponseBodySize (~1767); a non-empty, non-truncated inline body
+// therefore skips canFetchURL/fetchJSBody entirely. extractAPIPaths runs
+// directly against the inline body, the discovered "/api/v1/products" path
+// enters the probe loop, and the AllowPrivate gate at jsreplay.go:1865
+// becomes the sole guard standing between the loopback-resolving URL and
+// probeURL. As with its fetch-side sibling, withDefaults' proxied branch
+// installs no dial-time SSRF pin (we dial the proxy, not the target), so
+// the recording proxy seeing zero hits is the strongest available proof
+// the validator runs before any network I/O. Guards against the same
+// regression class as its sibling: relaxing line 1865 to also require
+// "!cfg.Proxy.Enabled()" would leave the entire pkg/crawl suite green —
+// this test is what makes that regression visible for the probe half of
+// the gate.
+func TestReplayJSExtracted_ProxiedProbe_AllowPrivateGate(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/products" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"data":[]}`)) //nolint:errcheck,gosec // test handler
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer origin.Close()
+
+	proxyURL, hits := newRecordingProxy(t)
+
+	requests := []ObservedRequest{
+		{
+			Method: "GET",
+			URL:    origin.URL + "/main.js",
+			Source: "katana",
+			Response: ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/javascript",
+				Body:        []byte(`var api = "/api/v1/products";`),
+			},
+		},
+	}
+
+	// Client is deliberately left nil: this forces withDefaults down the
+	// httpx.BuildHTTPClient proxied branch (the branch with no dial-time
+	// SSRF pin) rather than the injected-Client branch.
+	cfg := JSReplayConfig{
+		Proxy:        httpx.ProxyConfig{URL: proxyURL},
+		AllowPrivate: false, // loopback origin — the probe-loop SSRF gate must reject it
+		TargetURL:    origin.URL,
+	}
+	result := ReplayJSExtracted(context.Background(), requests, cfg)
+
+	var jsExtracted []string
+	for _, r := range result {
+		if r.Source == "js-extract" {
+			jsExtracted = append(jsExtracted, r.URL)
+		}
+	}
+	assert.Empty(t, jsExtracted, "no js-extract entries must be appended when the probe-loop SSRF gate rejects the loopback target before any probe")
+	assert.Zero(t, hits.Load(), "the SSRF validator must reject the loopback target before the proxy is ever contacted")
+}
+
+// TestExtractStaticConcatPaths pins the network-free concat / +-chain /
+// service-prefix reconstruction shared with pkg/analyze/jsstatic (LAB-4992).
+// It must reconstruct the same concrete forms extractConcatPaths does, PLUS the
+// literal service-prefix `+`-form that extractConcatPaths misses (its +-head
+// anchor requires an API indicator), and must NOT do speculative service-prefix
+// fan-out (only safe when 404-filtered by probing). Non-literal operands become
+// the numeric sentinel "0".
+func TestExtractStaticConcatPaths(t *testing.T) {
+	tests := []struct {
+		name string
+		js   string
+		want []string
+	}{
+		{
+			name: "concat method form",
+			js:   `fetch("/api/users/".concat(uid, "/orders"));`,
+			want: []string{"/api/users/0/orders"},
+		},
+		{
+			name: "plus chain form",
+			js:   `var u = "/api/products/" + pid + "/reviews";`,
+			want: []string{"/api/products/0/reviews"},
+		},
+		{
+			name: "literal service-prefix plus form",
+			js:   `var l = "identity/" + "api/auth/login";`,
+			want: []string{"identity/api/auth/login"},
+		},
+		{
+			name: "service-prefix plus with dynamic middle operand",
+			js:   `var u = "identity/" + id + "/api/orders";`,
+			want: []string{"identity/0/api/orders"},
+		},
+		{
+			// QUAL-006: single-character service prefixes ("v/") must match —
+			// servicePrefixPlusHeadPattern's quantifier is {0,30} so the head
+			// can be a lone letter + slash. cleanConcatPath's API-indicator
+			// filter still gates the assembled chain.
+			name: "single-character service prefix",
+			js:   `var u = "v/" + "api/users";`,
+			want: []string{"v/api/users"},
+		},
+		{
+			name: "service-prefix head without API indicator dropped",
+			js:   `var u = "assets/" + name + "/logo";`,
+			want: nil,
+		},
+		{
+			name: "no concatenation present",
+			js:   `fetch("/api/v2/users");`,
+			want: nil,
+		},
+		{
+			name: "dedup across forms and repeats",
+			js:   `"identity/"+"api/x"; "identity/"+"api/x"; fetch("/api/p/".concat(id));`,
+			want: []string{"/api/p/0", "identity/api/x"},
+		},
+		{
+			// TEST-009: pins the CROSS-EXTRACTOR arm of ExtractStaticConcatPaths'
+			// add() dedup (`seen[p]` already true). The case above only
+			// exercises intra-extractor repeats — "identity/" has no API
+			// indicator, so concatPlusHeadPattern never matches it and only
+			// servicePrefixPlusPaths emits it, whose own seen map absorbs the
+			// repeat. Here the single head literal "api/" matches BOTH
+			// concatPlusHeadPattern (it satisfies APIIndicatorAlternation) and
+			// servicePrefixPlusHeadPattern, so extractConcatPaths and
+			// servicePrefixPlusPaths each reconstruct "api/v2/users" and only
+			// add()'s shared seen map can collapse them to one entry.
+			name: "dedup across extractors for one input",
+			js:   `var u = "api/" + "v2/users";`,
+			want: []string{"api/v2/users"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractStaticConcatPaths([]byte(tt.js))
+			sort.Strings(got)
+			sort.Strings(tt.want)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestCleanConcatPath(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "collapses double slash in path",
+			in:   "/api/posts//comment",
+			want: "/api/posts/comment",
+		},
+		{
+			name: "preserves scheme separator",
+			in:   "https://h//api//x",
+			want: "https://h/api/x",
+		},
+		{
+			// QUAL-005: a `://` inside a query value must NOT be treated as a
+			// scheme separator, and `//` inside the query must be preserved —
+			// only the path portion is slash-collapsed.
+			name: "query-string scheme is not mistaken for path scheme",
+			in:   "/api//proxy?url=https://a//b",
+			want: "/api/proxy?url=https://a//b",
+		},
+		{
+			// SEC-BE-002: a raw control byte (here NUL) in the path must be
+			// rejected, not just ASCII whitespace.
+			name: "rejects embedded NUL control byte",
+			in:   "/api/\x00x",
+			want: "",
+		},
+		{
+			name: "rejects vertical tab control byte",
+			in:   "/api/\x0bx",
+			want: "",
+		},
+		{
+			name: "rejects DEL control byte",
+			in:   "/api/\x7fx",
+			want: "",
+		},
+		{
+			name: "rejects space",
+			in:   "/api/ x",
+			want: "",
+		},
+		{
+			name: "drops path without API indicator",
+			in:   "/static/logo",
+			want: "",
+		},
+		{
+			// SEC-BE-002: a lone non-UTF-8 high byte (0x80-0x9F) decodes to
+			// utf8.RuneError, for which unicode.IsControl is false — a
+			// rune-based-only scan would let it survive. It must still be
+			// rejected as an invalid/unprintable byte.
+			name: "rejects raw non-UTF-8 high byte",
+			in:   "/api/\x85x",
+			want: "",
+		},
+
+		// SEC-BE-002: every non-ASCII rune is rejected, because cleanConcatPath
+		// now enforces an ASCII ALLOW-list rather than enumerating bad Unicode
+		// categories. They reach a candidate path because stringLiteralValue
+		// copies operand bytes verbatim, and the sink is the generated OpenAPI
+		// document — yaml.v3 emits them raw, so the rendered path can differ from
+		// the bytes it contains (bidi override, homoglyph) or hide segments
+		// (zero-width).
+		//
+		// The first six cases below are the ones the original
+		// `' ' || unicode.IsControl` predicate missed (IsControl is Latin-1-only,
+		// so it returns false above U+00FF). The four after them are the ones the
+		// widened Zs/Cc/Cf/Zl/Zp block-list STILL missed — which is why the
+		// predicate was inverted rather than widened a third time.
+		{
+			name: "rejects U+202E right-to-left override (Cf)",
+			in:   "/api/\u202Ex",
+			want: "",
+		},
+		{
+			name: "rejects U+200B zero-width space (Cf)",
+			in:   "/api/\u200Bx",
+			want: "",
+		},
+		{
+			name: "rejects U+FEFF byte-order mark (Cf)",
+			in:   "/api/\uFEFFx",
+			want: "",
+		},
+		{
+			name: "rejects U+00A0 non-breaking space (Zs)",
+			in:   "/api/\u00A0x",
+			want: "",
+		},
+		{
+			name: "rejects U+3000 ideographic space (Zs)",
+			in:   "/api/\u3000x",
+			want: "",
+		},
+		{
+			name: "rejects U+2028 line separator (Zl)",
+			in:   "/api/\u2028x",
+			want: "",
+		},
+		{
+			// TEST-006: the Zp arm was never covered.
+			name: "rejects U+2029 paragraph separator (Zp)",
+			in:   "/api/\u2029x",
+			want: "",
+		},
+
+		// These four survived even the widened Zs/Cc/Cf/Zl/Zp block-list and are
+		// the direct reason for the allow-list inversion.
+		{
+			// The homoglyph sits AFTER a valid ASCII `api/` so hasAPIIndicator
+			// still matches and the charset check is what rejects it. Putting it
+			// inside the indicator itself ("/\u0430pi/users") would make this case
+			// vacuous \u2014 hasAPIIndicator would reject it whatever the charset does.
+			name: "rejects Cyrillic homoglyph (Ll, renders as Latin e)",
+			in:   "/api/us\u0435rs",
+			want: "",
+		},
+		{
+			name: "rejects U+FF0F fullwidth solidus (Po, renders as /)",
+			in:   "/api/x\uff0fy",
+			want: "",
+		},
+		{
+			name: "rejects U+0301 combining acute accent (Mn)",
+			in:   "/api/x\u0301y",
+			want: "",
+		},
+		{
+			name: "rejects U+FE0F variation selector-16 (Mn, not Cf)",
+			in:   "/api/x\ufe0fy",
+			want: "",
+		},
+
+		// QUAL-002: cleanConcatPath must canonicalize trailing slashes exactly as
+		// addPath does, so the offline mirror and the active js-extract entry for
+		// one reconstruction produce a single OpenAPI path rather than two.
+		{
+			name: "trims trailing slash",
+			in:   "/api/orders/",
+			want: "/api/orders",
+		},
+		{
+			name: "trims trailing slash after sentinel segment",
+			in:   "/api/orders/0/",
+			want: "/api/orders/0",
+		},
+		{
+			name: "trims repeated trailing slashes",
+			in:   "/api/orders///",
+			want: "/api/orders",
+		},
+		{
+			name: "trims trailing slash on absolute reconstruction",
+			in:   "https://h/api/x/",
+			want: "https://h/api/x",
+		},
+		{
+			// The trim applies to the path portion only, so a trailing slash
+			// inside a query value survives.
+			name: "preserves trailing slash inside query value",
+			in:   "/api/proxy?url=https://a/",
+			want: "/api/proxy?url=https://a/",
+		},
+
+		// TEST-006: the `#` arm of the IndexAny(p, "?#") split was untested — only
+		// the `?` arm had coverage. A fragment must be split off like a query, so
+		// `//` inside it is preserved and the path portion is still trimmed.
+		{
+			name: "collapses path slashes but preserves them inside a fragment",
+			in:   "/api//x#a//b",
+			want: "/api/x#a//b",
+		},
+		{
+			name: "trims trailing path slash before a fragment",
+			in:   "/api/x/#frag",
+			want: "/api/x#frag",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, cleanConcatPath(tt.in))
+		})
+	}
+}
+
+// TestIsAbsoluteHTTPURL pins the case-insensitivity that motivated this helper
+// (TEST-001 / QUAL-003). Mutation-tested previously: a case-sensitive
+// implementation survived the entire suite, because every existing fixture
+// spelled the scheme in lower case.
+//
+// Case matters because url.Parse lower-cases the scheme, so "HTTPS://h/x" is
+// absolute to every downstream consumer. A case-sensitive check would classify it
+// as relative and route it into path resolution — prepending a slash (jsstatic) or
+// concatenating it onto the target origin (the probe loop) instead of gating it.
+func TestIsAbsoluteHTTPURL(t *testing.T) {
+	absolute := []string{
+		"http://example.com/api/x",
+		"https://example.com/api/x",
+		"HTTP://example.com/api/x",
+		"HTTPS://example.com/api/x",
+		"HtTpS://example.com/api/x",
+		// u:p is synthetic; example.com is an RFC 2606 reserved domain. Present
+		// only to prove IsAbsoluteHTTPURL ignores userinfo when deciding
+		// absoluteness; no credential is used or sent.
+		"https://u:p@example.com/api/x", // absolute regardless of userinfo
+	}
+	for _, in := range absolute {
+		assert.True(t, IsAbsoluteHTTPURL(in), "expected %q to be absolute", in)
+	}
+
+	notAbsolute := []string{
+		"/api/x",
+		"api/x",
+		"//example.com/api/x", // scheme-relative: NOT absolute until resolved
+		"ftp://example.com/x",
+		"javascript:/api/x",
+		"httpsx://example.com/x",
+		"xhttps://example.com/x",
+		"",
+	}
+	for _, in := range notAbsolute {
+		assert.False(t, IsAbsoluteHTTPURL(in), "expected %q NOT to be absolute", in)
+	}
+}
+
+// TestSameOrigin gives the newly exported comparison direct coverage (TEST-005).
+// Mutation-tested previously: flipping its fail-closed arm to `return true`
+// survived the whole suite, because every caller happened to be exercised only
+// with parseable same-origin or clearly-different-origin inputs.
+func TestSameOrigin(t *testing.T) {
+	same := [][2]string{
+		{"https://example.com/a", "https://example.com/b"},
+		{"https://example.com/a", "https://example.com:443/b"}, // default port canonicalized
+		{"http://example.com/a", "http://example.com:80/b"},    // ditto for http
+		{"https://EXAMPLE.com/a", "https://example.com/b"},     // host case
+		{"https://example.com:8443/a", "https://example.com:8443/b"},
+		{"https://[::1]/a", "https://[::1]:443/b"},             // IPv6, default port canonicalized
+		{"https://[2001:DB8::1]/a", "https://[2001:db8::1]/b"}, // IPv6 host case
+	}
+	for _, tt := range same {
+		assert.True(t, SameOrigin(tt[0], tt[1]), "expected same origin: %q vs %q", tt[0], tt[1])
+	}
+
+	differ := [][2]string{
+		{"https://example.com/a", "http://example.com/a"},       // scheme
+		{"https://example.com/a", "https://other.com/a"},        // host
+		{"https://example.com/a", "https://example.com:8443/a"}, // explicit non-default port
+		{"https://example.com/a", "https://example.com./a"},     // trailing dot is a distinct host
+		// TEST (round-22 review, finding F): this http(s) pair does NOT
+		// actually require re-bracketing to differ under SameOrigin — verified
+		// by mutation, removing originOf's re-bracketing entirely still
+		// differs here, because https always appends a non-empty default port
+		// when none is given, and that extra ":443" suffix (present only on
+		// the second URL's unbracketed form) already breaks string equality
+		// on its own. The genuine collision this pair guards against — where
+		// BOTH strip to the identical bracket-less form — only manifests
+		// through CanonicalOrigin's *additional* default-port-suffix
+		// stripping, which is pinned directly by TestCanonicalOrigin's own
+		// assert.NotEqual for this exact pair, and by TestOriginOf's assert
+		// on the raw bracketed originOf output. Retained here only as a
+		// same-origin/host-equality sanity check for this pair, not as a
+		// bracket-pinning regression guard.
+		{"https://[2001:db8::1]:8443/a", "https://[2001:db8::1:8443]/b"},
+		// This pair, by contrast, DOES require re-bracketing to differ under
+		// SameOrigin directly (verified by mutation): an unknown scheme (no
+		// default port — see originOf's early-return branch, finding E) never
+		// appends a port suffix when none is given, so nothing masks a
+		// bracket-less collision the way https's always-present default port
+		// does above. Without re-bracketing, both origins fold to the
+		// identical unbracketed string "ws://2001:db8::1:8443" and SameOrigin
+		// would wrongly report them as the same origin.
+		{"ws://[2001:db8::1]:8443/a", "ws://[2001:db8::1:8443]/b"},
+	}
+	for _, tt := range differ {
+		assert.False(t, SameOrigin(tt[0], tt[1]), "expected different origin: %q vs %q", tt[0], tt[1])
+	}
+
+	// Fail-closed arm: anything without a parseable origin is never "same",
+	// including two identically-unparseable inputs. This is the branch a
+	// `return true` mutation slipped past.
+	failClosed := [][2]string{
+		{"", ""},
+		{"", "https://example.com/a"},
+		{"https://example.com/a", ""},
+		{"/api/x", "/api/x"},               // relative: no host
+		{"not a url\x7f", "not a url\x7f"}, // unparseable both sides
+		{"https://example.com/a", "not a url\x7f"},
+	}
+	for _, tt := range failClosed {
+		assert.False(t, SameOrigin(tt[0], tt[1]),
+			"must fail closed for %q vs %q", tt[0], tt[1])
+	}
+}
+
+// TestCleanConcatPathAllowList pins the allow-list's ACCEPT set and its
+// path-vs-suffix asymmetry (TEST-006, TEST-007). Both were unpinned: narrowing the
+// permitted punctuation by 12 characters survived the suite, and so did allowing
+// the query delimiters inside the path portion.
+//
+// Without the accept half, a future tightening silently drops real endpoints —
+// which already happened once (QUAL-004: `?filter[status]=open` and `?q=a|b` were
+// rejected by the first allow-list).
+func TestCleanConcatPathAllowList(t *testing.T) {
+	// Accept: every permitted punctuation character, in a path and in a query.
+	accepted := []string{
+		"/api/a-b_c.d~e",
+		"/api/v1/items:action",
+		"/api/users/{userId}/orders",
+		"/api/a!b$c'd(e)f*g+h,i;j",
+		"/api/items@rev",
+		"/api/items[0]",
+		"/api/items|alt",
+		"/api/items?filter[status]=open", // QUAL-004 regression guard
+		"/api/items?q=a|b",               // QUAL-004 regression guard
+		"/api/v1/items?page=2&size=10",
+		"/api/items?name=a%20b", // legit percent-escape
+		"/api/x%2Fy",            // encoded slash
+		"/api/items#frag",
+	}
+	for _, in := range accepted {
+		assert.Equal(t, in, cleanConcatPath(in), "must be accepted unchanged: %q", in)
+	}
+
+	// TEST-007: `?`, `=`, `&` and `#` are suffix-only. IndexAny splits on the
+	// first `?`/`#`, so reaching the path arm with one requires `=` or `&`, which
+	// no split consumes.
+	suffixOnlyInPath := []string{
+		"/api/a=b/c",
+		"/api/a&b/c",
+	}
+	for _, in := range suffixOnlyInPath {
+		assert.Empty(t, cleanConcatPath(in),
+			"query delimiter must be rejected in the path portion: %q", in)
+	}
+
+	// Percent-escape validation (SEC-BE-002): non-ASCII and control decodes are
+	// rejected; malformed escapes are rejected rather than passed through.
+	rejectedEscapes := []string{
+		"/api/x%E2%80%AEy", // U+202E bidi override — decodes non-ASCII
+		"/api/x%C3%A9y",    // é — decodes non-ASCII
+		"/api/x%00y",       // NUL
+		"/api/x%0Ay",       // LF
+		"/api/x%7Fy",       // DEL
+		"/api/x%",          // truncated
+		"/api/x%E",         // truncated
+		"/api/x%ZZy",       // non-hex
+	}
+	for _, in := range rejectedEscapes {
+		assert.Empty(t, cleanConcatPath(in), "must be rejected: %q", in)
+	}
+}
+
+// TestIsAbsoluteHTTPURLCallSites pins the REACHABLE call sites, not just the helper
+// (TEST-004).
+//
+// Two of the three rerouted sites are reachable with a mixed-case scheme and are
+// covered below. The third — the probe-URL construction in ReplayJSExtracted — is
+// NOT reachable that way and deliberately has no test here: fullURLPattern
+// requires a lowercase `https?://`, so an uppercase-scheme literal is never
+// extracted in the first place and never reaches that branch. A subtest for it
+// probed nothing and passed under the mutation, i.e. it was vacuous. That site is
+// defense-in-depth only; see the note at the branch itself. Mutation-tested previously: reverting ANY of the three rerouted sites
+// to a case-sensitive strings.HasPrefix left all 18 packages green, because
+// TestIsAbsoluteHTTPURL exercises the predicate in isolation and every other
+// fixture in the suite spells the scheme in lower case.
+//
+// Case matters because url.Parse lower-cases the scheme, so "HTTPS://h/x" is
+// absolute to every downstream consumer. A case-sensitive check routes it into path
+// resolution instead — which is how the scheme-relative shape that SEC-BE-001 was
+// about gets manufactured in the first place.
+func TestIsAbsoluteHTTPURLCallSites(t *testing.T) {
+	// Site 1 — template-literal reconstruction (jsreplay.go, the candidate trim).
+	// Mutated (case-sensitive) this yields "//example.com/api/users/{param}", i.e.
+	// a scheme-relative URL manufactured out of an absolute one.
+	t.Run("template_literal_reconstruction", func(t *testing.T) {
+		paths := extractAPIPaths([]byte("var u = `HTTPS://example.com/api/users/${id}`;"), nil)
+		for _, p := range paths {
+			assert.False(t, strings.HasPrefix(p, "//"),
+				"an uppercase-scheme literal must not be reduced to a scheme-relative path, got %q", p)
+		}
+	})
+
+	// Site 2 — addPath's full-URL branch. An uppercase-scheme cross-origin URL must
+	// go through ValidateFullURL and be kept absolute (not slash-prefixed into a
+	// bogus same-origin path).
+	t.Run("addPath_full_url_branch", func(t *testing.T) {
+		paths := extractAPIPaths([]byte(`var u = "HTTPS://other.example/api/items";`), nil)
+		for _, p := range paths {
+			assert.False(t, strings.HasPrefix(p, "/HTTPS:") || strings.HasPrefix(p, "//other.example"),
+				"uppercase-scheme URL must not be rewritten into a path, got %q", p)
+		}
+	})
+
+}
+
+// TestPercentEscapeValidation pins validPercentEscape's contract, exercised
+// through cleanConcatPath (TEST-005). Three mutants previously survived the
+// whole suite because the accepted-escape fixtures only ever used the hex
+// digits {0, 2, F}:
+//   - `i += 2` -> `i += 3`, which skips validation of the byte AFTER an escape
+//   - deleting unhex's lowercase-hex arm, silently dropping %2f / %3d / %7e
+//   - narrowing the accepted decode range by one (> 0x7E -> > 0x7D)
+func TestPercentEscapeValidation(t *testing.T) {
+	// Lowercase AND uppercase hex must both decode (the deleted-arm mutant).
+	for _, in := range []string{
+		"/api/x%2fy", "/api/x%2Fy",
+		"/api/x%3dy", "/api/x%3Dy",
+		"/api/x%7ey", "/api/x%7Ey",
+		"/api/x%5by%5dz", "/api/x%5By%5Dz",
+	} {
+		assert.Equal(t, in, cleanConcatPath(in), "both hex cases must decode: %q", in)
+	}
+
+	// Boundary decodes: 0x20 (space) and 0x7E (~) are the inclusive edges, so the
+	// off-by-one mutants on either bound are caught.
+	assert.Equal(t, "/api/x%20y", cleanConcatPath("/api/x%20y"), "%20 (0x20) is the lower bound and must be accepted")
+	assert.Equal(t, "/api/x%7Ey", cleanConcatPath("/api/x%7Ey"), "%7E (0x7E) is the upper bound and must be accepted")
+	assert.Empty(t, cleanConcatPath("/api/x%1Fy"), "%1F (0x1F) is below the lower bound")
+	assert.Empty(t, cleanConcatPath("/api/x%7Fy"), "%7F (0x7F) is above the upper bound")
+
+	// The byte immediately AFTER an escape must still be validated — this is the
+	// `i += 3` mutant, which skipped exactly one byte of checking.
+	assert.Empty(t, cleanConcatPath("/api/x%20\x01y"), "control byte directly after an escape must be rejected")
+	assert.Empty(t, cleanConcatPath("/api/x%20\x7Fy"), "DEL directly after an escape must be rejected")
+	assert.Empty(t, cleanConcatPath("/api/x%20\xE2\x80\xAEy"), "non-ASCII directly after an escape must be rejected")
+
+	// Two adjacent escapes: the index must land on the second '%', not past it.
+	assert.Empty(t, cleanConcatPath("/api/x%20%00y"), "a bad escape immediately following a good one must be rejected")
+	assert.Equal(t, "/api/x%20%21y", cleanConcatPath("/api/x%20%21y"), "two adjacent valid escapes must both be accepted")
+}
+
+// TestIsPrintableASCIIURL pins the exported byte policy that specSafeURL applies
+// to every jsstatic producer (SEC-BE-002).
+func TestIsPrintableASCIIURL(t *testing.T) {
+	ok := []string{
+		"/api/users",
+		"https://example.com/api/users/{userId}",
+		"/api/items?filter[status]=open&q=a|b",
+		"/api/x%20y",
+		"/api/x%2Fy",
+		// TEST-007: printable ASCII but OUTSIDE isAllowedConcatByte's
+		// allow-list (backslash isn't a structural/sub-delim byte that
+		// function admits). Documents the asymmetry this function's doc
+		// comment claims: IsPrintableASCIIURL gates literal bytes with a
+		// direct 0x21-0x7E range check, NOT isAllowedConcatByte, so a byte
+		// isAllowedConcatByte would reject must still be accepted here.
+		// Without this fixture, swapping the 0x21-0x7E predicate for
+		// isAllowedConcatByte survives every existing fixture undetected.
+		`/api/x\y`,
+	}
+	for _, in := range ok {
+		assert.True(t, IsPrintableASCIIURL(in), "must be accepted: %q", in)
+	}
+
+	bad := []string{
+		"/api/v1/\u202enimda",             // raw bidi override
+		"/api/us\u0435rs",                 // Cyrillic homoglyph
+		"/api/x\ufe0fy",                   // variation selector
+		"/api/x y",                        // literal space
+		"/api/x\x00y",                     // NUL
+		"/api/x\ty",                       // tab
+		"/api/x%E2%80%AEy",                // percent-encoded bidi override
+		"/api/x%00y",                      // percent-encoded NUL
+		"/api/x%",                         // truncated escape
+		"/api/x%ZZ",                       // non-hex escape
+		"https://\u202eexample.com/api/x", // bidi in the HOST (spec servers entry)
+	}
+	for _, in := range bad {
+		assert.False(t, IsPrintableASCIIURL(in), "must be rejected: %q", in)
+	}
+}
+
+// TestIsPrintableASCIIURL_SharedScanIndexAdvance pins scanEscapedBytes' shared
+// index-skip behavior (the `i += 2` after a decoded percent-escape) through
+// the IsPrintableASCIIURL caller specifically. TestPercentEscapeValidation
+// exercises the same shared loop only via cleanConcatPath/allowedConcatBytes;
+// mutating scanEscapedBytes' `i += 2` to `i += 3` (skipping one byte too many,
+// so the byte immediately after an escape is never validated) left
+// TestIsPrintableASCIIURL green, because none of its fixtures place a
+// rejectable byte directly after a valid escape.
+func TestIsPrintableASCIIURL_SharedScanIndexAdvance(t *testing.T) {
+	assert.True(t, IsPrintableASCIIURL("/api/x%20y"), "a lone valid escape must still be accepted")
+	assert.False(t, IsPrintableASCIIURL("/api/x%20\x01y"), "a control byte directly after a valid escape must be rejected")
+	assert.False(t, IsPrintableASCIIURL("/api/x%20\x7Fy"), "DEL directly after a valid escape must be rejected")
+	assert.False(t, IsPrintableASCIIURL("/api/x%20%00y"), "a bad escape immediately following a good one must be rejected")
+	assert.True(t, IsPrintableASCIIURL("/api/x%20%21y"), "two adjacent valid escapes must both be accepted")
 }

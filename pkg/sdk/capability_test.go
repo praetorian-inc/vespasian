@@ -15,8 +15,18 @@
 package sdk
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 
 	"time"
@@ -455,6 +465,201 @@ func TestInvoke_ScanMode_InvalidScopeReturnsError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// 6b. SEC-BE-002: probe-coverage telemetry
+// ---------------------------------------------------------------------------
+
+// TestSlogWriter_PipelineResolveAndGenerateSurfacesSkipAsSlogRecord tests
+// internal/pipeline's Warnings plumbing: given a pipeline.ScanOptions whose
+// Warnings field is a slogWriter, a probe-coverage decision made by the
+// SEC-BE-001 cross-origin gate must surface as a slog record. This drives the
+// real pipeline.ResolveAndGenerate (not the stubbed generateFunc seam) with a
+// hand-built ScanOptions literal shaped like runScan's -- TargetURL pinned to
+// the app's own origin, Warnings set to slogWriter -- against a two-origin
+// capture, so the cross-origin candidate is genuinely skipped by the gate.
+//
+// NOTE: this test builds its OWN pipeline.ScanOptions literal rather than
+// driving runScan/Invoke, so it proves internal/pipeline writes to whatever
+// Warnings the caller passes -- never in doubt -- but says nothing about
+// whether capability.go's runScan actually constructs its ScanOptions with
+// Warnings set to a slogWriter. TestRunScan_SetsScanOptionsWarningsToSlogWriter
+// below is the regression guard for that wiring.
+func TestSlogWriter_PipelineResolveAndGenerateSurfacesSkipAsSlogRecord(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1}`))
+	}))
+	t.Cleanup(api.Close)
+	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1}`))
+	}))
+	t.Cleanup(attacker.Close)
+
+	jsonAPIRequest := func(rawURL string) crawl.ObservedRequest {
+		return crawl.ObservedRequest{
+			Method:  "GET",
+			URL:     rawURL,
+			Headers: map[string]string{"Content-Type": "application/json"},
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Headers:     map[string]string{"Content-Type": "application/json"},
+				Body:        []byte(`{"id":1}`),
+			},
+		}
+	}
+	requests := []crawl.ObservedRequest{
+		jsonAPIRequest(api.URL + "/api/v1/users"),
+		jsonAPIRequest(attacker.URL + "/api/v1/collect"),
+	}
+
+	var logBuf bytes.Buffer
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+
+	// Mirrors runScan's ScanOptions literal in capability.go exactly, in
+	// particular Warnings: slogWriter{...} and AllowPrivate: false (the SDK
+	// never sets AllowPrivate true).
+	_, _, _, _, err := pipeline.ResolveAndGenerate(context.Background(), requests, pipeline.ScanOptions{
+		TargetURL:    api.URL,
+		APIType:      pipeline.APITypeREST,
+		Confidence:   0.5,
+		Probe:        true,
+		Deduplicate:  true,
+		AllowPrivate: false,
+		Warnings:     slogWriter{target: api.URL},
+	})
+	require.NoError(t, err)
+
+	assert.Contains(t, logBuf.String(), "probe coverage warning",
+		"a candidate skipped by the SEC-BE-001 cross-origin gate must surface at least one slog record (SEC-BE-002)")
+}
+
+// TestRunScan_SetsScanOptionsWarningsToSlogWriter is the regression guard for
+// capability.go's runScan wiring (TEST-002 review finding):
+// TestSlogWriter_PipelineResolveAndGenerateSurfacesSkipAsSlogRecord above
+// proves internal/pipeline honors whatever Warnings a caller passes, but
+// never drives runScan/Invoke itself, so it cannot catch runScan failing to
+// set Warnings at all -- reverting capability.go's
+// `Warnings: slogWriter{...}` to `Warnings: nil` left that test (and the
+// entire suite) green. This test swaps generateFunc (the package-level seam
+// already used by stubGenerate above) for a recorder that captures the
+// pipeline.ScanOptions runScan actually builds, drives Invoke in scan mode,
+// and asserts the captured Warnings is a slogWriter targeting the input's
+// PrimaryURL.
+func TestRunScan_SetsScanOptionsWarningsToSlogWriter(t *testing.T) {
+	var captured pipeline.ScanOptions
+	orig := generateFunc
+	generateFunc = func(_ context.Context, _ []crawl.ObservedRequest, opts pipeline.ScanOptions) ([]byte, string, bool, []crawl.ObservedRequest, error) {
+		captured = opts
+		return []byte(`openapi: "3.0"`), pipeline.APITypeREST, false, nil, nil
+	}
+	t.Cleanup(func() { generateFunc = orig })
+
+	stubCrawl(t, []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://x.com/api/v1/users",
+			Source: crawl.SourceStaticJS, // idempotency guard: skip jsstatic.Analyze
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Body:        []byte(`[{"id":1}]`),
+			},
+		},
+	}, nil)
+
+	c := &Capability{}
+	ctx := ctxWithParams("mode", "scan", "api_type", "rest", "probe", "false")
+	_, _, err := collect(t, c, ctx, seedApp("https://x.com"))
+	require.NoError(t, err)
+
+	require.NotNil(t, captured.Warnings, "runScan must set ScanOptions.Warnings, not leave it nil")
+	sw, ok := captured.Warnings.(slogWriter)
+	require.True(t, ok, "runScan must set ScanOptions.Warnings to a slogWriter, got %T", captured.Warnings)
+	assert.Equal(t, "https://x.com", sw.target, "the slogWriter must target the input's PrimaryURL")
+}
+
+// TestRunScan_SlogWriterTargetRedactsUserinfo pins the SEC-BE-005 redaction
+// (LAB-4992 review). slogWriter tags every warning it emits with its target
+// via slog.Warn, and PrimaryURL is operator-supplied with nothing upstream
+// stripping userinfo -- Match only parses and checks the scheme -- so a
+// credentialed target would otherwise be written to the SDK host's log sink
+// on every probe-coverage warning.
+//
+// The sibling test above cannot catch a revert: its PrimaryURL carries no
+// credentials, so `sw.target` equals the raw input either way. This one uses a
+// credentialed URL and asserts the exact redacted form, so deleting the
+// crawl.RedactURL wrap in capability.go fails here rather than silently
+// shipping the credential (SEC-BE-004/TEST-002 review finding).
+func TestRunScan_SlogWriterTargetRedactsUserinfo(t *testing.T) {
+	// NOTE for alert triage: titus flags the synthetic `svc-account:secretpass`
+	// below. The credential IS the subject under test -- this test exists to
+	// prove it never reaches slogWriter.target -- and x.example is a reserved
+	// domain that is never dialed (crawl is stubbed). Same class as alerts
+	// 97-115 and 119; retained deliberately.
+	// Written as one literal rather than concatenated parts on purpose:
+	// splitting it to slip past the scanner would hide the fixture from
+	// readers while defeating a control the repository relies on, so the
+	// suppression is explicit and carries its reason instead.
+	const primary = "https://svc-account:secretpass@x.example/" //nolint:gosec // G101: synthetic fixture; the credential is the subject under test (see NOTE above)
+
+	// Capture slog rather than letting it reach stderr. Invoke passes through
+	// the PRE-EXISTING "vespasian scan completed" Info, which still logs
+	// PrimaryURL raw, so without this the run prints this test's own synthetic
+	// credential into the terminal and CI logs (SEC-BE-002 review finding).
+	//
+	// This silences the TEST only. It does NOT close the deferred production
+	// issue -- the three raw sinks enumerated in capability.go's NOTE are
+	// still there, and the assertion below deliberately proves the redaction
+	// on the one sink this PR does own. Do not read a quiet test as evidence
+	// that the deferred ticket is done.
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+
+	var captured pipeline.ScanOptions
+	orig := generateFunc
+	generateFunc = func(_ context.Context, _ []crawl.ObservedRequest, opts pipeline.ScanOptions) ([]byte, string, bool, []crawl.ObservedRequest, error) {
+		captured = opts
+		return []byte(`openapi: "3.0"`), pipeline.APITypeREST, false, nil, nil
+	}
+	t.Cleanup(func() { generateFunc = orig })
+
+	stubCrawl(t, []crawl.ObservedRequest{
+		{
+			Method: "GET",
+			URL:    "https://x.example/api/v1/users",
+			Source: crawl.SourceStaticJS, // idempotency guard: skip jsstatic.Analyze
+			Response: crawl.ObservedResponse{
+				StatusCode:  200,
+				ContentType: "application/json",
+				Body:        []byte(`[{"id":1}]`),
+			},
+		},
+	}, nil)
+
+	c := &Capability{}
+	ctx := ctxWithParams("mode", "scan", "api_type", "rest", "probe", "false")
+	_, _, err := collect(t, c, ctx, seedApp(primary))
+	require.NoError(t, err)
+
+	sw, ok := captured.Warnings.(slogWriter)
+	require.True(t, ok, "runScan must set ScanOptions.Warnings to a slogWriter, got %T", captured.Warnings)
+	assert.NotContains(t, sw.target, "secretpass",
+		"the slogWriter target must not carry the PrimaryURL password into the host's log sink")
+	assert.NotContains(t, sw.target, "svc-account",
+		"the slogWriter target must not carry the PrimaryURL username either")
+	// Exact form, not just absence: this also pins that the host survives
+	// redaction, so a future change that replaced the value with a bare
+	// placeholder would be caught rather than silently passing the
+	// NotContains assertions above.
+	assert.Equal(t, "https://x.example/", sw.target,
+		"the slogWriter target must be the crawl.RedactURL form of PrimaryURL")
+}
+
+// ---------------------------------------------------------------------------
 // 7. Parameters declaration
 // ---------------------------------------------------------------------------
 
@@ -466,8 +671,8 @@ func TestCapability_Parameters(t *testing.T) {
 	c := &Capability{}
 	params := c.Parameters()
 
-	// Exactly 11 declared parameters.
-	require.Len(t, params, 11)
+	// Exactly 13 declared parameters.
+	require.Len(t, params, 13)
 
 	// Build a name -> Parameter map for convenient field assertions.
 	byName := make(map[string]capability.Parameter, len(params))
@@ -479,7 +684,7 @@ func TestCapability_Parameters(t *testing.T) {
 	for _, name := range []string{
 		"mode", "api_type", "timeout", "max_pages", "depth",
 		"scope", "headers", "confidence", "probe",
-		"merge_slugs", "slug_threshold",
+		"merge_slugs", "slug_threshold", "max_requests", "interact",
 	} {
 		assert.Contains(t, byName, name, "missing parameter %q", name)
 	}
@@ -492,6 +697,8 @@ func TestCapability_Parameters(t *testing.T) {
 	assert.Equal(t, "true", byName["probe"].Default)
 	assert.Equal(t, "false", byName["merge_slugs"].Default)
 	assert.Equal(t, "2", byName["slug_threshold"].Default)
+	assert.Equal(t, "0", byName["max_requests"].Default)
+	assert.Equal(t, "false", byName["interact"].Default)
 
 	// WithOptions enum sets for the parameters that have them.
 	assert.ElementsMatch(t, []string{"scan", "crawl"}, byName["mode"].Options)
@@ -501,7 +708,7 @@ func TestCapability_Parameters(t *testing.T) {
 
 // TestCapability_Metadata pins the trivial getter surface (Name, Description,
 // Input, Full, Timeout) that were at 0.0% coverage. Each is a single-statement
-// function; covering them here contributes to the 80% threshold.
+// function; covering them here contributes to the coverage threshold.
 func TestCapability_Metadata(t *testing.T) {
 	c := &Capability{}
 
@@ -702,4 +909,113 @@ func TestCrawlOptsFromCtx_InvalidHeaderReturnsError(t *testing.T) {
 	_, err := crawlOptsFromCtx(ctxWithParams("headers", "no-colon-here"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "vespasian:")
+}
+
+// TestCrawlOptsFromCtx_MaxRequestsAndInteract covers the two crawl options that
+// were unreachable from the Guard-facing surface: --max-requests and --interact are
+// both user-facing CLI flags, but crawlOptsFromCtx never read them, so a host had no
+// way to set either. (ResumeFrom/OnCheckpoint stay unwired on purpose — the host
+// owns checkpoint storage.)
+func TestCrawlOptsFromCtx_MaxRequestsAndInteract(t *testing.T) {
+	ctx := capability.ExecutionContext{Parameters: capability.Parameters{
+		capability.String("max_requests", "").WithDefault("25"),
+		capability.Bool("interact", "").WithDefault("true"),
+	}}
+	opts, err := crawlOptsFromCtx(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 25, opts.MaxRequests)
+	assert.True(t, opts.Interact)
+}
+
+// TestCrawlOptsFromCtx_MaxRequestsAndInteractDefaults pins the unset case: absent
+// parameters must leave both at their zero values (unlimited requests, no clicking),
+// so a host that does not opt in never gets interaction side effects.
+func TestCrawlOptsFromCtx_MaxRequestsAndInteractDefaults(t *testing.T) {
+	opts, err := crawlOptsFromCtx(ctxWithParams())
+	require.NoError(t, err)
+	assert.Equal(t, 0, opts.MaxRequests)
+	assert.False(t, opts.Interact)
+}
+
+// TestCapability_DeclaredParametersAreReadable pins the invariant the Codex
+// review of PR #189 caught a violation of: every crawl-shaping parameter this
+// capability READS from the ExecutionContext must also be DECLARED in
+// Parameters(). A parameter honored by crawlOptsFromCtx but absent from the
+// declaration is unreachable through the Guard-facing surface, so the feature
+// ships dark and only a hand-built context can exercise it.
+// The read set is DERIVED FROM SOURCE, not hand-listed. A literal slice annotated
+// "keep in sync" only covers keys someone remembered to add, which is the very
+// failure mode this test exists to catch: the next parameter read by crawlOptsFromCtx
+// without a matching entry would ship dark and the test would stay green. Parsing the
+// function's own ctx.Parameters.Get*("...") calls removes the sync burden entirely
+// (LAB-4678 review, TEST-010).
+func TestCapability_DeclaredParametersAreReadable(t *testing.T) {
+	declared := make(map[string]bool)
+	for _, p := range (&Capability{}).Parameters() {
+		declared[p.Name] = true
+	}
+
+	read := parametersReadFromSource(t)
+	require.NotEmpty(t, read,
+		"parsed zero parameter reads out of crawlOptsFromCtx; the extraction below has "+
+			"drifted from the code and this guard is no longer checking anything")
+
+	for _, name := range read {
+		assert.True(t, declared[name],
+			"crawlOptsFromCtx reads %q but Parameters() does not declare it, so no host can set it", name)
+	}
+}
+
+// parametersReadFromSource returns every parameter name crawlOptsFromCtx pulls off
+// the ExecutionContext, by parsing capability.go with go/ast and collecting the string
+// literal argument of each ctx.Parameters.Get* call inside that function.
+//
+// go/ast rather than a regexp so a name mentioned in a comment or an unrelated string
+// cannot be picked up, and so the extraction is scoped to the one function.
+func parametersReadFromSource(t *testing.T) []string {
+	t.Helper()
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "capability.go", nil, 0)
+	require.NoError(t, err, "parse capability.go")
+
+	var fn *ast.FuncDecl
+	for _, decl := range file.Decls {
+		if f, ok := decl.(*ast.FuncDecl); ok && f.Name.Name == "crawlOptsFromCtx" {
+			fn = f
+			break
+		}
+	}
+	require.NotNil(t, fn, "crawlOptsFromCtx not found in capability.go; update this guard")
+
+	seen := make(map[string]bool)
+	var names []string
+	ast.Inspect(fn, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) == 0 {
+			return true
+		}
+		// Match ctx.Parameters.GetString / GetInt / GetBool / ... — a selector whose
+		// method name starts with "Get" and whose receiver is a "Parameters" selector.
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || !strings.HasPrefix(sel.Sel.Name, "Get") {
+			return true
+		}
+		recv, ok := sel.X.(*ast.SelectorExpr)
+		if !ok || recv.Sel.Name != "Parameters" {
+			return true
+		}
+		lit, ok := call.Args[0].(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return true
+		}
+		name, err := strconv.Unquote(lit.Value)
+		if err != nil || seen[name] {
+			return true
+		}
+		seen[name] = true
+		names = append(names, name)
+		return true
+	})
+	return names
 }

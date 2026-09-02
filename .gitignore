@@ -11,7 +11,11 @@
 # Output of the go coverage tool
 *.out
 
-# Go workspace file
+# Go workspace file. Deliberately NOT committed: a workspace would put
+# test/proto-validate into the product's MVS build list, so the shipped binary's
+# dependency set could be moved by a bump to a live-test helper's manifest. The
+# module is reached by `cd`-ing into it instead (see AGENTS.md).
+go.work
 go.work.sum
 
 # Dependency directories
@@ -46,12 +50,21 @@ Thumbs.db
 test/.live-test-config
 test/.results/
 test/.*.pid
+test/.*.pids
+test/.*.log
 test/rest-api/rest-api
 test/soap-service/soap-service
 test/grpc-server/grpc-server
 test/concat-spa/concat-spa
 test/forms-target/forms-target
+# Unlike the entries above, no script builds this one: test/proto-validate's only
+# consumer is `go run`, which writes to the build cache. It is listed because
+# proto-validate is its own module, so `cd test/proto-validate && go build` is a
+# natural thing to do by hand — not because a build step produces it.
+test/proto-validate/proto-validate
 test/graphql-server/node_modules/
+test/spec-validators/node_modules/
 
-# go build artifact when run at repo root
+# go build artifacts when run at repo root
 /vespasian
+/proto-validate
