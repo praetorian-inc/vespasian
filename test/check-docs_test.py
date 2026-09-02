@@ -60,12 +60,17 @@ class ReferenceDefsAndUsagesTest(unittest.TestCase):
         self.assertEqual(defs, {"unreleased"})
         self.assertEqual(usages, set())
 
-    def test_definition_requires_whitespace_and_following_target(self):
-        # TEST-001: REF_DEF_RE needs "]:" then whitespace then a non-space target.
-        # A colon-adjacent token ("[label]:no-space") or an empty target
-        # ("[empty]:" at end of line) is NOT a reference definition.
-        defs, _ = self.defs_usages("[label]:no-space\n[empty]:\n")
-        self.assertEqual(defs, set())
+    def test_definition_colon_adjacent_target_and_empty_rejected(self):
+        # TEST-001: post-colon whitespace is OPTIONAL per CommonMark, so a
+        # colon-adjacent destination ("[release]:https://example.test") IS a
+        # definition and is collected, alongside the spaced form. A colon with
+        # no destination at all ("[empty]:" at end of line) is NOT a definition.
+        defs, _ = self.defs_usages(
+            "[release]:https://example.test\n"
+            "[spaced]: https://example.test\n"
+            "[empty]:\n"
+        )
+        self.assertEqual(defs, {"release", "spaced"})
 
     def test_checked_ordered_list_excluded(self):
         # TEST-002: an ordered-list checkbox ("1. [x]", "1) [X]") is a checkbox,

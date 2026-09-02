@@ -62,8 +62,11 @@ FENCE_RE = re.compile(r"^([ \t]*)(```|~~~)", re.MULTILINE)
 # heading is a shortcut reference that resolves through a "[1.0.0]: <url>"
 # definition at the foot of the file). LINK_RE sees neither half, so without a
 # dedicated check a deleted definition (heading renders as literal brackets) or
-# an orphaned definition passes silently.
-REF_DEF_RE = re.compile(r"^ {0,3}\[(?P<label>[^\]\n]+)\]:\s+\S", re.MULTILINE)
+# an orphaned definition passes silently. Whitespace after the colon is optional
+# per CommonMark ("[release]:https://..." is a valid definition), so match \s*;
+# the trailing \S still requires a non-empty destination, rejecting a bare
+# "[empty]:" with nothing after it.
+REF_DEF_RE = re.compile(r"^ {0,3}\[(?P<label>[^\]\n]+)\]:\s*\S", re.MULTILINE)
 # A bracket group. Labels do not nest. Reference-style images (`![label]`,
 # `![label][]`, `![text][label]`) resolve through the same definitions as
 # reference links, so they are counted as usages too; inline links/images
