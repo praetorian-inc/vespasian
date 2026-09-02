@@ -562,10 +562,13 @@ var sensitiveSubstrings = []string{
 }
 
 // isSensitiveName substring-matches sensitiveSubstrings, plus an exact "_token".
-// fieldValue blanks whatever matches, so it never reaches capture.json or a probe.
+// fieldValue blanks whatever matches, so the value never reaches the synthesized
+// request that becomes capture.json and the probe input;
+// TestExtractForms_SensitiveNonHiddenValueNotReplayed pins that.
 //
 // "nonce" and "state" are deliberately absent: they collide with ordinary
 // parameters, e.g. state=California in an address form.
+// TestParseForms_SensitiveFlagAllVariants pins the list in both directions.
 func isSensitiveName(name string) bool {
 	n := strings.ToLower(name)
 	if n == "_token" {
