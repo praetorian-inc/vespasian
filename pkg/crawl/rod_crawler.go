@@ -74,6 +74,11 @@ func (c *RodCrawler) crawlHeadless(ctx context.Context, targetURL string, maxPag
 	// Network.setExtraHTTPHeaders: extra headers do not survive server-side
 	// redirects — Spring Security's 302 to /login on WebGoat strips the JSESSIONID
 	// and breaks session auth (LAB-2222).
+	//
+	// The extract/parse/inject pipeline is pinned by
+	// TestApplyCookieHeader_CookiePresent_InjectsAndStripsHeader. This wiring —
+	// browserMgr.SetCookies as the injector, from the only production call site — is
+	// not: no test asserts it, so a swap here would go unnoticed.
 	extraHeaders, err := ApplyCookieHeader(c.opts.Headers, targetURL, browserMgr.SetCookies)
 	if err != nil {
 		return nil, err

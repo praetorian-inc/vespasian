@@ -102,7 +102,7 @@ func RedactURL(raw string) string { return redactSeedURL(raw) }
 type engineOptions struct {
 	Concurrency   int               // concurrent tabs (0 → DefaultConcurrency)
 	MaxPages      int               // max pages to visit (0 → unlimited)
-	MaxRequests   int               // max captured requests before stopping (0 → unlimited); a rate/politeness bound distinct from MaxPages
+	MaxRequests   int               // admission budget over captured requests (0 → unlimited); a page may overshoot it, see crawlBudget
 	MaxDepth      int               // max crawl depth
 	PageTimeout   time.Duration     // per-page navigation timeout (0 → 30s)
 	StableTimeout time.Duration     // DOM stability wait (0 → DefaultStableWait)
@@ -240,10 +240,11 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 	// everything they captured rather than being cut off mid-page. Which pages land
 	// inside the budget still varies run to run.
 	//
-	// MaxRequests is a second, independent budget: a politeness bound on total
-	// captured requests, distinct from the crawl-breadth MaxPages. Both are enforced
-	// by crawlBudget, which RESERVES an estimated request cost before a page starts —
-	// see that type for why counting after a page finishes is not a bound.
+	// MaxRequests is a second, independent budget over captured requests, distinct
+	// from the crawl-breadth MaxPages. It is ADMISSION control, not a cap on what
+	// reaches the target: crawlBudget reserves an estimated cost before a page starts
+	// and reconciles afterwards, so a page that fires more than the estimate
+	// overshoots. See that type.
 	budget := newCrawlBudget(e.opts.MaxPages, e.opts.MaxRequests)
 
 	var wg sync.WaitGroup
@@ -301,6 +302,12 @@ const initialRequestsPerPageEstimate = 8
 // Residual overshoot is bounded by how far a page exceeds the current mean, summed
 // over in-flight pages, rather than by concurrency. It cannot be zero without cutting
 // a page mid-capture, which is the partial-page truncation MaxPages avoids.
+//
+// Nothing caps one page's captured-request count, so that overshoot has no per-page
+// ceiling: with MaxRequests 10 and an 8-request estimate, a single admitted page that
+// fires 10,000 requests emits all of them. So this bounds how many pages are ADMITTED
+// against a request budget; it is not a guarantee about how many requests reach the
+// target. MaxPages is the hard ceiling.
 type crawlBudget struct {
 	mu          sync.Mutex
 	maxPages    int
@@ -512,8 +519,10 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 			continue
 		}
 
-		// Counting emitted requests, not just page loads, is what makes the budget a
-		// request-rate bound distinct from MaxPages.
+		// Charged after the fact: e.visit captured the whole page before this loop, so
+		// every request here has already been sent. Counting them is what separates
+		// MaxRequests from MaxPages, but it also means this page's overshoot is
+		// (emitted - reservation) and nothing at this point can prevent it.
 		emitted := 0
 		for _, req := range requests {
 			if ctx.Err() != nil {

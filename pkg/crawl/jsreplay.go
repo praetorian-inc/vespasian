@@ -701,7 +701,9 @@ func SanitizeForLog(s string) string {
 // warnDerivedOrigin names the origin replay will hit, and the credentials going
 // with it, when --target-url is unset. Never gated on Verbose: the operator did
 // not choose this origin, the capture did. targetOrigin goes through sanitizeForLog
-// for parity with this file's other URL logging. Interim; redesign is LAB-4998.
+// for parity with this file's other URL logging. Split out of ReplayJSExtracted so
+// both arms are testable without running a crawl (TestWarnDerivedOrigin covers the
+// with- and without-credentials arms and the sanitizer). Interim; redesign is LAB-4998.
 func warnDerivedOrigin(w io.Writer, targetOrigin string, hasHeaders bool) {
 	origin := sanitizeForLog(targetOrigin)
 	if hasHeaders {
