@@ -12,7 +12,10 @@ forms, and the exclusions) and check_reference_links end-to-end against a temp
 fixture tree, asserting the exact failure strings CI would surface.
 """
 
+import contextlib
 import importlib.util
+import io
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -56,6 +59,20 @@ class ReferenceDefsAndUsagesTest(unittest.TestCase):
         defs, usages = self.defs_usages("[unreleased]: https://example.test\n")
         self.assertEqual(defs, {"unreleased"})
         self.assertEqual(usages, set())
+
+    def test_definition_requires_whitespace_and_following_target(self):
+        # TEST-001: REF_DEF_RE needs "]:" then whitespace then a non-space target.
+        # A colon-adjacent token ("[label]:no-space") or an empty target
+        # ("[empty]:" at end of line) is NOT a reference definition.
+        defs, _ = self.defs_usages("[label]:no-space\n[empty]:\n")
+        self.assertEqual(defs, set())
+
+    def test_checked_ordered_list_excluded(self):
+        # TEST-002: an ordered-list checkbox ("1. [x]", "1) [X]") is a checkbox,
+        # not a reference usage of label "x" — consistent with bullet lists.
+        for text in ("1. [x] done\n", "1) [X] done\n"):
+            _, usages = self.defs_usages(text)
+            self.assertEqual(usages, set(), text)
 
     def test_shortcut_reference(self):
         _, usages = self.defs_usages("## [Unreleased]\n")
@@ -150,6 +167,69 @@ class CheckReferenceLinksTest(unittest.TestCase):
         body = "## [Unreleased]\n\n```\n[stale]: https://example.test/old\n```\n" \
                "[Unreleased]: https://example.test/c\n"
         self.assertEqual(self.run_check({"CHANGELOG.md": body}), [])
+
+    def test_unreadable_file_reported_and_others_continue(self):
+        # TEST-003: a file that cannot be decoded is reported, and the check does
+        # not abort — a later well-formed file is still processed.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "bad.md").write_bytes(b"\xff\xfe## [Unreleased]\n")
+            (root / "CHANGELOG.md").write_text(
+                "## [1.0.0]\n\n[1.0.0]: https://example.test/c\n## [Unreleased]\n",
+                encoding="utf-8",
+            )
+            failures = []
+            cd.check_reference_links(
+                root, [Path("bad.md"), Path("CHANGELOG.md")], failures, verbose=False
+            )
+        self.assertEqual(len(failures), 2, failures)
+        self.assertTrue(
+            failures[0].startswith("reference-links: cannot read bad.md: "), failures
+        )
+        self.assertIn(
+            "reference-links: CHANGELOG.md uses reference-style link [unreleased] "
+            "with no matching [unreleased]: definition",
+            failures,
+        )
+
+
+class MainDispatchTest(unittest.TestCase):
+    """TEST-004: main()/CHECKS wiring for the reference-links check."""
+
+    def test_reference_links_registered_in_default_selection(self):
+        self.assertIn("reference-links", sorted(cd.CHECKS))
+
+    def test_main_dispatches_reference_links_with_files(self):
+        # Drive main() through the ("links", "reference-links") dispatch branch:
+        # a seeded reference-link mismatch must surface on stderr and set a
+        # non-zero exit code, proving check_reference_links is invoked with the
+        # (root, files, ...) signature and the tracked file list is forwarded.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "CHANGELOG.md").write_text(
+                "## [1.0.0]\n\n[unreleased]: https://example.test/c\n",
+                encoding="utf-8",
+            )
+            orig_repo_root = cd.repo_root
+            orig_tracked = cd.tracked_markdown
+            orig_argv = sys.argv
+            cd.repo_root = lambda: root
+            cd.tracked_markdown = lambda _root: [Path("CHANGELOG.md")]
+            sys.argv = ["check-docs.py", "--only", "reference-links"]
+            try:
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    rc = cd.main()
+            finally:
+                cd.repo_root = orig_repo_root
+                cd.tracked_markdown = orig_tracked
+                sys.argv = orig_argv
+        self.assertEqual(rc, 1)
+        self.assertIn(
+            "reference-links: CHANGELOG.md uses reference-style link [1.0.0] "
+            "with no matching [1.0.0]: definition",
+            stderr.getvalue(),
+        )
 
 
 if __name__ == "__main__":

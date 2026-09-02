@@ -374,7 +374,7 @@ Review is driven by [`CODEOWNERS`](CODEOWNERS); a maintainer review is required 
 Two CI workflows gate a PR:
 
 - **CI** — build, test, lint, and format check. Runs only when a PR touches Go sources, `go.mod`, `go.sum`, `.golangci*`, or the `Makefile`, so docs-only PRs intentionally show no CI run.
-- **Live Tests** — the end-to-end suite, on every PR. It also carries the checks that must run regardless of what a PR touches, including **docs-check** (`test/check-docs.py`): required docs present, every relative link and heading anchor resolving, and the `CODEOWNERS` roster matching `GOVERNANCE.md`. Run it locally with `make check-docs`; `make check` includes it.
+- **Live Tests** — the end-to-end suite, on every PR. It also carries the checks that must run regardless of what a PR touches, including **docs-check** (`test/check-docs.py`): required docs present, every relative link and heading anchor resolving, reference-style link definitions resolving, and the `CODEOWNERS` roster matching `GOVERNANCE.md`. Run it locally with `make check-docs`; `make check` includes it.
 
 ### PR checklist
 

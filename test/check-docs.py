@@ -69,9 +69,10 @@ REF_DEF_RE = re.compile(r"^ {0,3}\[(?P<label>[^\]\n]+)\]:\s+\S", re.MULTILINE)
 # reference links, so they are counted as usages too; inline links/images
 # (`[text](url)`, `![alt](url)`) are excluded downstream by the following "(".
 BRACKET_RE = re.compile(r"\[(?P<inner>[^\[\]]*)\]")
-# A GitHub task-list checkbox at a list-item start: "- [ ]", "* [x]", "+ [X]".
-# The bracket prefix is the bullet up to the checkbox.
-TASK_ITEM_RE = re.compile(r"^\s*[-*+]\s+$")
+# A GitHub task-list checkbox at a list-item start: "- [ ]", "* [x]", "+ [X]",
+# or the ordered-list form "1. [x]" / "1) [X]". The bracket prefix is the bullet
+# (bullet or numbered marker) up to the checkbox.
+TASK_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+$")
 # Inline code spans, so bracketed tokens inside them (`[role=button]`,
 # `map[string][]string`) are not read as reference links. The disjoint
 # `[\s\S]` (not `.|\n`) keeps the lazy repetition single-path, not ReDoS-shaped.
