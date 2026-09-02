@@ -1049,8 +1049,8 @@ jobs:
       # third-party egress executed as root, so dropping the monitoring here
       # would have left the arch we understand LEAST the one we watch least.
       #
-      # disable-sudo is NOT set here for the same reason as `devcontainer-image`
-      # (:803): `docker build` on a GitHub runner reaches the daemon through the
+      # disable-sudo is NOT set here for the same reason as `devcontainer-image`:
+      # `docker build` on a GitHub runner reaches the daemon through the
       # docker group, but the base image's own layers and the browser install run
       # as root inside the build sandbox, and pinning that down is what the build
       # is for.

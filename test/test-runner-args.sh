@@ -3616,9 +3616,7 @@ if [[ "$ac3_b_noegress" == 1 ]]; then
     pass "AC3 behaviour: a runner with NO egress at all fails the job rather than passing vacuously"
 else
     fail "test/assert-egress-enforced.sh does NOT fail when the allowlisted control host is also unreachable (stub: both exit 7) — got exit ${ac3_b_noegress}, expected 1. Without this the refusal above proves nothing: a total egress outage would read as a working policy."
-fi
-
-SUITE_COMPLETED=1
+    fi
 
 echo ""
 
