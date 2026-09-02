@@ -1220,7 +1220,7 @@ jobs:
     steps:
       # Egress allowlist derived from telemetry — see the ALLOWLIST PROVENANCE
       # block above jobs:. The widest of the five: Go plus npm plus the Actions
-      # cache plus upload-artifact. The six live targets are local servers on
+      # cache plus upload-artifact. The six services are local servers on
       # loopback ports and contribute nothing here — confirmed in the telemetry,
       # not assumed. Chrome's phone-home is deliberately absent, same as
       # integration-tests.
