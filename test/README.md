@@ -6,7 +6,7 @@ End-to-end live tests that spin up intentionally simple target applications, run
 
 ```bash
 # 0. One-time: install the OpenAPI/GraphQL spec validators
-(cd test/spec-validators && npm ci)
+(cd test/spec-validators && npm ci --ignore-scripts)
 
 # 1. Setup: build binaries, resolve ports, start services
 ./test/setup-live-targets.sh
@@ -23,11 +23,11 @@ End-to-end live tests that spin up intentionally simple target applications, run
 - **Go 1.27.0+** — [https://go.dev/dl/](https://go.dev/dl/)
 - **Chrome/Chromium** — Required for headless crawling (see below)
 - **python3** — Required for test validation scripts
-- **Node.js** — Required for the graphql-server target, and for the parser-backed spec validators in `test/spec-validators/` (LAB-3890 T1) that every OpenAPI and GraphQL target validates through. `setup-live-targets.sh` installs the graphql-server dependencies but **not** the validator dependencies — run `(cd test/spec-validators && npm ci)` once, or `validate_openapi_structure` fails with `spec-validators deps missing or incomplete`.
+- **Node.js** — Required for the graphql-server target, and for the parser-backed spec validators in `test/spec-validators/` (LAB-3890 T1) that the spec-producing targets validate through. `setup-live-targets.sh` installs the graphql-server dependencies but **not** the validator dependencies — run `(cd test/spec-validators && npm ci --ignore-scripts)` once, or `validate_openapi_structure` fails with `spec-validators deps missing or incomplete`.
 
 Optional, feature-gated at runtime:
 
-- **protoc** — compiles the `.proto` emitted by `grpc-server`. Absent, the compile check logs `protoc not installed — skipping .proto compile check (AC4)` and the target still reports PASS.
+- **protoc** (plus `protoc-gen-go` and `protoc-gen-go-grpc`) — only needed to regenerate `grpc-server/labpb/` via its `make proto` target. The AC4 compile check does **not** need it: it compiles the emitted `.proto` in-process (see "No `protoc` required." below), so a host without `protoc` still runs that assertion rather than skipping it.
 - **grpcurl** — used by the preflight reachability check for `grpc-server` (`grpcurl -plaintext <host>:<port> list`); probed with `command -v` and skipped when missing.
 
 ### Chrome in containers
@@ -162,7 +162,7 @@ launch, and skips cleanly when no browser is present at all.
 | soap-service | SOAP/WSDL | Custom SOAP service with GetUser, ListUsers, CreateUser | Go binary |
 | graphql-server | GraphQL | Apollo Server with queries, mutations, enums, unions, nested types | Node.js |
 | grpc-server | gRPC | Three reflectable gRPC services (UserService, OrderService, AccountService) | Go binary |
-| concat-spa | REST | SPA whose two API paths exist only as JS string concatenations in an external bundle, recoverable only by the JS-replay concat extractor (LAB-1368). Backs both the `concat-spa` and `concat-spa-two-stage` test targets | Go binary |
+| concat-spa | REST | SPA whose two API paths exist only as JS string concatenations in an external bundle, recoverable only by the concat extractor rather than by link-following (LAB-1368). Backs both the `concat-spa` and `concat-spa-two-stage` test targets | Go binary |
 | forms-target | REST (HTML forms) | Static HTML page whose POST/GET `<form>` endpoints are recovered by `analyze.ExtractForms` (LAB-2109) | Go binary |
 
 ## What the Test Runner Does
@@ -179,7 +179,7 @@ For each target:
 
 > **Why `--dangerous-allow-private`?** All live targets run on `localhost`, which the crawler's SSRF gate treats as a private host. The flag is required on every `vespasian crawl` invocation in this suite; running without it will exit non-zero with `seed URL rejected by frontier ...`. The flag name reflects production-risk semantics — pass it only when you intend to crawl a known-private host (e.g., this suite, or an internal-network assessment).
 
-Steps 3 and 5 describe the two-stage shape most targets use. `scan-rest`, `concat-spa`, and `no-download` deviate — see their sections below.
+Steps 3 and 5 describe the two-stage shape most targets use. `concat-spa` and `no-download` deviate — see their sections below. `scan-rest` deviates too, running single-stage `scan` in place of steps 3 and 5; the REST-counts note further down covers what that changes.
 
 For the GraphQL live test (`graphql-server`):
 
@@ -218,13 +218,13 @@ For the JS bundle static-analysis test (`generate-js-static`, offline — no ser
 
 For the concatenated-URL SPA tests (`concat-spa`, `concat-spa-two-stage`):
 
-Both drive the same `concat-spa` server, whose two API endpoints (`/api/users/{id}/orders`, `/api/products/{id}/reviews`) appear only as `String.prototype.concat` / `+`-string expressions with non-literal operands inside an external `app.js`. Neither full path is ever an `<a href>` or a plain string literal, so a passive browser crawl alone cannot reach them — only the JS-replay concat extractor (Strategy 5) reconstructs and probes them. Both targets share one fixture (`concat-spa/expected-paths.json`, `total_paths: 2`) and one validation battery (`validate_concat_spec`).
+Both drive the same `concat-spa` server, whose two API endpoints (`/api/users/{id}/orders`, `/api/products/{id}/reviews`) appear only as `String.prototype.concat` / `+`-string expressions with non-literal operands inside an external `app.js`. Neither full path is ever an `<a href>` or a plain string literal, so link-following alone cannot reach them: the concat extractor (Strategy 5) reconstructs them from the bundle text, and `scan` / `generate` additionally probe the reconstructions. Both targets share one fixture (`concat-spa/expected-paths.json`, `total_paths: 2`) and one validation battery (`validate_concat_spec`).
 
 1. **`concat-spa`** — single-stage `vespasian scan`, which runs crawl, JS-replay, and generate in one process. Writes `spec.yaml` only; no capture file is produced.
-2. **`concat-spa-two-stage`** — `vespasian crawl` followed by `vespasian generate rest`. The crawl stays passive and captures only the index page referencing `app.js`; `generate`'s own post-crawl JS-replay step (`crawl.ReplayJSExtracted`, gated on `--probe && --analyze-js`, both default true) re-fetches the bundle from the capture's recorded origin and recovers the endpoints. This target exists to prove the two-stage workflow reaches parity with `scan` (LAB-3892).
+2. **`concat-spa-two-stage`** — `vespasian crawl` followed by `vespasian generate rest`. The crawl records the index page and `app.js`, and statically reconstructs both paths (`--analyze-js` defaults on); `generate`'s post-crawl JS-replay step (`crawl.ReplayJSExtracted`, gated on `--probe && --analyze-js`, both default true) re-fetches the bundle from the capture's recorded origin and probes those reconstructions, which is what drops the 404 control. This target exists to prove the two-stage workflow reaches parity with `scan` (LAB-3892).
 3. **Both assert** exactly `total_paths` (2) paths survive, and that three paths are absent: the bare receiver literals `/api/users` and `/api/products`, plus the `/api/missing/` subtree. The control path `/api/missing/0/gone` is referenced in `app.js` exactly like the two real ones (`fetch("/api/missing/".concat(x, "/gone"))`), so the extractor *does* reconstruct and probe it — it is dropped because the server answers it 404. Its absence is what proves the 404 filter still works; a regression that kept it would fail the exact-count assertion and `validate_paths_absent` together.
 
-Plain `vespasian crawl` on its own still recovers nothing here — JS-replay runs inside `scan` and `generate`, not `crawl`. Reproducing either target by hand needs one of those two commands.
+Plain `vespasian crawl` does reconstruct these paths statically — `--analyze-js` defaults on, so the concat extractor runs and the paths enter the capture tagged `static:js-concat`. What `crawl` alone does not do is probe them, so the `/api/missing/0/gone` control survives and the counts will not match the fixture. Reproducing either target by hand therefore needs `scan`, or `crawl` followed by `generate`.
 
 For the HTML form-extraction live test (`forms-target`):
 
@@ -809,7 +809,7 @@ the budget: `CHROME_PROBE_TIMEOUT=10 ./test/setup-live-targets.sh`.
 The Node validators in `test/spec-validators/` are not installed, or an interrupted `npm ci` left `node_modules` present but unusable. `setup-live-targets.sh` does not install them — do it directly:
 
 ```bash
-(cd test/spec-validators && npm ci)
+(cd test/spec-validators && npm ci --ignore-scripts)
 ```
 
 ### Crawl produces empty capture
@@ -833,7 +833,7 @@ The seed URL is a private host (`localhost`, `127.0.0.1`, RFC1918, or link-local
 
 ### `concat-spa` recovers no endpoints by hand
 
-`vespasian crawl` alone never runs JS-replay, so the concat-derived paths never enter the capture. Reproduce with `scan`, or with `crawl` followed by `generate` (whose own JS-replay step recovers them):
+`vespasian crawl` alone does not run JS-replay, so the concat-derived paths enter the capture unprobed and the 404 control is never filtered out. Reproduce with `scan`, or with `crawl` followed by `generate` (whose JS-replay step probes them):
 
 ```bash
 ./bin/vespasian scan http://localhost:8993 --api-type rest \
