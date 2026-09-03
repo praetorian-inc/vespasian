@@ -179,7 +179,7 @@ For each target:
 
 > **Why `--dangerous-allow-private`?** All live targets run on `localhost`, which the crawler's SSRF gate treats as a private host. The flag is required on every `vespasian crawl` invocation in this suite; running without it will exit non-zero with `seed URL rejected by frontier ...`. The flag name reflects production-risk semantics — pass it only when you intend to crawl a known-private host (e.g., this suite, or an internal-network assessment).
 
-Steps 3 and 5 describe the two-stage shape most targets use. `concat-spa` and `no-download` deviate — see their sections below. `scan-rest` deviates too, running single-stage `scan` in place of steps 3 and 5; the REST-counts note further down covers what that changes.
+Steps 3 and 5 describe the two-stage shape most targets use. `concat-spa` and `no-download` deviate — see their sections below. `scan-rest` deviates too, running single-stage `scan` in place of steps 3 and 5, and `soap-service` generates its WSDL from a synthetic capture the runner builds rather than from the crawl capture. The REST-counts note further down covers what `scan-rest` changes.
 
 For the GraphQL live test (`graphql-server`):
 
@@ -221,7 +221,7 @@ For the concatenated-URL SPA tests (`concat-spa`, `concat-spa-two-stage`):
 Both drive the same `concat-spa` server, whose two API endpoints (`/api/users/{id}/orders`, `/api/products/{id}/reviews`) appear only as `String.prototype.concat` / `+`-string expressions with non-literal operands inside an external `app.js`. Neither full path is ever an `<a href>` or a plain string literal, so link-following alone cannot reach them: the concat extractor (Strategy 5) reconstructs them from the bundle text, and `scan` / `generate` additionally probe the reconstructions. Both targets share one fixture (`concat-spa/expected-paths.json`, `total_paths: 2`) and one validation battery (`validate_concat_spec`).
 
 1. **`concat-spa`** — single-stage `vespasian scan`, which runs crawl, JS-replay, and generate in one process. Writes `spec.yaml` only; no capture file is produced.
-2. **`concat-spa-two-stage`** — `vespasian crawl` followed by `vespasian generate rest`. The crawl records the index page and `app.js`, and statically reconstructs both paths (`--analyze-js` defaults on); `generate`'s post-crawl JS-replay step (`crawl.ReplayJSExtracted`, gated on `--probe && --analyze-js`, both default true) re-fetches the bundle from the capture's recorded origin and probes those reconstructions, which is what drops the 404 control. This target exists to prove the two-stage workflow reaches parity with `scan` (LAB-3892).
+2. **`concat-spa-two-stage`** — `vespasian crawl` followed by `vespasian generate rest`. The crawl records the index page and `app.js`, and statically reconstructs all three concat paths, the two real endpoints plus the `/api/missing/` control (`--analyze-js` defaults on); `generate`'s post-crawl JS-replay step (`crawl.ReplayJSExtracted`, gated on `--probe && --analyze-js`, both default true) re-fetches the bundle from the capture's recorded origin and probes those reconstructions, which is what drops the 404 control. This target exists to prove the two-stage workflow reaches parity with `scan` (LAB-3892).
 3. **Both assert** exactly `total_paths` (2) paths survive, and that three paths are absent: the bare receiver literals `/api/users` and `/api/products`, plus the `/api/missing/` subtree. The control path `/api/missing/0/gone` is referenced in `app.js` exactly like the two real ones (`fetch("/api/missing/".concat(x, "/gone"))`), so the extractor *does* reconstruct and probe it — it is dropped because the server answers it 404. Its absence is what proves the 404 filter still works; a regression that kept it would fail the exact-count assertion and `validate_paths_absent` together.
 
 Plain `vespasian crawl` does reconstruct these paths statically — `--analyze-js` defaults on, so the concat extractor runs and the paths enter the capture tagged `static:js-concat`. What `crawl` alone does not do is probe them, so the `/api/missing/0/gone` control survives and the counts will not match the fixture. Reproducing either target by hand therefore needs `scan`, or `crawl` followed by `generate`.
@@ -513,8 +513,8 @@ Results are saved to `test/.results/` with one subdirectory per test:
 ├── concat-spa/
 │   └── spec.yaml           # Single-stage `scan`; 2 concat-derived paths, no capture file
 ├── concat-spa-two-stage/
-│   ├── capture.json        # Crawl output: index page, app.js, + 3 static:js-concat reconstructions (incl. the 404 control)
-│   └── spec.yaml           # Same 2 paths, recovered by generate's JS-replay
+│   ├── capture.json        # Crawl output: index page, app.js, link-followed fragments, and 3 static:js-concat reconstructions (incl. the 404 control)
+│   └── spec.yaml           # The 2 real paths; generate's JS-replay probes the reconstructions and drops the 404 control
 ├── forms-target/
 │   ├── capture-false.json  # net/http backend crawl
 │   ├── capture-true.json   # rod/Chrome backend crawl
@@ -831,7 +831,7 @@ The seed URL is a private host (`localhost`, `127.0.0.1`, RFC1918, or link-local
     -o /tmp/cap.json --depth 2 --max-pages 50
 ```
 
-### `concat-spa` recovers no endpoints by hand
+### `concat-spa` by hand keeps the 404 control path
 
 `vespasian crawl` alone does not run JS-replay, so the concat-derived paths enter the capture unprobed and the 404 control is never filtered out. Reproduce with `scan`, or with `crawl` followed by `generate` (whose JS-replay step probes them):
 
