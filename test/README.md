@@ -509,7 +509,8 @@ Results are saved to `test/.results/` with one subdirectory per test:
 │   └── spec.graphql        # Generated GraphQL SDL
 ├── grpc-server/
 │   ├── capture.json        # Synthetic capture seeding the reflection probe
-│   └── spec.proto          # Generated proto3 from server reflection
+│   ├── spec.proto          # Generated proto3 from server reflection
+│   └── proto-validate.err  # protocompile stderr; empty on success
 ├── concat-spa/
 │   └── spec.yaml           # Single-stage `scan`; 2 concat-derived paths, no capture file
 ├── concat-spa-two-stage/
@@ -587,7 +588,7 @@ Results are saved to `test/.results/` with one subdirectory per test:
 
 `ssrf-rejection` writes nothing and creates no directory — it asserts that `vespasian crawl` rejects `http://127.0.0.1:9` without `--dangerous-allow-private`, with output sent to `/dev/null` (LAB-3890 A4).
 
-Every `capture-true.json` and `capture-rod.json` above is a rod/Chrome capture. `rest-api`, `soap-service`, and `forms-target` crawl with both backends and skip the rod leg with a `[WARN]` when Chrome is unavailable or unlaunchable, so those files are absent on a machine without a usable Chrome. No target generates from a rod capture, so the targets still pass: `rest-api` and `forms-target` generate from the net/http capture, and `soap-service` generates from the synthetic `soap-capture.json` the runner builds instead.
+Every `capture-true.json` and `capture-rod.json` above is a rod/Chrome capture. `rest-api`, `soap-service`, and `forms-target` crawl with both backends and skip the rod leg with a `[WARN]` when Chrome is unavailable or unlaunchable, so those files are absent on a machine without a usable Chrome. None of those three generates from its rod capture, so those three still pass without Chrome: `rest-api` and `forms-target` generate from the net/http capture, and `soap-service` generates from the synthetic `soap-capture.json` the runner builds instead.
 
 ## Expected Results
 
