@@ -23,7 +23,7 @@ End-to-end live tests that spin up intentionally simple target applications, run
 - **Go 1.27.0+** — [https://go.dev/dl/](https://go.dev/dl/)
 - **Chrome/Chromium** — Required for headless crawling (see below)
 - **python3** — Required for test validation scripts
-- **Node.js** — Required for the graphql-server target, and for the parser-backed spec validators in `test/spec-validators/` (LAB-3890 T1) that the spec-producing targets validate through. `setup-live-targets.sh` installs the graphql-server dependencies but **not** the validator dependencies — run `(cd test/spec-validators && npm ci --ignore-scripts)` once, or `validate_openapi_structure` fails with `spec-validators deps missing or incomplete`.
+- **Node.js** — Required for the graphql-server target, and for the parser-backed spec validators in `test/spec-validators/` (LAB-3890 T1). `setup-live-targets.sh` installs the graphql-server dependencies but **not** the validator dependencies — run `(cd test/spec-validators && npm ci --ignore-scripts)` once, or `validate_openapi_structure` fails with `spec-validators deps missing or incomplete`.
 
 Optional, feature-gated at runtime:
 
@@ -513,7 +513,7 @@ Results are saved to `test/.results/` with one subdirectory per test:
 ├── concat-spa/
 │   └── spec.yaml           # Single-stage `scan`; 2 concat-derived paths, no capture file
 ├── concat-spa-two-stage/
-│   ├── capture.json        # Passive crawl (index page + app.js reference only)
+│   ├── capture.json        # Crawl output: index page, app.js, + 3 static:js-concat reconstructions (incl. the 404 control)
 │   └── spec.yaml           # Same 2 paths, recovered by generate's JS-replay
 ├── forms-target/
 │   ├── capture-false.json  # net/http backend crawl
@@ -587,7 +587,7 @@ Results are saved to `test/.results/` with one subdirectory per test:
 
 `ssrf-rejection` writes nothing and creates no directory — it asserts that `vespasian crawl` rejects `http://127.0.0.1:9` without `--dangerous-allow-private`, with output sent to `/dev/null` (LAB-3890 A4).
 
-Every `capture-true.json` and `capture-rod.json` above is a rod/Chrome capture. `rest-api`, `soap-service`, and `forms-target` crawl with both backends and skip the rod leg with a `[WARN]` when Chrome is unavailable or unlaunchable, so those files are absent on a machine without a usable Chrome. Spec generation always uses the net/http capture, so the targets still pass.
+Every `capture-true.json` and `capture-rod.json` above is a rod/Chrome capture. `rest-api`, `soap-service`, and `forms-target` crawl with both backends and skip the rod leg with a `[WARN]` when Chrome is unavailable or unlaunchable, so those files are absent on a machine without a usable Chrome. No target generates from a rod capture, so the targets still pass: `rest-api` and `forms-target` generate from the net/http capture, and `soap-service` generates from the synthetic `soap-capture.json` the runner builds instead.
 
 ## Expected Results
 
