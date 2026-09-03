@@ -17,6 +17,7 @@ Read the [Architecture](README.md#architecture) section of the README first. It 
 - [Testing](#testing)
 - [Code style](#code-style)
 - [Commit messages](#commit-messages)
+- [Changelog](#changelog)
 - [Pull requests](#pull-requests)
 - [Reporting issues](#reporting-issues)
 - [Security disclosures](#security-disclosures)
@@ -319,6 +320,46 @@ fix(generate): stop collapsing distinct routes sharing a path prefix
 test: add live coverage for HTML form extraction
 ```
 
+## Changelog
+
+Vespasian keeps a hand-maintained [`CHANGELOG.md`](CHANGELOG.md) at the repository
+root, in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
+following [Semantic Versioning](https://semver.org/spec/v2.0.0.html). It is the
+curated, human-readable history, and the canonical record of breaking changes.
+
+- **Update it in the same PR.** If your change affects user-facing behavior — a
+  new flag, a new API type, a changed default, or a bug fix a user would notice —
+  add a bullet under the `## [Unreleased]` heading, in the matching
+  `Added` / `Changed` / `Deprecated` / `Removed` / `Fixed` / `Security` group.
+  Purely internal changes (tests, CI, refactors, dependency bumps with no
+  behavior change) don't need an entry.
+- **Breaking changes are mandatory and go first.** Anything that invalidates an
+  existing `capture.json`, changes a persisted format, removes a flag, changes a
+  default in a way that alters output, or breaks an exported Go API in an
+  importable package (`pkg/...`, including the embeddable `pkg/sdk`) goes under
+  the `Breaking changes` subsection of `[Unreleased]`, with a one-line migration
+  note. A breaking change requires a major-version bump at release time.
+- **Releases are cut by a maintainer.** At release time the maintainer renames
+  `[Unreleased]` to the new version with a date and opens a fresh `[Unreleased]`.
+  Then update the link-reference definitions at the bottom of `CHANGELOG.md`, or
+  the new heading renders as literal bracketed text and the `[Unreleased]` diff
+  keeps showing already-released work:
+  - add `[<new>]: https://github.com/praetorian-inc/vespasian/compare/<prev>...v<new>`, and
+  - retarget `[Unreleased]:` to `.../compare/v<new>...HEAD`.
+
+  `make check-docs` flags a version heading with no matching definition, and a
+  definition nothing uses, so a forgotten or orphaned reference is caught; it
+  cannot tell whether a definition's URL points at the right compare range, so
+  verify that by eye.
+
+  Contributors do not assign version numbers.
+- **`CHANGELOG.md` and the GitHub Release notes are complementary.** goreleaser
+  generates per-release notes from conventional commits (see
+  [`.goreleaser.yml`](.goreleaser.yml)) — the commit log for the release, minus
+  `docs:`/`ci:`/`deps:` commits (per that file's `changelog.filters.exclude`).
+  `CHANGELOG.md` is the curated summary. Writing good conventional-commit messages
+  (see [Commit messages](#commit-messages)) keeps both useful.
+
 ## Pull requests
 
 1. **One logical change per PR.** If you're fixing a bug and adding a feature, split them.
@@ -333,7 +374,7 @@ Review is driven by [`CODEOWNERS`](CODEOWNERS); a maintainer review is required 
 Two CI workflows gate a PR:
 
 - **CI** — build, test, lint, and format check. Runs only when a PR touches Go sources, `go.mod`, `go.sum`, `.golangci*`, or the `Makefile`, so docs-only PRs intentionally show no CI run.
-- **Live Tests** — the end-to-end suite, on every PR. It also carries the checks that must run regardless of what a PR touches, including **docs-check** (`test/check-docs.py`): required docs present, every relative link and heading anchor resolving, and the `CODEOWNERS` roster matching `GOVERNANCE.md`. Run it locally with `make check-docs`; `make check` includes it.
+- **Live Tests** — the end-to-end suite, on every PR. It also carries the checks that must run regardless of what a PR touches, including **docs-check** (`test/check-docs.py`): required docs present, every relative link and heading anchor resolving, reference-style link definitions resolving, and the `CODEOWNERS` roster matching `GOVERNANCE.md`. Run it locally with `make check-docs`; `make check` includes it.
 
 ### PR checklist
 
@@ -343,6 +384,7 @@ Two CI workflows gate a PR:
 - [ ] Commit messages follow conventional commit format
 - [ ] Apache 2.0 license header on any new source file
 - [ ] `README.md` / `doc.go` updated if user-facing behavior or a public API changed
+- [ ] `CHANGELOG.md` updated under `[Unreleased]` if the change is user-facing
 
 ## Reporting issues
 

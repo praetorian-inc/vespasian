@@ -440,6 +440,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Test the docs checker
+        run: python3 test/check-docs_test.py
+
       - name: Check community-health docs
         run: python3 test/check-docs.py --verbose
 

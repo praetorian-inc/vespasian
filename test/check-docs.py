@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """Assert the repository's community-health docs are present, linked, and self-consistent.
 
-Three checks, each independently reportable:
+Four checks, each independently reportable:
 
-1. presence   — the community-health set exists at the repository root. LAB-5870 landed
-                after GOVERNANCE.md and SUPPORT.md were absent from `main` for a week
-                because two stacked PRs merged into feature branches that nothing merges
-                from again. Nothing in CI noticed.
-2. links      — every relative markdown link and heading anchor resolves. A cross-link
-                added alongside a new document is the other half of that failure: the
-                document can be present and the link to it still dead.
-3. roster     — the `*` owner line in CODEOWNERS matches the maintainer table in
-                GOVERNANCE.md. Both files assert they are kept in sync and each points at
-                the other, but CODEOWNERS is what actually drives review assignment, so a
-                one-sided edit misroutes reviews while both documents still read as
-                authoritative.
+1. presence        — the community-health set exists at the repository root. LAB-5870 landed
+                     after GOVERNANCE.md and SUPPORT.md were absent from `main` for a week
+                     because two stacked PRs merged into feature branches that nothing merges
+                     from again. Nothing in CI noticed.
+2. links           — every relative markdown link and heading anchor resolves. A cross-link
+                     added alongside a new document is the other half of that failure: the
+                     document can be present and the link to it still dead.
+3. reference-links — reference-style link definitions and their usages correspond. CHANGELOG.md
+                     is Keep a Changelog format, where each `## [x.y.z]` heading is a shortcut
+                     reference resolved by a `[x.y.z]: <url>` definition at the foot of the file.
+                     The inline-link check sees neither half, so a deleted definition (the
+                     heading renders as literal brackets) or an orphaned one would pass silently.
+4. roster          — the `*` owner line in CODEOWNERS matches the maintainer table in
+                     GOVERNANCE.md. Both files assert they are kept in sync and each points at
+                     the other, but CODEOWNERS is what actually drives review assignment, so a
+                     one-sided edit misroutes reviews while both documents still read as
+                     authoritative.
 
 Written in Python rather than shell deliberately: the link and slug logic needs real
 parsing, and the surrounding scripts are developed on macOS and run on Linux, where the
@@ -47,10 +52,34 @@ REQUIRED_ROOT_FILES = [
 SKIP_DIR_PARTS = {"node_modules", ".worktrees", "vendor", "dist", "bin"}
 
 # Inline markdown links and images: [text](target) / ![alt](target), optional "title".
-# Reference-style links carry no inline target and are deliberately not matched.
+# Reference-style usages ([label], [text][label], [label][]) are matched separately
+# by BRACKET_RE for the reference-links check, not here.
 LINK_RE = re.compile(r"!?\[(?P<text>[^\]]*)\]\((?P<target>[^)\s]+)(?:\s+\"[^\"]*\")?\)")
 HEADING_RE = re.compile(r"^(?P<hashes>#{1,6})\s+(?P<text>.+?)\s*$", re.MULTILINE)
 FENCE_RE = re.compile(r"^([ \t]*)(```|~~~)", re.MULTILINE)
+
+# Reference-style link plumbing (Keep a Changelog leans on it: a "## [1.0.0]"
+# heading is a shortcut reference that resolves through a "[1.0.0]: <url>"
+# definition at the foot of the file). LINK_RE sees neither half, so without a
+# dedicated check a deleted definition (heading renders as literal brackets) or
+# an orphaned definition passes silently. Whitespace after the colon is optional
+# per CommonMark ("[release]:https://..." is a valid definition), so match \s*;
+# the trailing \S still requires a non-empty destination, rejecting a bare
+# "[empty]:" with nothing after it.
+REF_DEF_RE = re.compile(r"^ {0,3}\[(?P<label>[^\]\n]+)\]:\s*\S", re.MULTILINE)
+# A bracket group. Labels do not nest. Reference-style images (`![label]`,
+# `![label][]`, `![text][label]`) resolve through the same definitions as
+# reference links, so they are counted as usages too; inline links/images
+# (`[text](url)`, `![alt](url)`) are excluded downstream by the following "(".
+BRACKET_RE = re.compile(r"\[(?P<inner>[^\[\]]*)\]")
+# A GitHub task-list checkbox at a list-item start: "- [ ]", "* [x]", "+ [X]",
+# or the ordered-list form "1. [x]" / "1) [X]". The bracket prefix is the bullet
+# (bullet or numbered marker) up to the checkbox.
+TASK_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+$")
+# Inline code spans, so bracketed tokens inside them (`[role=button]`,
+# `map[string][]string`) are not read as reference links. The disjoint
+# `[\s\S]` (not `.|\n`) keeps the lazy repetition single-path, not ReDoS-shaped.
+INLINE_CODE_RE = re.compile(r"(?P<ticks>`+)[\s\S]*?(?P=ticks)")
 
 
 def repo_root():
@@ -255,9 +284,85 @@ def check_roster(root, failures, verbose):
     )
 
 
+def strip_inline_code(text):
+    """Blank inline code spans, preserving newlines so line numbers stay accurate."""
+    return INLINE_CODE_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+
+
+def _norm_label(label):
+    """CommonMark reference-label matching: case-insensitive, whitespace-collapsed."""
+    return re.sub(r"\s+", " ", label).strip().lower()
+
+
+def reference_defs_and_usages(text):
+    """Return (defs, usages) of reference-link labels found in already-stripped text.
+
+    Definitions are `[label]: target` lines. Usages are shortcut (`[label]`),
+    collapsed (`[label][]`), and full (`[text][label]`) references, including
+    their image forms (`![label]`, ...). Inline links/images (`[text](url)`,
+    `![alt](url)`), definitions, empty brackets, GitHub task-list checkboxes
+    (`- [ ]` / `- [x]`), and footnotes (`[^ref]`) are excluded.
+    """
+    defs = {_norm_label(m.group("label")) for m in REF_DEF_RE.finditer(text)}
+    usages = set()
+    for m in BRACKET_RE.finditer(text):
+        nxt = text[m.end()] if m.end() < len(text) else ""
+        if nxt in ("(", ":"):
+            continue  # inline link/image, or reference definition
+        inner = m.group("inner")
+        if not inner.strip() or inner.startswith("^"):
+            continue  # empty / unchecked task-list marker / footnote
+        if inner in ("x", "X"):
+            # Checked task-list item ("- [x]"): a checkbox, not a reference.
+            line_start = text.rfind("\n", 0, m.start()) + 1
+            if TASK_ITEM_RE.match(text[line_start:m.start()]):
+                continue
+        if nxt == "[":
+            m2 = BRACKET_RE.match(text, m.end())
+            if m2 is not None:
+                usages.add(_norm_label(m2.group("inner").strip() or inner))
+                continue
+        usages.add(_norm_label(inner))
+    return defs, usages
+
+
+def check_reference_links(root, files, failures, verbose):
+    """Reference-style link definitions and usages must correspond, per file.
+
+    Scoped to files that actually define a reference link, so prose brackets in
+    definition-free documents cannot false-positive.
+    """
+    checked = 0
+    for rel in files:
+        path = root / rel
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            failures.append(f"reference-links: cannot read {rel}: {e}")
+            continue
+        text = strip_inline_code(strip_fenced_blocks(raw))
+        defs, usages = reference_defs_and_usages(text)
+        if not defs:
+            continue
+        checked += 1
+        for label in sorted(usages - defs):
+            failures.append(
+                f"reference-links: {rel} uses reference-style link [{label}] with no "
+                f"matching [{label}]: definition"
+            )
+        for label in sorted(defs - usages):
+            failures.append(
+                f"reference-links: {rel} defines reference-style link [{label}]: but "
+                f"nothing uses it"
+            )
+    if verbose:
+        print(f"  checked reference-style links in {checked} markdown file(s)")
+
+
 CHECKS = {
     "presence": check_presence,
     "links": check_links,
+    "reference-links": check_reference_links,
     "roster": check_roster,
 }
 
@@ -267,7 +372,7 @@ def main():
     ap.add_argument("--verbose", "-v", action="store_true", help="list what was checked")
     ap.add_argument(
         "--only", choices=sorted(CHECKS), action="append",
-        help="run only the named check (repeatable); default runs all three",
+        help="run only the named check (repeatable); default runs all four",
     )
     args = ap.parse_args()
 
@@ -279,7 +384,7 @@ def main():
     for name in selected:
         if args.verbose:
             print(f"{name}:")
-        if name == "links":
+        if name in ("links", "reference-links"):
             CHECKS[name](root, files, failures, args.verbose)
         else:
             CHECKS[name](root, failures, args.verbose)
