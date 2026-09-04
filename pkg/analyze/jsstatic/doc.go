@@ -13,26 +13,19 @@
 // limitations under the License.
 
 // Package jsstatic statically analyses JavaScript bundles to recover API
-// endpoints, methods, path parameters, and request-body field names.
+// endpoints, methods, path parameters and request-body field names. It runs
+// between capture and classify/generate, returning the input captures with
+// synthesized [crawl.ObservedRequest] entries appended.
 //
-// It is invoked between the capture stage (pkg/crawl, pkg/importer) and the
-// classify/generate stages (pkg/classify, pkg/generate). It returns the input
-// captures unchanged, with newly synthesized [crawl.ObservedRequest] entries
-// appended (Source = "static:js", "static:js-sourcemap", or
-// "static:js-concat").
+// It wraps BishopFox/jsluice's tree-sitter URL matchers with three extensions:
 //
-// The analyser is a thin wrapper over BishopFox/jsluice's tree-sitter URL
-// matchers, with three extensions over the upstream library:
+//   - "EXPR" placeholders in URL paths become OpenAPI {param}, using the original
+//     template-literal identifiers where recoverable.
 //
-//   - "EXPR" placeholders in URL paths are normalised to OpenAPI {param}
-//     form using the names of the original template-literal identifiers when
-//     they can be recovered.
-//
-//   - For fetch(url, {body: JSON.stringify({a, b})}) and axios.<m>(url, {a, b})
-//     calls, the names of the top-level keys of the object literal are
-//     captured as body parameter names. They are emitted as a synthesized
-//     JSON body ({"a": null, "b": null}) so the existing
-//     pkg/generate/rest.InferSchema produces an object schema downstream.
+//   - For fetch(url, {body: JSON.stringify({a, b})}) and axios.<m>(url, {a, b}), the
+//     top-level keys of the object literal are emitted as a synthetic JSON body
+//     ({"a": null, "b": null}) so pkg/generate/rest.InferSchema produces a real
+//     object schema.
 //
 //   - Paths built by JS string concatenation that jsluice's AST analysis
 //     cannot resolve — String.prototype.concat, "+"-operator chains, and
@@ -81,7 +74,7 @@
 //     Scheme="https", Host="" (a single slash after the scheme is not an
 //     authority marker), and without this check it produced a degenerate
 //     "https://" spec server entry that sorted before every real host and
-//     blanked info.title (LAB-4992 review). A hostile bundle literal cannot
+//     blanked info.title (LAB-4992). A hostile bundle literal cannot
 //     steer the offline candidate set — or the probe stage that later
 //     consumes it — at an attacker-chosen host, credential, or byte-spoofed
 //     path.
@@ -126,60 +119,51 @@
 // # Source tagging
 //
 // Each synthesized [crawl.ObservedRequest] carries one of Source = "static:js"
-// (AST-recovered literal), "static:js-sourcemap" (recovered from a .js.map
-// source), "static:js-concat" (a never-probed concat/+-chain/service-prefix
-// reconstruction — LAB-4992), "static:js-nextroute" (an App Router route
-// handler) or "static:js-nextpage" (an App Router page route).
-//
-// The OpenAPI generator maps these to the x-vespasian-source extension on each
-// operation ("static:js" -> "js-bundle", "static:js-sourcemap" ->
-// "js-sourcemap", "static:js-concat" -> "js-bundle-concat",
-// "static:js-nextroute" -> "js-nextroute", "static:js-nextpage" ->
-// "js-nextpage"). The last two do not occur in emitted output: pkg/classify
-// Rule 6a reports both chunk sources as not-an-API, so they never reach the
-// generator (see "Next.js App Router routes" above). They exist so the tag
-// vocabulary stays total. A group mixing distinct JS-static tags resolves to the
-// least-confident member present rather than to "dynamic", which is reserved for
-// a group holding a genuinely non-JS-static source. The distinct tags let
-// consumers weight speculative reconstructions and chunk-URL recoveries below
+// (AST-recovered literal), "static:js-sourcemap" (from a .js.map source),
+// "static:js-concat" (a never-probed concat/+-chain/service-prefix reconstruction,
+// LAB-4992), "static:js-nextroute" (an App Router route handler) or
+// "static:js-nextpage" (an App Router page route). The OpenAPI generator strips the
+// "static:" prefix for x-vespasian-source ("js-bundle", "js-sourcemap",
+// "js-bundle-concat", "js-nextroute", "js-nextpage"); the last two never appear in
+// emitted output because pkg/classify Rule 6a reports both chunk sources as
+// not-an-API at any --confidence (TestNextRoute_NeverAnOperationAtAnyThreshold),
+// and exist so the tag vocabulary stays total. A group mixing distinct
+// JS-static tags resolves to its least-confident member, not to "dynamic", which is
+// reserved for a group holding a genuinely non-JS-static source. The distinct tags
+// let consumers weight speculative reconstructions and chunk-URL recoveries below
 // directly-observed literals.
 //
 // # Confidence at generation
 //
-// A concat/literal candidate reaches the generated spec only after
-// classification. Fully offline it has no probed response, so it scores only the
-// REST classifier's path heuristic; RESTClassifier Rule 7 floors any JS-static
-// candidate whose path carries an API indicator to the default --confidence
-// threshold (0.5) so these offline candidates survive default-confidence
-// generation instead of being silently dropped.
+// Fully offline a candidate has no probed response, so it scores only the REST
+// classifier's path heuristic. RESTClassifier Rule 7 floors any JS-static candidate
+// whose path carries an API indicator to the default --confidence (0.5) so these
+// survive default-confidence generation instead of being dropped silently.
 //
-// A recovered Next.js route is deliberately exempt from that floor. Rule 6a runs
-// first and returns outright, because the chunk URL proves the path is served but
-// says nothing about which verbs the route exports, so a floored route would
-// enter the spec under a guessed verb. pkg/classify enforces the exemption with
-// two independent things and both are needed. Rule 6a reports isAPI=false, which
-// is what keeps the route out of the spec: it is the gate RunClassifiers applies
-// and NearMisses ignores, so it holds at every --confidence value. Rule 6a also
-// scores the route at NextRouteProvenanceConfidence, pinned to
-// classify.NearMissFloor, which is what keeps it VISIBLE under -v. Scoring alone
-// was not enough — --confidence is an operator flag, and at 0.1 the routes
-// classified and the generator emitted a guessed `get`. Scoring 0 is equally
-// wrong: it drops the route below the near-miss floor and it appears nowhere at
-// all, which is what happened to every route off the /api/ path allowlist,
-// /vaults/{vaultId} included.
+// A recovered Next.js route is deliberately exempt from that floor: the chunk URL
+// proves the path is served but says nothing about which verbs the route exports, so
+// a floored route would enter the spec under a guessed verb. pkg/classify needs both
+// halves of the exemption. Rule 6a returns isAPI=false, the gate RunClassifiers
+// applies and NearMisses ignores, so the route stays out of the spec at every
+// --confidence value. Rule 6a also scores it at NextRouteProvenanceConfidence,
+// pinned to classify.NearMissFloor, which is what keeps it VISIBLE under -v. Scoring
+// alone was not enough — at --confidence 0.1 the routes classified and the generator
+// emitted a guessed `get` — and scoring 0 drops the route below the near-miss floor
+// so it appears nowhere at all, which is what happened to every route off the /api/
+// path allowlist, /vaults/{vaultId} included.
 //
-// # Security and Operator Considerations
+// # Security
 //
-// When analyzing attacker-controlled JavaScript bundles (i.e., when the crawled
-// application serves malicious content), enabling --analyze-js carries a bounded
-// resource-exhaustion risk. The underlying jsluice/tree-sitter parser is not
-// context-aware: if it hangs on adversarial input, the per-bundle goroutine will
-// remain in-flight until jsluice returns (it cannot be canceled). Per-bundle and
-// per-source timeouts (PerBundleTimeout, default 5s) bound wait time per input,
-// but a bundle that causes the parser to deadlock will leak that goroutine for
-// the duration of the process. The worst-case number of leaked goroutines is
-// Concurrency × (1 + N) where N is the number of sourcesContent entries in
-// a recovered sourcemap. Operators analyzing untrusted bundles in long-running
-// processes should be aware of this residual risk; process isolation (running
-// vespasian per-target with a wall-clock timeout) is the recommended mitigation.
+// Against attacker-controlled bundles, --analyze-js carries a bounded
+// resource-exhaustion risk. jsluice/tree-sitter is not context-aware, so a
+// goroutine inside it cannot be canceled. PerBundleTimeout (default 5s) bounds
+// each input separately — the bundle and every sourcemap source — so one bundle
+// can hold a worker for (1+N) x PerBundleTimeout, and a bundle that deadlocks the
+// parser leaks its goroutine for the life of the process.
+//
+// Concurrency does not bound the leak: it caps how many extractions run at once,
+// while a worker that times out moves on, so leaks accumulate one per timed-out
+// extraction across the run — worst case one for every bundle plus every
+// sourcemap source. For long-running processes over untrusted input, process
+// isolation, vespasian per target under a wall-clock timeout, is the mitigation.
 package jsstatic

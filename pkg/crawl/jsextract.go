@@ -23,17 +23,14 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 )
 
-// jsExtractedURL represents an endpoint discovered by jsluice from JavaScript
-// source code. It carries richer metadata than a plain URL string.
+// jsExtractedURL is a jsluice endpoint with its metadata.
 type jsExtractedURL struct {
 	URL         string
 	Method      string
 	ContentType string
 }
 
-// extractURLsFromJS runs jsluice on JavaScript source code and returns
-// discovered URLs. It filters out obviously non-API URLs (data: URIs,
-// fragment-only refs, etc.).
+// extractURLsFromJS runs jsluice, dropping data: URIs and fragment-only refs.
 func extractURLsFromJS(source []byte) []jsExtractedURL {
 	if len(source) == 0 {
 		return nil
@@ -49,7 +46,6 @@ func extractURLsFromJS(source []byte) []jsExtractedURL {
 			continue
 		}
 
-		// Skip non-navigable URLs.
 		lower := strings.ToLower(raw)
 		if strings.HasPrefix(lower, "javascript:") ||
 			strings.HasPrefix(lower, "data:") ||
@@ -78,9 +74,8 @@ func extractURLsFromJS(source []byte) []jsExtractedURL {
 	return results
 }
 
-// extractURLsFromInlineScripts collects all inline <script> tag contents from
-// the current page DOM and runs jsluice on each. This captures endpoints
-// defined in inline JavaScript that aren't in external .js files.
+// extractURLsFromInlineScripts covers endpoints defined inline rather than in
+// external .js files.
 func extractURLsFromInlineScripts(page *rod.Page) []jsExtractedURL {
 	elements, err := page.Elements("script:not([src])")
 	if err != nil {
@@ -98,10 +93,8 @@ func extractURLsFromInlineScripts(page *rod.Page) []jsExtractedURL {
 	return results
 }
 
-// extractURLsFromResponses runs jsluice on captured JavaScript response bodies
-// from network interception. This discovers endpoints embedded in external JS
-// files that the browser downloaded but whose code paths weren't triggered
-// during the page visit.
+// extractURLsFromResponses covers endpoints in downloaded JS whose code paths the
+// page visit never triggered.
 func extractURLsFromResponses(captured []ObservedRequest) []jsExtractedURL {
 	var results []jsExtractedURL
 	for _, req := range captured {
@@ -117,22 +110,17 @@ func extractURLsFromResponses(captured []ObservedRequest) []jsExtractedURL {
 	return results
 }
 
-// isJavaScriptContentType returns true if the content type indicates JavaScript.
-//
-// It delegates to mediatype.IsJavaScript so pkg/classify's static-asset exclusion tests
-// the same bytes this package's retention exemption tests. Keeping a second copy here
-// is what let the scope filter admit a media type the classifier did not reject
-// (LAB-4678 review, REQ-005).
+// Delegates to mediatype.IsJavaScript so pkg/classify's static-asset exclusion and this
+// package's retention exemption test the same bytes; a second copy here let the scope
+// filter admit a media type the classifier did not reject (LAB-4678).
 func isJavaScriptContentType(ct string) bool {
 	return mediatype.IsJavaScript(ct)
 }
 
-// jsExtractedToLinks resolves jsluice-discovered URLs against a base URL and
-// returns them as plain URL strings suitable for pushing to the frontier.
-// URLs pointing at static assets or streaming transports (JS/CSS/images/
-// socket.io/...) are dropped — their content is already captured via network
-// interception and navigating to them wastes the page budget (and produces
-// nested "mangled" paths on SPA catch-all servers).
+// jsExtractedToLinks resolves against base for the frontier, dropping static
+// assets and streaming transports: they are not useful frontier targets, and
+// navigating wastes the page budget and nests paths on SPA catch-all servers. On
+// the headless path CDP interception has already captured their content.
 func jsExtractedToLinks(extracted []jsExtractedURL, baseURL string) []string {
 	seen := make(map[string]bool)
 	var links []string

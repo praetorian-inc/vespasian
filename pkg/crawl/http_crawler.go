@@ -132,14 +132,12 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 		if err := ValidateProxyAddr(c.opts.Proxy); err != nil {
 			return nil, err
 		}
-		// ValidateProxyAddr already parsed the address; re-parse for the URL.
 		proxyURL, err = url.Parse(c.opts.Proxy)
 		if err != nil {
 			return nil, fmt.Errorf("parse proxy address: %w", err)
 		}
 	}
 
-	// Early return if context is already canceled.
 	if ctx.Err() != nil {
 		if c.opts.Stderr != nil {
 			fmt.Fprint(c.opts.Stderr, interruptMessage) //nolint:errcheck // best-effort
@@ -147,31 +145,26 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 		return nil, ctx.Err()
 	}
 
-	// Apply the overall crawl timeout if configured.
 	if c.opts.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, c.opts.Timeout)
 		defer cancel()
 	}
 
-	// Set up scope checker (includes SSRF protection).
+	// scopeChecker includes the SSRF check.
 	scopeFn, err := scopeChecker(targetURL, c.opts.Scope, c.opts.AllowPrivate)
 	if err != nil {
 		return nil, fmt.Errorf("scope setup: %w", err)
 	}
 
-	// Set up the frontier in DFS (depth-first) mode.
 	frontier := newURLFrontier(c.opts.Depth, scopeFn)
 	frontier.SetDFS(true)
 
-	// Shared rate limiter at 150 rps.
+	// Shared, so 150 rps is the whole-crawl rate, not per worker.
 	limiter := rate.NewLimiter(rate.Limit(150), 150)
 
-	// HTTP client with redirect scope guard and bounded timeout.
-	// The per-page context (c.pageTimeout) already cancels hung fetches, but an
-	// explicit Client.Timeout provides defense-in-depth if the context is ever
-	// mis-wired on a future code path. Both use c.pageTimeout so they track the
-	// same source.
+	// The per-page context already cancels hung fetches; Client.Timeout is defense
+	// in depth if it is ever mis-wired. Both read c.pageTimeout.
 	client := newHTTPClient(scopeFn, c.opts.AllowPrivate, c.pageTimeout, proxyURL, c.opts.ProxyInsecure)
 
 	resumeCfg := c.opts.resume(targetURL)
@@ -223,13 +216,12 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 	return snapshot, nil
 }
 
-// restoreAndSeed applies any resume state to the frontier and then seeds it with
-// the target, returning an error only when there is genuinely nothing to crawl.
-// Resume must be restored BEFORE seeding so already-covered pages are not
-// re-crawled (LAB-4678 Phase 4). A resumed frontier has already seen the seed, so
-// Push returns 0 for it — that is expected, not a rejection, which is why the
-// failure condition also requires an empty queue. Split out of Crawl to keep it
-// under the cyclomatic complexity gate.
+// restoreAndSeed applies any resume state to the frontier and then seeds it with the
+// target. Resume must be restored BEFORE seeding so already-covered pages are not
+// re-crawled (LAB-4678). A resumed frontier has already seen the seed, so Push returns
+// 0 for it — expected, not a rejection, which is why the failure condition also
+// requires an empty queue. Split out of Crawl to stay under the cyclomatic complexity
+// gate.
 func (c *HTTPCrawler) restoreAndSeed(frontier *urlFrontier, targetURL string, resumeCfg resumeOptions) error {
 	resumed := resumeFrontier(frontier, resumeCfg, time.Now(), c.opts.Stderr)
 
@@ -246,10 +238,9 @@ func (c *HTTPCrawler) restoreAndSeed(frontier *urlFrontier, targetURL string, re
 }
 
 // warnInteractUnsupported reports that --interact does nothing on the net/http
-// backend. That backend has no DOM to click, so the option is ignored; staying
-// silent left an operator who passed "--interact --headless=false" to conclude the
-// target had no interaction-only surface. Mirrors the concurrency-cap warning in
-// newRodEngine. No-op when the option was not requested or Stderr is nil.
+// backend, which has no DOM to click. Staying silent left an operator who passed
+// "--interact --headless=false" to conclude the target had no interaction-only
+// surface. No-op when the option was not requested or Stderr is nil.
 func warnInteractUnsupported(stderr io.Writer, interact bool) {
 	if !interact || stderr == nil {
 		return
@@ -257,18 +248,16 @@ func warnInteractUnsupported(stderr io.Writer, interact bool) {
 	fmt.Fprint(stderr, "warning: --interact requires the headless backend (it clicks DOM elements); ignoring it with --headless=false\n") //nolint:errcheck // best-effort
 }
 
-// httpPageCap folds the request budget into the page cap for the net/http
-// backend: that backend records one request per page, so a MaxRequests bound
-// (maxRequests > 0) reduces to a page cap. A zero maxRequests leaves maxPages
-// unchanged. Kept as a helper so HTTPCrawler.Crawl stays under the cyclomatic
-// complexity gate.
+// httpPageCap folds the request budget into the page cap: this backend records one
+// request per page, so a MaxRequests bound reduces to a page cap. Kept as a helper so
+// HTTPCrawler.Crawl stays under the cyclomatic complexity gate.
 //
 // maxPages MUST already be resolved to a positive value — validateCrawlInputs
 // normalizes the "0 means unlimited" sentinel to DefaultMaxPages before this is
-// called. The guard below enforces that rather than trusting it: with maxPages
-// as an unlimited sentinel, a naive `maxRequests < maxPages` comparison is false
-// and the request budget would be silently discarded, failing a politeness
-// control open against a sensitive target.
+// called. The guard below enforces that rather than trusting it: with maxPages as an
+// unlimited sentinel, a naive `maxRequests < maxPages` comparison is false and the
+// request budget would be silently discarded, failing a politeness control open
+// against a sensitive target.
 func httpPageCap(maxPages, maxRequests int) int {
 	if maxRequests <= 0 {
 		return maxPages
@@ -280,8 +269,7 @@ func httpPageCap(maxPages, maxRequests int) int {
 	return min(maxRequests, maxPages)
 }
 
-// runWorker is the per-goroutine crawl loop. It pops entries from the frontier,
-// fetches pages, records results, and pushes discovered links back.
+// runWorker is the per-goroutine loop: pop, fetch, record, push links.
 func (c *HTTPCrawler) runWorker(
 	ctx context.Context,
 	cancel context.CancelFunc,
@@ -302,9 +290,8 @@ func (c *HTTPCrawler) runWorker(
 		if !ok {
 			return
 		}
-		// MarkActive is NOT called here: Pop atomically increments the active
-		// counter before returning, making dequeue+activate a single critical
-		// section. Callers only need MarkIdle() after processing completes.
+		// MarkActive is NOT called: Pop already incremented the active counter in
+		// its own critical section. Only MarkIdle() is needed.
 
 		// The page cap cancels the shared context, so a worker blocked in Pop can
 		// wake up holding an entry it must not fetch. Return it to the queue
@@ -373,17 +360,13 @@ func (c *HTTPCrawler) runWorker(
 	}
 }
 
-// fetchPage performs a single HTTP GET for the given entry. It applies a
-// per-page timeout, rate limiting, and the configured headers. On success it
-// returns the observed request and discovered links. On error it logs to Stderr
-// (if set) and returns (nil, nil) so the worker can continue.
+// fetchPage GETs one entry under the per-page timeout, rate limiter and configured
+// headers. Errors log to Stderr and return (nil, nil) so the worker continues.
 func (c *HTTPCrawler) fetchPage(ctx context.Context, client *http.Client, limiter *rate.Limiter, entry urlEntry) (*ObservedRequest, []string) {
 	pageCtx, cancel := context.WithTimeout(ctx, c.pageTimeout)
 	defer cancel()
 
-	// Rate-limit before fetching. A limiter.Wait error (context canceled or
-	// deadline exceeded) must be handled identically to a client.Do error —
-	// log to Stderr and skip this page.
+	// A Wait error is handled exactly like a client.Do error: log and skip.
 	if err := limiter.Wait(pageCtx); err != nil {
 		if c.opts.Stderr != nil {
 			fmt.Fprintf(c.opts.Stderr, "rate limiter: %s: %v\n", redactSeedURL(entry.URL), err) //nolint:errcheck // best-effort
@@ -410,51 +393,38 @@ func (c *HTTPCrawler) fetchPage(ctx context.Context, client *http.Client, limite
 	}
 	defer resp.Body.Close() //nolint:errcheck // best-effort
 
-	// Read up to MaxHTTPBodySize (DoS cap). Partial reads are intentional.
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPBodySize)) //nolint:errcheck // best-effort; partial body is acceptable
 
 	observed := buildObservedRequest(req, resp, body)
-	// Extract links from the full read body (up to MaxHTTPBodySize / 10 MB), NOT
-	// from observed.Response.Body, which buildObservedRequest truncates to the 1 MB
-	// retention cap. Using the stored body here would silently drop every endpoint
-	// that appears past the first 1 MB of a large HTML/JS page even though we paid
-	// to read up to 10 MB.
+	// Extract from the full 10 MB read, NOT observed.Response.Body, which
+	// buildObservedRequest truncates to the 1 MB retention cap — that would drop
+	// every endpoint past the first 1 MB of a page we already paid to read.
 	//
-	// Resolve discovered links against the FINAL response URL (observed.URL,
-	// post-redirect), not the queued entry.URL — otherwise a redirect from
-	// /start to /app/ would resolve href="next" as /next instead of /app/next.
+	// Resolve against the post-redirect observed.URL, not entry.URL: a /start ->
+	// /app/ redirect would otherwise resolve href="next" as /next.
 	links := c.extractLinks(observed, body, observed.URL)
 
 	return &observed, links
 }
 
-// extractLinks discovers navigable URLs from a fetched page using HTML parsing
-// (goquery) and jsluice. It handles both HTML pages and JavaScript response
-// bodies.
+// extractLinks discovers URLs via goquery and jsluice, from HTML and JS bodies.
 //
-// fullBody is the body as read from the wire (capped only by MaxHTTPBodySize),
-// which is what link discovery operates on. observed carries the content type,
-// final URL, and the 1 MB-retention-capped body used for storage; its Body field
-// is deliberately NOT used for extraction (see fetchPage).
+// fullBody is the wire body, capped only by MaxHTTPBodySize; observed.Body is the
+// 1 MB retention copy and is deliberately NOT used here (see fetchPage).
 //
-// For HTML responses, extractFromHTML reads the <base href> tag (if present)
-// and resolves relative links against it, exactly matching the rod path's
-// effectiveBaseURL behavior. Inline-script URLs are resolved against the same
-// base so that jsluice-extracted paths honor the page's declared base.
+// <base href> resolution matches the rod path's effectiveBaseURL, and
+// inline-script URLs resolve against the same base.
 func (c *HTTPCrawler) extractLinks(observed ObservedRequest, fullBody []byte, pageURL string) []string {
 	var links []string
 
-	// base is the <base href>-aware base for HTML pages, else the (final,
-	// post-redirect) pageURL. All jsluice-derived URLs resolve against it so the
-	// inline-script and JS-response paths stay consistent with the DOM links.
+	// <base href>-aware for HTML, else the post-redirect pageURL. Every
+	// jsluice URL resolves against it, so JS and DOM links stay consistent.
 	base := pageURL
 
 	ct := strings.ToLower(observed.Response.ContentType)
 	if isHTMLContentType(ct) {
-		// extractHTMLAndInlineScripts parses the body exactly once, returning
-		// both the navigable links and inline-script jsluice results. Previously
-		// extractFromHTML and extractInlineScripts each called
-		// goquery.NewDocumentFromReader separately, which parsed the body twice.
+		// One goquery parse for both links and inline-script results. Keep it that
+		// way: two calls here means parsing the body twice.
 		var htmlLinks []string
 		var inlineScripts []jsExtractedURL
 		htmlLinks, base, inlineScripts = extractHTMLAndInlineScripts(fullBody, pageURL)
@@ -462,9 +432,7 @@ func (c *HTTPCrawler) extractLinks(observed ObservedRequest, fullBody []byte, pa
 		links = append(links, jsExtractedToLinks(inlineScripts, base)...)
 	}
 
-	// extractURLsFromResponses keys off the response body, so feed it a view of
-	// the observed request that carries the full (read-capped) body rather than
-	// the 1 MB-retention-capped stored body.
+	// Feed it the full read body, not the 1 MB retention copy.
 	full := observed
 	full.Response.Body = fullBody
 	links = append(links, jsExtractedToLinks(extractURLsFromResponses([]ObservedRequest{full}), base)...)

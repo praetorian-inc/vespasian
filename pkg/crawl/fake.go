@@ -16,26 +16,16 @@ package crawl
 
 import "context"
 
-// FakeCrawler is a test double for [Crawler]. It returns a pre-configured list
-// of requests and records invocation details so callers can verify the
-// interaction. No network activity occurs.
-//
-// Usage:
-//
-//	fake := &FakeCrawler{Requests: []ObservedRequest{{URL: "https://example.com"}}}
-//	got, err := fake.Crawl(ctx, "https://example.com/seed")
+// FakeCrawler is a [Crawler] test double: it returns Requests verbatim, records
+// the invocation, and never touches the network.
 type FakeCrawler struct {
-	// Requests is returned verbatim by every Crawl call.
 	Requests []ObservedRequest
-	// Err is returned verbatim by every Crawl call.
-	Err error
-	// Called is set to true after the first Crawl call.
-	Called bool
-	// LastURL is the targetURL passed to the most recent Crawl call.
-	LastURL string
+	Err      error
+	Called   bool
+	LastURL  string // targetURL from the most recent Crawl
 }
 
-// Crawl records the invocation and returns the pre-configured Requests and Err.
+// Crawl records the invocation and returns Requests and Err.
 func (f *FakeCrawler) Crawl(_ context.Context, targetURL string) ([]ObservedRequest, error) {
 	f.Called = true
 	f.LastURL = targetURL

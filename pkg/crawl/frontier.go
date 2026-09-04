@@ -25,11 +25,9 @@ import "sync"
 // that read best with it while leaving the checkpoint's wire type exported.
 type urlEntry = PendingURL
 
-// urlFrontier is a thread-safe queue of URLs to visit, with deduplication,
-// scope filtering, and depth tracking. Workers call Pop to get the next URL and
-// Push to enqueue discovered links. The frontier detects completion when the
-// queue is empty and no workers are actively processing a page.
-// By default the queue is FIFO (BFS). Call SetDFS(true) to switch to LIFO (DFS).
+// urlFrontier is a thread-safe queue with dedup, scope filtering and depth
+// tracking. Complete when the queue is empty and no worker is active. FIFO (BFS)
+// unless SetDFS(true).
 type urlFrontier struct {
 	mu       sync.Mutex
 	cond     *sync.Cond
@@ -64,26 +62,20 @@ type urlFrontier struct {
 // maxQueryVariantsPerPath bounds how many distinct query strings one path may be
 // crawled with.
 //
-// Collapsing every query variant of a path to a single visit assumes the query
-// only selects WHICH row a page shows, not WHAT the page does — true for
-// /product?id=1 versus /product?id=2, and false for the two shapes that matter:
-// pagination (?page=2 commonly fires a different XHR than page 1) and
-// query-switched views (?tab=billing, ?view=admin), where one query value can be
-// the only route into a whole section of the app. Normalizing the PATH does not
-// normalize the RESULTS.
+// Collapsing every variant to a single visit assumes the query only selects WHICH row
+// a page shows, not WHAT the page does. That holds for /product?id=1 versus ?id=2 and
+// fails for the two shapes that matter: pagination (?page=2 commonly fires a different
+// XHR than page 1) and query-switched views (?tab=billing, ?view=admin), where one
+// query value can be the only route into a whole section of the app. Normalizing the
+// PATH does not normalize the RESULTS.
 //
-// A cap keeps most of what collapsing bought — a catalog with 5,000 ?id= values
-// still costs a handful of visits instead of 5,000 — while leaving room for the
-// handful of variants that carry distinct surface. It is not a measured
-// distribution over real targets; it is a deliberate ceiling chosen so the
-// pathological case stays bounded and the common case (a page reached with two or
-// three different query strings) is no longer silently dropped. Re-tune it
-// against real Guard runs rather than treating it as settled.
+// Not measured against real targets — a deliberate ceiling, so a catalog with 5,000
+// ?id= values still costs a handful of visits while a page reached with two or three
+// query strings is no longer silently dropped. Re-tune against real Guard runs rather
+// than treating it as settled.
 const maxQueryVariantsPerPath = 4
 
-// newURLFrontier creates a frontier with the given max depth and scope filter.
-// The scopeFn is called for every URL before enqueuing; returning false rejects
-// the URL. A nil scopeFn accepts all URLs.
+// newURLFrontier calls scopeFn before enqueuing each URL; nil accepts everything.
 func newURLFrontier(maxDepth int, scopeFn func(string) bool) *urlFrontier {
 	f := &urlFrontier{
 		queue:    make([]urlEntry, 0, 64),
@@ -97,8 +89,7 @@ func newURLFrontier(maxDepth int, scopeFn func(string) bool) *urlFrontier {
 	return f
 }
 
-// Push adds URLs to the frontier if they pass scope, depth, and dedup checks.
-// Returns the number of URLs actually enqueued.
+// Push returns the number enqueued after scope, depth and dedup checks.
 func (f *urlFrontier) Push(entries []urlEntry) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -109,8 +100,6 @@ func (f *urlFrontier) Push(entries []urlEntry) int {
 
 	added := 0
 	for _, e := range entries {
-		// Depth check: entries at depth > maxDepth are links we would visit
-		// at maxDepth+1, which exceeds the configured limit.
 		if f.maxDepth >= 0 && e.Depth > f.maxDepth {
 			continue
 		}
@@ -158,19 +147,18 @@ func (f *urlFrontier) Push(entries []urlEntry) int {
 	return added
 }
 
-// Requeue returns a popped-but-unvisited entry to the queue so it is not lost.
-// Push cannot be used for this: the entry's key is already in seen, so Push
-// would reject it. The key deliberately STAYS in seen, so a link rediscovered
-// later still dedups against it — only this specific abandoned entry is
-// restored.
+// Requeue returns a popped-but-unvisited entry to the queue. Push cannot do this: the
+// entry's key is already in seen, so Push would reject it. The key deliberately STAYS
+// in seen, so a link rediscovered later still dedups against it — only this specific
+// abandoned entry is restored. Callers must still call MarkIdle afterwards, exactly as
+// after any Pop.
 //
-// Callers must still call MarkIdle after Requeue, exactly as after any Pop. Use
-// this whenever a worker gives up an entry without covering it (a crawl budget
-// was reached, or the context was canceled): the page is genuinely unvisited, so
-// it belongs in the pending queue for cross-run resume ([urlFrontier.Snapshot])
-// rather than silently dropped (LAB-4678 Phase 4). Dropping it made a
-// budget-truncated crawl lose its entire pending queue at default concurrency,
-// which is the exact case resume exists to carry forward.
+// Use it whenever a worker gives up an entry without covering it (a crawl budget was
+// reached, or the context was canceled): the page is genuinely unvisited, so it belongs
+// in the pending queue for cross-run resume ([urlFrontier.Snapshot]) rather than
+// silently dropped. Dropping it made a budget-truncated crawl lose its entire pending
+// queue at default concurrency, the exact case resume exists to carry forward
+// (LAB-4678 Phase 4).
 func (f *urlFrontier) Requeue(e urlEntry) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -181,25 +169,22 @@ func (f *urlFrontier) Requeue(e urlEntry) {
 	f.cond.Broadcast()
 }
 
-// MarkFailed records that the page at e.URL was attempted and failed for a
-// reason that is plausibly transient (navigation error, DNS blip, connection
-// reset, rate-limiter timeout) while the crawl itself was still healthy.
+// MarkFailed records that the page at e.URL was attempted and failed for a plausibly
+// transient reason (navigation error, DNS blip, connection reset, rate-limiter
+// timeout) while the crawl itself was still healthy. Callers must still call MarkIdle
+// afterwards, exactly as after any Pop.
 //
-// The key deliberately STAYS in seen, so this run will not retry the page: a
-// broken page linked from many others would otherwise be re-attempted once per
-// referrer, and every attempt reserves a slot from the page budget. What changes
-// is the CHECKPOINT: [urlFrontier.Snapshot] omits failed keys from the persisted
-// seen-set AND returns the entry on the pending queue, so the next resumed run
-// treats the page as never covered and tries it again. Without this, seen is
-// cumulative across every resume cycle, so a single one-off 503 blacklisted the
-// page permanently for the life of the checkpoint.
+// The key deliberately STAYS in seen, so this run will not retry the page: a broken
+// page linked from many others would otherwise be re-attempted once per referrer, and
+// every attempt reserves a slot from the page budget. What changes is the CHECKPOINT:
+// [urlFrontier.Snapshot] omits failed keys from the persisted seen-set AND returns the
+// entry on the pending queue, so the next resumed run treats the page as never covered
+// and tries it again. Without this, seen is cumulative across every resume cycle, so a
+// single one-off 503 blacklisted the page permanently for the life of the checkpoint.
 //
-// The whole entry is taken rather than just the URL because Snapshot needs its
-// Depth to requeue it. Omitting the key from seen without requeuing it loses the
-// page entirely: it was popped, so it is not in the queue either, and it would
-// then be retried only if another pending page happens to link it again.
-//
-// Callers must still call MarkIdle afterwards, exactly as after any Pop.
+// The whole entry is taken rather than just the URL because Snapshot needs its Depth to
+// requeue it. Omitting the key from seen without requeuing it loses the page entirely:
+// it was popped, so it is not in the queue either.
 func (f *urlFrontier) MarkFailed(e urlEntry) {
 	// Keyed on the same identity as `seen` (seenKey, the full canonical URL), so a
 	// failed ?page=2 is excluded from the persisted seen-set without also un-seeing
@@ -213,29 +198,20 @@ func (f *urlFrontier) MarkFailed(e urlEntry) {
 	f.mu.Unlock()
 }
 
-// SetDFS switches the frontier to depth-first (LIFO) pop order when v is true,
-// or back to breadth-first (FIFO) when v is false. The mutation is
-// mutex-protected and is therefore safe from data races. However, SetDFS is
-// intended to be called before the first Push: calling it after workers have
-// started produces a non-deterministic mid-crawl traversal-order change (a
-// logical race), not a data race.
+// SetDFS switches pop order. Mutex-protected, so no data race, but call it before
+// the first Push: mid-crawl it changes traversal order non-deterministically.
 func (f *urlFrontier) SetDFS(v bool) {
 	f.mu.Lock()
 	f.dfs = v
 	f.mu.Unlock()
 }
 
-// Pop returns the next URL to visit, atomically marking the entry as active.
-// It blocks until a URL is available or the frontier is done (empty queue, no
-// active workers, or closed). Returns (entry, true) on success or
-// (urlEntry{}, false) when the frontier is exhausted.
-// When SetDFS(true) has been called, Pop returns the last-pushed entry (LIFO).
+// Pop blocks until an entry is available or the frontier is exhausted.
 //
-// Active tracking is incremented inside Pop's critical section before the
-// mutex is released, making dequeue+activate atomic. This closes the TOCTOU
-// window where a concurrent Pop could observe an empty queue with active==0
-// while another worker holds an entry but has not yet called MarkActive.
-// Callers MUST call MarkIdle() exactly once when done processing the entry.
+// The active counter is incremented inside Pop's critical section, making
+// dequeue+activate atomic. That closes the TOCTOU window where a concurrent Pop
+// sees an empty queue with active==0 while another worker holds an entry but has
+// not yet marked itself active. Callers MUST call MarkIdle() exactly once.
 func (f *urlFrontier) Pop() (urlEntry, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -244,49 +220,43 @@ func (f *urlFrontier) Pop() (urlEntry, bool) {
 		if len(f.queue) > 0 {
 			var entry urlEntry
 			if f.dfs {
-				// LIFO: take the last element. Clear the popped slot before
-				// reslicing so the backing array does not retain the entry
-				// (GC concern on large DFS crawls — mirrors the FIFO path).
+				// Clear the slot before reslicing or the backing array retains it.
 				last := len(f.queue) - 1
 				entry = f.queue[last]
 				f.queue[last] = urlEntry{}
 				f.queue = f.queue[:last]
 			} else {
-				// FIFO: take the first element. Zero the dequeued slot before
-				// advancing so the backing array does not retain it between
-				// compactions (same GC concern handled in the DFS branch).
+				// Zero before advancing, same reason.
 				entry = f.queue[0]
 				f.queue[0] = urlEntry{}
 				f.queue = f.queue[1:]
-				// Compact the backing array when it's 4x larger than needed.
-				// Without this, consumed slots hold stale entries that can't
-				// be GC'd — a memory concern on large crawls.
+				// Compact at 4x: consumed slots otherwise pin stale entries.
 				if cap(f.queue) > 4*len(f.queue) && len(f.queue) > 0 {
 					compact := make([]urlEntry, len(f.queue))
 					copy(compact, f.queue)
 					f.queue = compact
 				}
 			}
-			// Atomically mark this worker as active so concurrent Pop calls
-			// block instead of returning false when the queue drains.
+			// Marked active here so a concurrent Pop blocks rather than returning
+			// false as the queue drains.
 			f.active++
 			return entry, true
 		}
 
-		// Queue is empty. If no workers are active (and thus no new URLs can
-		// arrive), or the frontier is closed, we're done.
+		// Empty and nobody active means no new URLs can arrive.
 		if f.active == 0 || f.closed {
 			return urlEntry{}, false
 		}
 
-		// Wait for Push or MarkIdle to signal.
+		// Woken by Push, Requeue, MarkIdle or Close.
 		f.cond.Wait()
 	}
 }
 
-// MarkIdle decrements the active-worker counter. Call this when a worker
-// finishes processing a URL (after pushing discovered links). If the queue
-// is empty and no workers are active, waiting Pop calls are unblocked.
+// MarkIdle decrements the active counter, after pushing discovered links. It is one
+// of the four cond.Broadcast sites (with Push, Requeue and Close) that release a Pop
+// parked in cond.Wait, which has no timeout — a return path that skips MarkIdle
+// parks every waiting worker for the rest of the run.
 func (f *urlFrontier) MarkIdle() {
 	f.mu.Lock()
 	f.active--
@@ -296,8 +266,7 @@ func (f *urlFrontier) MarkIdle() {
 	f.mu.Unlock()
 }
 
-// Close signals that no more URLs will be added externally. Any blocked Pop
-// calls will return false once the queue drains.
+// Close makes blocked Pop calls return false once the queue drains.
 func (f *urlFrontier) Close() {
 	f.mu.Lock()
 	f.closed = true
@@ -305,16 +274,14 @@ func (f *urlFrontier) Close() {
 	f.mu.Unlock()
 }
 
-// Len returns the number of URLs currently in the queue (not including
-// URLs being actively processed by workers).
+// Len excludes URLs being actively processed.
 func (f *urlFrontier) Len() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.queue)
 }
 
-// Seen returns the total number of unique URLs that have been enqueued
-// (including those already processed).
+// Seen counts every unique URL ever enqueued.
 func (f *urlFrontier) Seen() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

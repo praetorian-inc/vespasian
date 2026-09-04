@@ -30,21 +30,20 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/mediatype"
 )
 
-// DefaultStableWait is the default DOM stability wait duration.
+// DefaultStableWait is the default DOM-stability wait.
 const DefaultStableWait = 3 * time.Second
 
-// Completion-driven capture bounds (LAB-4678 Phase 1). After DOM stability the
-// crawl waits for the network to go quiet instead of a fixed settle window, so
-// late and dynamic XHR/fetch calls are captured. The wait is bounded by:
-//   - a floor: a minimum wait even when the network already looks idle,
-//   - a quiet period: how long the network must be idle before stopping,
-//   - a per-request timeout: the age after which a still-pending request no
-//     longer counts as in-flight, so one hung request cannot stall the wait.
+// Completion-driven capture bounds (LAB-4678). After DOM stability the crawl waits
+// for the network to go quiet instead of a fixed settle window, so late and dynamic
+// XHR/fetch calls are captured. The wait is bounded by a floor (a minimum wait even
+// when the network already looks idle), a quiet period (how long it must stay idle
+// before stopping), and a per-request timeout (the age past which a still-pending
+// request no longer counts as in flight, so one hung request cannot stall the wait).
 //
-// The ceiling is a per-page deadline of PageTimeout, computed once in visitPage
-// and shared by the baseline wait and every interaction wait. It is enforced
-// explicitly rather than by the rod page timeout: these waits poll local capture
-// state and issue no CDP call, so the page timeout never fires inside them.
+// The ceiling is a per-page deadline of PageTimeout, computed once in visitPage and
+// shared by the baseline wait and every interaction wait. It is enforced explicitly
+// rather than by the rod page timeout: these waits poll local capture state and issue
+// no CDP call, so the page timeout never fires inside them.
 const (
 	DefaultNetworkIdleFloor   = 500 * time.Millisecond
 	DefaultNetworkQuietPeriod = 500 * time.Millisecond
@@ -52,42 +51,19 @@ const (
 	networkIdlePollInterval   = 100 * time.Millisecond
 )
 
-// ---- operator-message helpers ----
-
-// flagDangerousAllowPrivate is the CLI flag name that disables SSRF protection
-// for private/localhost targets. It is referenced in operator-facing error
-// messages so operators can copy-paste it verbatim; keep this in sync with the
-// `name:"..."` tag on CrawlCmd.DangerousAllowPrivate / ScanCmd.DangerousAllowPrivate
-// in cmd/vespasian/main.go.
+// Kept in sync with the `name:"..."` tag on CrawlCmd.DangerousAllowPrivate and
+// ScanCmd.DangerousAllowPrivate; operators copy-paste it from error messages.
 const flagDangerousAllowPrivate = "--dangerous-allow-private"
 
-// redactedURLPlaceholder is substituted for a URL that cannot be safely
-// stripped of userinfo (either url.Parse failed and "@" is present, or
-// url.Parse succeeded into an opaque form where u.User is not populated).
-// Emitting the raw string in either case would leak credentials — the whole
-// point of redactSeedURL is to hide them.
 const redactedURLPlaceholder = "<URL with userinfo redacted>"
 
-// redactSeedURL returns raw with any userinfo (user[:password]) removed so the
-// URL can be echoed to stderr / logs without leaking credentials. Behavior:
-//   - url.Parse succeeds AND the re-serialized URL has no "@": userinfo is
-//     stripped via u.User = nil and the URL is re-serialized.
-//   - url.Parse succeeds AND the re-serialized URL still contains "@":
-//     either the URL is in opaque form (e.g. "http:user:pass@host/path" parses
-//     into u.Opaque rather than u.User, so u.User = nil is a no-op), or "@"
-//     appears unencoded in the path/query (Go preserves it there — e.g.
-//     "http://example.com/@user" or "http://example.com/?q=a@b"). Fail closed
-//     in both cases: emit the placeholder rather than round-trip credentials
-//     through u.String(). For the path/query case this is a deliberate false
-//     positive — operators lose host/path context, but we accept that to avoid
-//     any risk of echoing credentials. Keep the check in place.
-//   - url.Parse fails AND raw contains "@": fail closed — emit the placeholder,
-//     since a parse failure on a URL with "@" (e.g. "http://admin:se%zz@host/path"
-//     — invalid percent escape in userinfo) would otherwise echo the credentials
-//     verbatim. Note: "@" may also appear in the path or query of a malformed
-//     URL (with no real userinfo); same deliberate false positive as above.
-//   - url.Parse fails AND raw contains no "@": return raw unchanged; nothing
-//     to redact and the operator still gets an actionable error.
+// redactSeedURL strips userinfo so the seed URL can be echoed to stderr.
+//
+// Fails closed on any residual "@": an opaque URL ("http:user:pass@host/path")
+// parses into u.Opaque, so u.User = nil is a no-op and credentials would survive
+// u.String(). A parse failure with "@" would echo them verbatim. "@" also appears
+// unencoded in paths and queries, which cannot cheaply be told apart from the
+// credential case, so those lose host context — a deliberate false positive.
 func redactSeedURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -97,14 +73,6 @@ func redactSeedURL(raw string) string {
 		return raw
 	}
 	u.User = nil
-	// Defensive: the residual-"@" check catches two distinct cases:
-	//   1. Opaque URLs (e.g. "http:user:pass@host/path") parse with userinfo
-	//      in u.Opaque, so u.User = nil above is a no-op and credentials
-	//      would survive u.String() verbatim.
-	//   2. "@" unencoded in the path or query (e.g. "http://example.com/@user")
-	//      — no credentials, but we cannot cheaply distinguish this case from
-	//      (1), so we fall back to the placeholder. Deliberate false positive;
-	//      see the function-level doc comment.
 	out := u.String()
 	if strings.Contains(out, "@") {
 		return redactedURLPlaceholder
@@ -134,7 +102,7 @@ func RedactURL(raw string) string { return redactSeedURL(raw) }
 type engineOptions struct {
 	Concurrency   int               // concurrent tabs (0 → DefaultConcurrency)
 	MaxPages      int               // max pages to visit (0 → unlimited)
-	MaxRequests   int               // max captured requests before stopping (0 → unlimited); a rate/politeness bound distinct from MaxPages
+	MaxRequests   int               // admission budget over captured requests (0 → unlimited); a page may overshoot it, see crawlBudget
 	MaxDepth      int               // max crawl depth
 	PageTimeout   time.Duration     // per-page navigation timeout (0 → 30s)
 	StableTimeout time.Duration     // DOM stability wait (0 → DefaultStableWait)
@@ -149,7 +117,7 @@ type engineOptions struct {
 	// an empty capture. Only the visit of the SEED ITSELF calls it, gated on
 	// frontier-key identity rather than on Depth == 0 — resume restores pending
 	// entries before the seed is pushed and honors the depth the checkpoint claims,
-	// so depth 0 stopped being a reliable proxy for "is the seed" (LAB-4678 review).
+	// so depth 0 stopped being a reliable proxy for "is the seed" (LAB-4678).
 	// See [learnSeedOrigin] and [seedScope] for the containment reasoning.
 	LearnEffectiveOrigin func(effectiveURL string)
 
@@ -168,9 +136,8 @@ type engineOptions struct {
 	Resume resumeOptions
 }
 
-// rodEngine implements a concurrent headless crawl using go-rod. It connects
-// to an existing Chrome instance (managed by BrowserManager) and runs N worker
-// goroutines, each operating its own browser tab.
+// rodEngine connects to a BrowserManager-owned Chrome and runs one worker
+// goroutine per tab.
 type rodEngine struct {
 	browser  *rod.Browser
 	opts     engineOptions
@@ -192,18 +159,15 @@ type rodEngine struct {
 	// backend, where one page is one request so it degenerates to a page cap.
 	// Removing `maxRequests := e.opts.MaxRequests` would have left --max-requests
 	// silently inert on the backend Guard actually uses, with every test still green
-	// (LAB-4678 review).
+	// (LAB-4678).
 	visit func(ctx context.Context, target urlEntry) ([]ObservedRequest, []string, error)
 }
 
-// newRodEngine connects to the Chrome instance at wsURL and returns a crawl
-// engine ready to start. The caller must call Close() when done.
+// newRodEngine connects to wsURL. The caller must Close().
 func newRodEngine(wsURL string, opts engineOptions) (*rodEngine, error) {
 	if opts.Concurrency > MaxConcurrency && opts.Stderr != nil {
 		fmt.Fprintf(opts.Stderr, "warning: --concurrency %d exceeds maximum (%d), capping\n", opts.Concurrency, MaxConcurrency) //nolint:errcheck // best-effort
 	}
-	// clampConcurrency (crawler.go) is the shared clamp: 0 → DefaultConcurrency,
-	// > MaxConcurrency → MaxConcurrency. The warning above is rod-specific.
 	opts.Concurrency = clampConcurrency(opts.Concurrency)
 	if opts.PageTimeout <= 0 {
 		opts.PageTimeout = time.Duration(PageTimeout) * time.Second
@@ -237,39 +201,31 @@ func newRodEngine(wsURL string, opts engineOptions) (*rodEngine, error) {
 	return e, nil
 }
 
-// Crawl starts the concurrent crawl from seedURL. It blocks until the crawl
-// completes (frontier exhausted, maxPages reached, or ctx canceled). Each
-// captured network request is passed to onResult as it is observed.
+// Crawl blocks until the frontier is exhausted, maxPages is hit, or ctx is
+// canceled, passing each captured request to onResult.
 func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(ObservedRequest)) error {
-	// Record which frontier entry IS the seed, before any worker starts. Written
-	// once here and only read afterwards, so no synchronization is needed.
-	// Full canonical URL, not the query-stripped frontier key: the frontier now
-	// admits several query variants of one path, so the stripped form no longer
-	// identifies a single entry and a variant of the seed's path would have been
-	// mistaken for the seed itself.
+	// Which frontier entry IS the seed, written once before any worker starts and
+	// only read afterwards, so no synchronization is needed. The full canonical URL,
+	// not the query-stripped frontier key: the frontier admits several query variants
+	// of one path, so the stripped form no longer identifies a single entry and a
+	// variant of the seed's path would be mistaken for the seed itself.
 	e.seedKey = seenKey(seedURL)
 
-	// Seed the frontier. If Push adds zero entries the seed was rejected
-	// (malformed URL, scope mismatch, or — the common case — the seed is a
-	// private host such as localhost / 127.0.0.1 / RFC1918 / 169.254.*, which
-	// the scope predicate's SSRF check rejects unless flagDangerousAllowPrivate
-	// is set). Without this guard the crawl silently returned zero captures
-	// with no error to help the operator diagnose (LAB-2438).
-	// Restore resume state BEFORE seeding so already-covered pages are not
-	// re-crawled (LAB-4678 Phase 4).
+	// Resume state is restored BEFORE seeding so already-covered pages are not
+	// re-crawled (LAB-4678).
 	resumed := resumeFrontier(e.frontier, e.opts.Resume, time.Now(), e.opts.Stderr)
 
-	// A resumed frontier has already seen the seed, so Push returns 0 for it —
-	// that is expected, not a rejection. Only fail when the seed was refused AND
-	// there is nothing queued to crawl, which preserves the LAB-2438 diagnostic
-	// for a genuinely unusable seed.
+	// Push returns 0 when the seed is rejected: malformed, out of scope, or —
+	// usually — a private host the SSRF check refuses without
+	// flagDangerousAllowPrivate. Erroring is what stops that looking like a
+	// successful crawl of nothing (LAB-2438). A resumed frontier has already seen the
+	// seed, so a 0 there is expected rather than a rejection, which is why the failure
+	// also requires an empty queue.
 	if e.frontier.Push([]urlEntry{{URL: seedURL, Depth: 0}}) == 0 && e.frontier.Len() == 0 {
-		// redactSeedURL strips userinfo (user[:password]) before echoing the
-		// seed URL to stderr. If an operator pastes a credentialed URL and
-		// forgets flagDangerousAllowPrivate, the error message still lands in
-		// shell history / CI logs / scrollback — without this we would emit
-		// the cleartext credentials. url.Parse errors return the raw string
-		// unchanged so the operator still sees an actionable message.
+		// redactSeedURL strips userinfo before echoing the seed: this message lands in
+		// shell history, CI logs and scrollback, so a credentialed URL pasted without
+		// flagDangerousAllowPrivate must not leak in cleartext. A url.Parse error
+		// returns the raw string so the message stays actionable.
 		if resumed {
 			return fmt.Errorf("resumed checkpoint has no pending pages and seed URL %s "+
 				"was already covered; nothing to crawl", redactSeedURL(seedURL))
@@ -279,29 +235,18 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 			"pass %s", redactSeedURL(seedURL), flagDangerousAllowPrivate)
 	}
 
-	// Track pages VISITED for MaxPages enforcement (LAB-4678). The budget
-	// counts pages (URLs visited), not captured requests: a single SPA page can
-	// fire dozens of XHR/fetch calls, so counting requests truncated the crawl
-	// far earlier than "max pages" implies, and hard-canceling the shared
-	// context when the count was hit abandoned in-flight tabs mid-capture —
-	// dropping part of a page's surface and varying the emitted set run-to-run.
-	// Workers now reserve a page slot under this mutex before visiting and stop
-	// taking new pages once the budget is reached, so pages already in flight
-	// finalize and emit all of their captured requests, and the crawl is no
-	// longer canceled mid-page.
+	// MaxPages counts pages, not requests — one SPA page fires dozens of XHR calls
+	// (LAB-4678). Hitting it does NOT cancel ctx: in-flight pages finalize and emit
+	// everything they captured rather than being cut off mid-page. Which pages land
+	// inside the budget still varies run to run.
 	//
-	// MaxRequests (LAB-4678 Phase 3) is a second, independent budget: a
-	// rate/politeness bound on the total number of captured requests, distinct
-	// from the crawl-breadth MaxPages. Both are enforced by crawlBudget, which
-	// RESERVES an estimated request cost before a page starts rather than
-	// counting only after it finishes — see that type for why counting after was
-	// not a bound at all.
+	// MaxRequests is a second, independent budget over captured requests, distinct
+	// from the crawl-breadth MaxPages. It is ADMISSION control, not a cap on what
+	// reaches the target: crawlBudget reserves an estimated cost before a page starts
+	// and reconciles afterwards, so a page that fires more than the estimate
+	// overshoots. See that type.
 	budget := newCrawlBudget(e.opts.MaxPages, e.opts.MaxRequests)
 
-	// Workers run under ctx directly. The page budget no longer cancels the
-	// crawl (it just stops workers from taking new pages under the mutex), so
-	// the former context.WithCancel wrapper served no purpose beyond ctx's own
-	// parent cancellation and was removed.
 	var wg sync.WaitGroup
 	for i := range e.opts.Concurrency {
 		wg.Add(1)
@@ -322,45 +267,47 @@ func (e *rodEngine) Crawl(ctx context.Context, seedURL string, onResult func(Obs
 	return ctx.Err()
 }
 
-// Close disconnects from the browser. It does NOT kill Chrome — BrowserManager
-// owns that lifecycle.
+// Close disconnects only. BrowserManager owns the Chrome lifecycle.
 func (e *rodEngine) Close() error {
 	return e.browser.Close()
 }
 
-// initialRequestsPerPageEstimate is what crawlBudget assumes a page will cost
-// before it has measured one. It is deliberately pessimistic: over-estimating
-// costs a little parallelism at the start of a crawl and is corrected within one
-// page, while under-estimating spends budget that cannot be taken back, because
-// the requests have already been sent to the target.
+// initialRequestsPerPageEstimate is what crawlBudget assumes a page will cost before
+// it has measured one. Deliberately pessimistic: over-estimating costs a little
+// parallelism at the start of a crawl and is corrected within one page, while
+// under-estimating spends budget that cannot be taken back, because the requests have
+// already been sent to the target.
 const initialRequestsPerPageEstimate = 8
 
 // crawlBudget enforces the page and request budgets together.
 //
-// The request budget RESERVES an estimated cost before a page starts, and
-// reconciles against the actual count when it finishes. That is the difference
-// between a bound and a running total. Counting only after a page returned meant
-// the budget was consulted before a visit and updated after it, so every worker
-// could clear the check inside the same window and the real bound was
+// The request budget RESERVES an estimated cost before a page starts and reconciles
+// against the actual count when it finishes. That is the difference between a bound
+// and a running total: consulting the budget before a visit and updating it after lets
+// every worker clear the check inside the same window, making the real bound
 //
 //	MaxRequests + (Concurrency x requests-per-page)
 //
-// Measured on the old code: --max-requests 10 at the default --concurrency 10
-// against pages firing 4 requests each emitted 44. It also could not bound below
-// a single page's request count. Documenting that overshoot did not make it a
-// politeness control — an operator who needs one against a fragile target is not
-// served by a number four times what they asked for.
+// Measured that way, --max-requests 10 at the default --concurrency 10 against pages
+// firing 4 requests each emitted 44, and it could not bound below a single page's
+// request count at all. An operator who needs a politeness control against a fragile
+// target is not served by a number four times what they asked for.
 //
-// The estimate is the running mean of requests per completed page, so it adapts
-// to the target rather than to a guess. As the budget fills, the reservation
-// naturally reduces concurrency: with 2 units left and an 8-unit estimate, no new
-// page starts. Serializing near the limit is the correct trade for a bound that
-// exists to protect the target.
+// The estimate is the running mean of requests per completed page, so it adapts to the
+// target rather than to a guess. As the budget fills the reservation naturally reduces
+// concurrency: with 2 units left and an 8-unit estimate, no new page starts.
+// Serializing near the limit is the correct trade for a bound that exists to protect
+// the target.
 //
-// Residual overshoot is bounded by how far a page exceeds the current mean,
-// summed over in-flight pages, rather than by concurrency. It cannot be zero
-// without cutting a page mid-capture, which would re-introduce the partial-page
-// truncation MaxPages was changed to avoid.
+// Residual overshoot is bounded by how far a page exceeds the current mean, summed
+// over in-flight pages, rather than by concurrency. It cannot be zero without cutting
+// a page mid-capture, which is the partial-page truncation MaxPages avoids.
+//
+// Nothing caps one page's captured-request count, so that overshoot has no per-page
+// ceiling: with MaxRequests 10 and an 8-request estimate, a single admitted page that
+// fires 10,000 requests emits all of them. So this bounds how many pages are ADMITTED
+// against a request budget; it is not a guarantee about how many requests reach the
+// target. MaxPages is the hard ceiling.
 type crawlBudget struct {
 	mu          sync.Mutex
 	maxPages    int
@@ -508,19 +455,15 @@ func (b *crawlBudget) Requests() int {
 	return b.reqCount
 }
 
-// worker is the per-tab goroutine. It takes URLs from the frontier, visits
-// each one in a fresh tab, captures network events, extracts links, and pushes
-// discovered URLs back to the frontier.
+// worker is the per-tab goroutine: pop, visit, capture, push discovered links.
 func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRequest), budget *crawlBudget) {
 	for {
-		// Check context before blocking on Pop.
 		if ctx.Err() != nil {
 			return
 		}
 
-		// Stop taking new pages once either budget is reached. Pages already
-		// being visited by other workers still finalize below. Check-only (no
-		// reservation): we have not popped an entry yet.
+		// Check-only: nothing popped yet, so no slot to reserve. Pages other workers
+		// are already visiting still finalize below.
 		if budget.Reached() {
 			return
 		}
@@ -529,28 +472,24 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 		if !ok {
 			return // frontier exhausted
 		}
-		// MarkActive is NOT called here: Pop atomically increments the active
-		// counter before returning, making dequeue+activate a single critical
-		// section. Callers only need MarkIdle() after processing completes.
+		// MarkActive is NOT called: Pop already incremented the active counter
+		// inside its own critical section, making dequeue+activate atomic. Only
+		// MarkIdle() is needed after processing.
 
-		// Reserve this page's budget slot before visiting. Another worker may
-		// have reached a budget while we were blocked in Pop waiting for a
-		// link; if so, release the entry without visiting so the crawl never
-		// starts a page past a budget. Reserving before the visit (rather than
-		// counting after) keeps the page cap exact instead of overshooting by
-		// up to Concurrency pages.
-		// Note on the reservation below: the cancellation paths further down requeue
-		// their entry as uncovered WITHOUT releasing the slot this call consumed, so
-		// pageCount can transiently exceed the number of pages actually covered.
-		// That is deliberate. Releasing it would add a lock acquisition on a
-		// terminating path for no observable gain: pageCount is local to Crawl, is
-		// never persisted into the checkpoint, and every path that requeues has ctx
-		// already canceled, so any worker that reads the inflated count exits on
-		// its own ctx check first.
+		// Another worker may have filled a budget while this one blocked in Pop, so
+		// release the entry without visiting. Reserving before the visit rather than
+		// counting after is what avoids overshooting by up to Concurrency pages.
+		//
+		// The cancellation paths further down requeue their entry as uncovered WITHOUT
+		// releasing the slot this call consumed, so pageCount can transiently exceed
+		// the number of pages actually covered. That is deliberate: the count is local
+		// to Crawl, is never persisted into the checkpoint, and every path that
+		// requeues has ctx already canceled, so a worker that reads the inflated count
+		// exits on its own ctx check first.
 		reservation, admitted := budget.TryReserve()
 		if !admitted {
-			// Return the entry to the queue: it was dequeued but never visited,
-			// so it must survive into resume state instead of being dropped.
+			// Return the entry to the queue: it was dequeued but never visited, so it
+			// must survive into resume state instead of being dropped.
 			e.frontier.Requeue(entry)
 			e.frontier.MarkIdle()
 			return
@@ -579,9 +518,10 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 			continue
 		}
 
-		// Emit captured requests and reconcile the reservation against what the
-		// page actually cost. Counting emitted requests (not just page loads) is
-		// what makes the budget a request-rate bound distinct from MaxPages.
+		// Charged after the fact: e.visit captured the whole page before this loop, so
+		// every request here has already been sent. Counting them is what separates
+		// MaxRequests from MaxPages, but it also means this page's overshoot is
+		// (emitted - reservation) and nothing at this point can prevent it.
 		emitted := 0
 		for _, req := range requests {
 			if ctx.Err() != nil {
@@ -602,7 +542,6 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 		}
 		budget.Release(reservation, emitted)
 
-		// Push discovered links at depth+1.
 		if len(links) > 0 {
 			entries := make([]urlEntry, len(links))
 			for i, link := range links {
@@ -615,10 +554,10 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 	}
 }
 
-// visitPage navigates a fresh tab to the given URL, captures network events,
-// waits for DOM stability, and extracts links.
+// visitPage navigates a fresh tab, captures network events, waits for DOM
+// stability, and extracts links.
 func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedRequest, []string, error) {
-	// Create a new tab for each visit to avoid stale state.
+	// Fresh tab per visit: no stale state carried between pages.
 	page, err := e.browser.Page(proto.TargetCreateTarget{URL: "about:blank"})
 	if err != nil {
 		return nil, nil, fmt.Errorf("create tab: %w", err)
@@ -628,21 +567,19 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 		page.Close() //nolint:errcheck // best-effort close; page may already be closed
 	}()
 
-	// Apply context and per-page timeout. pageDeadline mirrors that timeout as a
-	// wall-clock bound for the completion-driven waits below, which poll local
-	// capture state and so never trip the rod page timeout themselves. Every
-	// network-idle wait for this page — baseline and per-click — shares it, so
-	// the page's total wait cannot scale with the number of interactions.
+	// pageDeadline mirrors the per-page timeout as a wall-clock bound for the
+	// completion-driven waits below, which poll local capture state and so never trip
+	// the rod page timeout themselves. Every network-idle wait for this page, baseline
+	// and per-click, shares it, so the page's total wait cannot scale with the number
+	// of interactions.
 	page = page.Context(ctx).Timeout(e.opts.PageTimeout)
 	pageDeadline := time.Now().Add(e.opts.PageTimeout)
 
-	// Enable the Network domain for capturing requests.
 	enableNetwork := proto.NetworkEnable{}
 	if err := enableNetwork.Call(page); err != nil {
 		return nil, nil, fmt.Errorf("enable network: %w", err)
 	}
 
-	// Set custom headers if configured.
 	if len(e.opts.Headers) > 0 {
 		headerPairs := make([]string, 0, len(e.opts.Headers)*2)
 		for k, v := range e.opts.Headers {
@@ -655,24 +592,19 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 		defer cleanup()
 	}
 
-	// Wire up network capture before navigation.
+	// Before navigation, or the first requests are missed.
 	capture, waitEvents := newPageNetworkCapture(page, target.URL)
 
-	// Start the event listener in a goroutine. The goroutine exits when
-	// the page is closed (deferred above) or the page context expires.
-	// go-rod's EachEvent internally listens on the page's CDP session,
-	// which is torn down by page.Close().
+	// Exits when page.Close() tears down the CDP session EachEvent listens on, or
+	// when the page context expires.
 	go waitEvents()
 
-	// Navigate to the target URL.
 	if err := page.Navigate(target.URL); err != nil {
 		return nil, nil, fmt.Errorf("navigate: %w", err)
 	}
 
-	// Wait for page load event.
 	if err := page.WaitLoad(); err != nil {
-		// Non-fatal: some pages may not fire load event before timeout.
-		// Continue to collect whatever network events were captured.
+		// Non-fatal: not every page fires load before the timeout.
 		if ctx.Err() != nil {
 			return capture.Results(), nil, nil
 		}
@@ -680,35 +612,29 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 
 	e.learnSeedOrigin(page, target)
 
-	// Wait for DOM stability — the key optimization: these waits overlap
-	// across concurrent workers instead of serializing.
+	// These waits overlap across workers rather than serializing.
 	if err := page.WaitStable(e.opts.StableTimeout); err != nil {
-		// Non-fatal: collect partial results.
 		if ctx.Err() != nil {
 			return capture.Results(), nil, nil
 		}
 	}
 
-	// Wait for the network to go quiet instead of a fixed settle window, so
-	// late and dynamic XHR/fetch calls (mutation/intersection observers, delayed
-	// data loads) are captured rather than dropped (LAB-4678 Phase 1). Bounded by
-	// a floor, a quiet period, a per-request timeout, and the page ceiling; see
-	// waitForNetworkIdle. Returns early if ctx is canceled; the snapshot below is
-	// the single place this page's captured requests are read.
+	// Wait for the network to go quiet instead of a fixed settle window, so late and
+	// dynamic XHR/fetch calls (mutation and intersection observers, delayed data
+	// loads) are captured rather than dropped (LAB-4678). Bounded by a floor, a quiet
+	// period, a per-request timeout and the page ceiling; see waitForNetworkIdle.
 	e.waitForNetworkIdle(ctx, capture, pageDeadline)
 
-	// Optionally exercise the page (clicks / client-side route changes) to
-	// surface endpoints that only fire on interaction, then snapshot everything
-	// captured — baseline plus interaction-triggered (LAB-4678 Phase 2). Opt-in,
-	// off by default. Shares the page deadline, so interaction cannot extend the
-	// page past its budget.
+	// Optionally exercise the page (clicks, client-side route changes) to surface
+	// endpoints that only fire on interaction, then snapshot everything captured,
+	// baseline plus interaction-triggered (LAB-4678). Opt-in, off by default. Shares
+	// the page deadline, so interaction cannot extend the page past its budget.
 	navigated := false
 	if e.opts.Interact {
 		navigated = e.interactPage(ctx, page, capture, pageDeadline)
 	}
 	capturedResults := capture.Results()
 
-	// Extract links, run jsluice, and discover forms from the stabilized page.
 	results, links := enrichFromPage(e.enrichTarget(page, navigated, target.URL), capturedResults, target.URL, e.opts.Stderr, e.opts.ScopeCheck)
 	return results, links, nil
 }
@@ -718,21 +644,18 @@ func (e *rodEngine) visitPage(ctx context.Context, target urlEntry) ([]ObservedR
 // reports the document the seed actually resolved to.
 //
 // Only the SEED itself may widen scope, and the widening is one-shot inside the
-// predicate (see [seedScope]). It must run before the scope filter in
-// enrichFromPage, or a cross-origin seed redirect discards every captured request
-// and the crawl returns an empty capture with no diagnostic.
+// predicate (see [seedScope]). It must run before the scope filter in enrichFromPage,
+// or a cross-origin seed redirect discards every captured request and the crawl
+// returns an empty capture with no diagnostic.
 //
-// The gate is IDENTITY with the seed, not Depth == 0. Depth was a valid proxy only
-// while the seed was the sole depth-0 entry, which stopped being true when resume
-// landed: resumeFrontier runs BEFORE the seed is pushed, and urlFrontier.Restore
-// honors whatever Depth the checkpoint claims, so a restored entry carrying
-// "Depth": 0 with a different URL is popped from the FIFO queue ahead of the seed
-// and would become the page whose post-redirect origin is learned. A checkpoint is
-// unauthenticated by design — its fingerprint is derived from non-secret crawl
-// config — so under the proxy gate anyone able to write to checkpoint storage chose
-// which page decided the scope widening. Comparing against the seed's frontier key
-// restores the invariant seedScope's containment argument depends on
-// (LAB-4678 review).
+// The gate is IDENTITY with the seed, not Depth == 0. Depth is not a proxy for the
+// seed once resume is in play: resumeFrontier runs BEFORE the seed is pushed and
+// urlFrontier.Restore honors whatever Depth the checkpoint claims, so a restored
+// entry carrying "Depth": 0 with a different URL is popped from the FIFO queue ahead
+// of the seed and would become the page whose post-redirect origin is learned. A
+// checkpoint is unauthenticated by design — its fingerprint is derived from
+// non-secret crawl config — so a depth gate would let anyone able to write to
+// checkpoint storage choose which page decided the scope widening (LAB-4678).
 func (e *rodEngine) learnSeedOrigin(page *rod.Page, target urlEntry) {
 	if e.opts.LearnEffectiveOrigin == nil || seenKey(target.URL) != e.seedKey {
 		return
@@ -745,15 +668,15 @@ func (e *rodEngine) learnSeedOrigin(page *rod.Page, target urlEntry) {
 }
 
 // enrichTarget returns the page enrichFromPage should read the DOM from: the page
-// itself normally, or nil when an interaction click navigated away and could not
-// be undone.
+// itself normally, or nil when an interaction click navigated away and could not be
+// undone.
 //
 // In that case the live DOM is a document this worker was never assigned:
-// page.Info() reports the navigated-to URL, so reading it would extract that
-// page's links and forms, resolve them against its base URL, and push them into
-// the frontier without the intermediate page counting against --max-pages — while
-// the synthetic form requests would still be tagged with this page's URL. A nil
-// page limits enrichment to what was actually captured for the assigned page.
+// page.Info() reports the navigated-to URL, so reading it would extract that page's
+// links and forms, resolve them against its base URL, and push them into the frontier
+// without the intermediate page counting against --max-pages — while the synthetic
+// form requests would still be tagged with this page's URL. A nil page limits
+// enrichment to what was actually captured for the assigned page.
 func (e *rodEngine) enrichTarget(page *rod.Page, navigated bool, pageURL string) *rod.Page {
 	if !navigated {
 		return page
@@ -761,35 +684,30 @@ func (e *rodEngine) enrichTarget(page *rod.Page, navigated bool, pageURL string)
 	if e.opts.Stderr != nil {
 		// redactSeedURL, not the raw URL: for the depth-0 visit pageURL is the seed
 		// exactly as the operator typed it, so `vespasian crawl --interact
-		// https://admin:s3cret@target/` wrote cleartext credentials to stderr, which
-		// lands in CI job logs, shell scrollback, and any wrapper capturing the
-		// capability's stderr. Every other operator-facing URL echo in this package
-		// already redacts; this one was added without it (LAB-4678 review).
+		// https://admin:s3cret@target/` would write cleartext credentials to stderr,
+		// which lands in CI job logs, shell scrollback, and any wrapper capturing the
+		// capability's stderr.
 		fmt.Fprintf(e.opts.Stderr, "interact: a click navigated away from %s and the page could not be restored; skipping DOM enrichment for it\n", redactSeedURL(pageURL)) //nolint:errcheck // best-effort
 	}
 	return nil
 }
 
 // waitForNetworkIdle blocks until the page's network goes quiet or a bound is hit
-// (LAB-4678 Phase 1). It replaces the previous fixed 200ms settle so late/dynamic
-// requests are captured. It stops at the page deadline; or, once past the floor,
-// when no requests are in flight and the network has been quiet for the quiet
-// period; or when ctx is canceled.
+// (LAB-4678). It stops at the page deadline; or, once past the floor, when no
+// requests are in flight and the network has been quiet for the quiet period; or when
+// ctx is canceled.
 //
-// It returns nothing. It used to return capture.Results(), which every one of its
-// three call sites discarded — visitPage takes its own snapshot afterwards. That
-// was not merely an unused value: Results() takes the capture mutex and rebuilds
-// every captured request, re-parsing each URL and re-deriving its query params, so
-// each return was O(total captured bytes) for the page. interactPage calls this once
-// per click plus once per returnToPage, so a page paid up to 16 full reconstructions
-// purely to throw them away, across Concurrency tabs, scaled by attacker-controlled
-// page content (LAB-4678 review).
+// It deliberately returns nothing. capture.Results() takes the capture mutex and
+// rebuilds every captured request, re-parsing each URL and re-deriving its query
+// params, so returning a snapshot here would cost O(total captured bytes) per call —
+// and interactPage calls this once per click plus once per returnToPage, up to 16
+// times a page, across Concurrency tabs, scaled by attacker-controlled page content.
+// visitPage takes the one snapshot that is actually read.
 //
 // deadline is the WHOLE PAGE's ceiling, shared by the baseline wait and every
-// interaction wait, so a page cannot exceed its budget by calling this
-// repeatedly. The floor still applies per call, which is deliberate: each click
-// needs a minimum window for its requests to start, and the shared deadline caps
-// the total regardless.
+// interaction wait, so a page cannot exceed its budget by calling this repeatedly.
+// The floor still applies per call, which is deliberate: each click needs a minimum
+// window for its requests to start, and the shared deadline caps the total regardless.
 func (e *rodEngine) waitForNetworkIdle(ctx context.Context, capture *pageNetworkCapture, deadline time.Time) {
 	start := time.Now()
 	ticker := time.NewTicker(networkIdlePollInterval)
@@ -809,11 +727,9 @@ func (e *rodEngine) waitForNetworkIdle(ctx context.Context, capture *pageNetwork
 	}
 }
 
-// networkIdleReached is the pure stop decision for waitForNetworkIdle, split out
-// so it is unit-testable without a browser. Stop when the page deadline has been
-// reached, or once past the floor with nothing in flight and a quiet period since
-// the last network activity. deadlineReached is passed in rather than derived so
-// this stays a pure function of durations.
+// networkIdleReached is the pure stop decision for waitForNetworkIdle, split out so
+// it is unit-testable without a browser. deadlineReached is passed in rather than
+// derived so this stays a pure function of durations.
 func networkIdleReached(inFlight int, sinceActivity, elapsed, floor, quiet time.Duration, deadlineReached bool) bool {
 	if deadlineReached {
 		return true
@@ -824,34 +740,34 @@ func networkIdleReached(inFlight int, sinceActivity, elapsed, floor, quiet time.
 	return inFlight == 0 && sinceActivity >= quiet
 }
 
-// isRetainedForStaticAnalysis reports whether an out-of-scope captured request
-// must survive the scope filter anyway because a later stage reads its BODY
-// rather than treating it as an endpoint.
+// isRetainedForStaticAnalysis reports whether an out-of-scope captured request must
+// survive the scope filter anyway because a later stage reads its BODY rather than
+// treating it as an endpoint.
 //
-// Today that is exactly one case: a JavaScript bundle. pkg/analyze/jsstatic runs
-// over the capture after the crawl, and it is the only input it has — so scope-
-// filtering the capture also decided what static analysis could see. A Next.js or
-// SPA bundle served from a separate asset host (assetPrefix, a CDN, a static.
-// subdomain) is out of scope under the default same-origin policy, so the filter
-// silently removed both SPA bundle extraction and App Router route recovery for
-// every target deployed that way. That is the normal Next.js deployment, not an
-// edge case, and it failed with no diagnostic: the operator saw a smaller spec,
-// not an error.
+// Today that is exactly one case: a JavaScript bundle. pkg/analyze/jsstatic runs over
+// the capture after the crawl and it is the only input jsstatic has, so scope-
+// filtering the capture also decides what static analysis can see. A Next.js or SPA
+// bundle served from a separate asset host (assetPrefix, a CDN, a static. subdomain)
+// is out of scope under the default same-origin policy, so without this the filter
+// silently removes both SPA bundle extraction and App Router route recovery for every
+// target deployed that way — the normal Next.js deployment, not an edge case — and
+// the operator sees a smaller spec rather than an error.
 //
-// Retaining the bundle is not a scope escape. The browser had already fetched it
-// as a subresource of an in-scope page, so no new request is issued, and nothing
-// downstream treats it as an endpoint: pkg/classify rejects ".js" as a static
-// asset in rule 1 of every classifier, so it cannot reach the spec or the
-// `servers` list. What it can do is contribute the paths inside it, which
-// jsstatic resolves against the PAGE url, keeping recovered endpoints on the
-// in-scope origin.
+// Retaining the bundle is not a scope escape. The browser had already fetched it as a
+// subresource of an in-scope page, so no new request is issued, and nothing downstream
+// treats it as an endpoint: pkg/classify's isStaticAssetRequest excludes on the same
+// mediatype.IsJavaScript predicate this filter retains on, plus .js/.mjs/.cjs by
+// extension, so it cannot reach the spec or the `servers` list;
+// TestScopeExemptionCannotBecomeAnEndpoint pins that. What it can do
+// is contribute the paths inside it, which jsstatic resolves against the PAGE url,
+// keeping recovered endpoints on the in-scope origin. Third-party XHR/fetch to
+// analytics and external APIs — the traffic the filter exists for — is JSON, not
+// JavaScript, and is unaffected.
 //
-// Third-party XHR/fetch to analytics and external APIs — the traffic the filter
-// exists for — is unaffected: those are JSON, not JavaScript.
 // It shares isJavaScriptContentType with the jsluice extraction path rather than
-// applying its own test, so "what counts as a JS body" is decided in one place
-// for both the stage that reads bodies and the filter that decides which bodies
-// survive to be read.
+// applying its own test, so "what counts as a JS body" is decided in one place for
+// both the stage that reads bodies and the filter that decides which bodies survive
+// to be read.
 func isRetainedForStaticAnalysis(r ObservedRequest) bool {
 	if isJavaScriptContentType(strings.ToLower(mediatype.Base(r.Response.ContentType))) {
 		return true
@@ -866,47 +782,33 @@ func isRetainedForStaticAnalysis(r ObservedRequest) bool {
 	return strings.HasSuffix(p, ".js") || strings.HasSuffix(p, ".mjs")
 }
 
-// enrichFromPage extracts links from the DOM, runs jsluice on JS sources and
-// inline scripts, and discovers forms. It returns the enriched results and all
-// discovered links for the frontier. Errors are logged to stderr (if non-nil)
-// but are non-fatal — captured network results are always returned.
+// enrichFromPage does the DOM-reading half — links, jsluice, forms — then hands
+// the pure combining logic to [mergeEnrichedLinks], which is unit tested. Errors
+// are non-fatal; captured network results are always returned.
 //
-// pageURL is the URL the worker navigated to (used for form PageURL tagging
-// and as a fallback for URL resolution when the DOM provides no <base href>
-// and page.Info() returns an error).
-//
-// scopeFn is forwarded to mergeEnrichedLinks so form actions whose host
-// is out of scope are not appended as synthetic ObservedRequests.
-//
-// This function handles the DOM-reading side (page.Info, extractLinks,
-// extractForms, extractURLsFromInlineScripts) and then delegates the pure
-// link-combining logic to [mergeEnrichedLinks], which is directly unit
-// tested.
+// pageURL is where the worker navigated, used for form PageURL tagging and as the
+// resolution fallback when there is no <base href> and page.Info() errors.
 func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, stderr io.Writer, scopeFn func(string) bool) ([]ObservedRequest, []string) {
-	// A nil page means the DOM must not (or cannot) be read. visitPage passes nil
-	// when an interaction click navigated away, so the live DOM belongs to a
-	// document this worker was never assigned; the merger-threading contract is
-	// also tested through this path without standing up a real rod.Page. jsluice
-	// over the captured RESPONSE bodies is a pure function of `captured` and stays
-	// valid either way, so it still runs — only the DOM-sourced inputs (hrefs,
-	// inline scripts, forms) are dropped.
+	// A nil page means the DOM must not (or cannot) be read. visitPage passes nil when
+	// an interaction click navigated away, so the live DOM belongs to a document this
+	// worker was never assigned; the merger-threading contract is also tested through
+	// this path without standing up a real rod.Page. jsluice over the captured RESPONSE
+	// bodies is a pure function of `captured` and stays valid either way, so it still
+	// runs — only the DOM-sourced inputs (hrefs, inline scripts, forms) are dropped.
 	if page == nil {
 		captured, links := mergeEnrichedLinksFn(captured, nil, extractURLsFromResponses(captured), nil, nil, pageURL, pageURL, scopeFn)
 		return captured, links
 	}
 
-	// Resolve the effective base URL for any relative references on this page.
-	// jsluice-extracted URLs and form actions must honor <base href> the same
-	// way the browser would, or we end up queuing mangled/nested paths.
+	// jsluice URLs and form actions must honor <base href> like the browser, or
+	// the frontier queues mangled nested paths.
 	resolvedPageURL := pageURL
 	if info, err := page.Info(); err == nil && info.URL != "" {
 		resolvedPageURL = info.URL
 	}
 	baseURL := effectiveBaseURL(page, resolvedPageURL)
 
-	// Extract links from the DOM. A failure here is non-fatal — it only
-	// affects DOM-sourced href discovery. Continue with domLinks=nil so the
-	// JS-from-responses, inline-script, and form paths still enrich captured.
+	// Non-fatal: domLinks=nil still leaves the JS, inline-script and form paths.
 	domLinks, err := extractLinks(page, baseURL)
 	if err != nil {
 		if stderr != nil {
@@ -918,9 +820,8 @@ func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, 
 	jsFromResponses := extractURLsFromResponses(captured)
 	jsFromInline := extractURLsFromInlineScripts(page)
 
-	// extractForms uses resolvedPageURL for no-action forms (HTML spec) and
-	// baseURL for explicit action refs (browser behavior). A DOM query error
-	// here is non-fatal — treat as "no forms discovered" and keep going.
+	// resolvedPageURL for no-action forms per the HTML spec, baseURL for explicit
+	// action refs per browser behavior. A DOM error means no forms.
 	forms, ferr := extractForms(page, resolvedPageURL, baseURL)
 	if ferr != nil && stderr != nil {
 		fmt.Fprintf(stderr, "form extraction failed for %s: %v\n", redactSeedURL(pageURL), ferr) //nolint:errcheck // best-effort
@@ -930,43 +831,25 @@ func enrichFromPage(page *rod.Page, captured []ObservedRequest, pageURL string, 
 	return captured, links
 }
 
-// mergeEnrichedLinksFn is the function enrichFromPage calls to combine
-// page-extracted inputs with scope enforcement. Package-level var so tests
-// can verify the scopeFn argument is threaded correctly from e.opts.ScopeCheck
-// through enrichFromPage to mergeEnrichedLinks (the one-line call was
-// previously integration-only coverage — see LAB-2221).
-// Production callers always see the real mergeEnrichedLinks.
+// mergeEnrichedLinksFn is a var so tests can check scopeFn is threaded from
+// e.opts.ScopeCheck through to mergeEnrichedLinks without a browser — that one-line
+// call was otherwise integration-only coverage (LAB-2221). Production callers always
+// see the real mergeEnrichedLinks.
 //
-// NOT PARALLEL-SAFE: tests swap this via a t.Cleanup-restored pattern and
-// MUST NOT call t.Parallel() — concurrent swaps would race on the global.
-// No sync is used here because the production read path is single-threaded
-// per page and the test swap happens before the call under test.
+// NOT PARALLEL-SAFE: tests swap it and MUST NOT call t.Parallel().
+// Unsynchronized because production reads it single-threaded per page.
 var mergeEnrichedLinksFn = mergeEnrichedLinks
 
-// mergeEnrichedLinks combines every link source discovered on a page into a
-// single link list for the frontier, appends synthetic form ObservedRequests
-// to captured, and returns the combined (captured, links) pair. This is the
-// pure, DOM-free portion of enrichFromPage and is directly unit tested.
+// mergeEnrichedLinks is the pure, DOM-free half of enrichFromPage: it merges every
+// link source and appends synthetic form ObservedRequests to captured.
 //
-//   - jsFromResponses/jsFromInline come from jsluice and are routed through
-//     jsExtractedToLinks so asset-only hits (main.js, styles.css) are
-//     dropped before entering the frontier.
-//   - form actions arrive pre-resolved from extractForms (explicit
-//     action= values resolved against baseURL; no-action forms set to
-//     pageURL). Only the asset/streaming filter applies here.
-//   - pageURL is the resolved navigation URL; baseURL is the <base href>-
-//     aware base. Both are passed because forms need page-URL semantics
-//     for PageURL tagging but base-URL semantics for explicit action refs.
-//   - scopeFn filters form actions before they become synthetic
-//     ObservedRequests. Frontier-side links already go through scope
-//     at Push; this protects the captured-append path from
-//     attacker-host form actions on an in-scope page. When scopeFn is
-//     nil, no filtering is applied.
+// Both pageURL and baseURL are needed: forms tag PageURL from the former and
+// resolve explicit action refs against the latter. scopeFn filters form actions,
+// which the frontier's Push-time scope check cannot do because these go straight
+// into captured. Nil scopeFn means no filtering.
 //
-// The returned links slice may contain cross-source duplicates (a URL
-// reached from both a DOM href and a jsluice hit will appear twice).
-// The frontier deduplicates on Push, so callers should not add another
-// dedup layer here.
+// Returned links may hold cross-source duplicates; the frontier dedupes on Push,
+// so do not add another layer.
 func mergeEnrichedLinks(
 	captured []ObservedRequest,
 	domLinks []string,
@@ -1002,19 +885,15 @@ func mergeEnrichedLinks(
 	}
 
 	if len(forms) > 0 {
-		// Scope-enforce form actions before they become synthetic
-		// ObservedRequests. Without this, a <form action="https://attacker/x">
-		// on an in-scope page would flow into captured -> capture.json ->
-		// probes, which would re-request the attacker URL with any
-		// operator-supplied headers attached. (Frontier-side links are
-		// scope-checked at Push; this closes the corresponding gap on the
-		// captured-append side.) f.Action is always absolute per
-		// resolveFormAction; empty Action means the form spec-defaults to
-		// pageURL, which is same-origin by definition — keep those.
+		// Without this, <form action="https://attacker/x"> on an in-scope page
+		// reaches capture.json and then the probe stage, which re-requests it with
+		// the operator's headers attached. Empty Action spec-defaults to pageURL and
+		// is same-origin, so keep those. Everything else is absolute per
+		// resolveFormAction, which is what lets scopeFn judge it — a relative action
+		// would fail parseHTTPURL and be dropped rather than admitted.
 		//
-		// Fast path: nil scopeFn means no filtering; alias `forms` directly
-		// to avoid allocation. Do not mutate scopedForms when scopeFn is nil
-		// — the alias would leak back to the caller's slice.
+		// Nil scopeFn aliases `forms` to avoid an allocation — do NOT mutate
+		// scopedForms in that case, the alias reaches the caller's slice.
 		scopedForms := forms
 		if scopeFn != nil {
 			scopedForms = make([]discoveredForm, 0, len(forms))
