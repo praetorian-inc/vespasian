@@ -5,6 +5,9 @@ End-to-end live tests that spin up intentionally simple target applications, run
 ## Quick Start
 
 ```bash
+# 0. One-time: install the OpenAPI/GraphQL spec validators
+(cd test/spec-validators && npm ci --ignore-scripts)
+
 # 1. Setup: build binaries, resolve ports, start services
 ./test/setup-live-targets.sh
 
@@ -20,7 +23,12 @@ End-to-end live tests that spin up intentionally simple target applications, run
 - **Go 1.27.0+** — [https://go.dev/dl/](https://go.dev/dl/)
 - **Chrome/Chromium** — Required for headless crawling (see below)
 - **python3** — Required for test validation scripts
-- **Node.js** — Required for the graphql-server target
+- **Node.js** — Required for the graphql-server target, and for the parser-backed spec validators in `test/spec-validators/` (LAB-3890 T1). `setup-live-targets.sh` installs the graphql-server dependencies but **not** the validator dependencies — run `(cd test/spec-validators && npm ci --ignore-scripts)` once, or `validate_openapi_structure` fails with `spec-validators deps missing or incomplete`.
+
+Optional, feature-gated at runtime:
+
+- **protoc** (plus `protoc-gen-go` and `protoc-gen-go-grpc`) — only needed to regenerate `grpc-server/labpb/` via its `make proto` target. The AC4 compile check does **not** need it: it compiles the emitted `.proto` in-process (see "No `protoc` required." below), so a host without `protoc` still runs that assertion rather than skipping it.
+- **grpcurl** — used by the preflight reachability check for `grpc-server` (`grpcurl -plaintext <host>:<port> list`); probed with `command -v` and skipped when missing.
 
 ### Chrome in containers
 
@@ -150,10 +158,11 @@ launch, and skips cleanly when no browser is present at all.
 
 | Target | Protocol | Description | Infrastructure |
 |--------|----------|-------------|----------------|
-| rest-api | REST | Custom API with users, products, orders endpoints | Go binary |
+| rest-api | REST | Custom API with users, products, orders endpoints, two JS-`fetch` form POSTs (`/api/login`, `/api/upload`), and one static `<form>` action (`/api/subscribe`) | Go binary |
 | soap-service | SOAP/WSDL | Custom SOAP service with GetUser, ListUsers, CreateUser | Go binary |
 | graphql-server | GraphQL | Apollo Server with queries, mutations, enums, unions, nested types | Node.js |
 | grpc-server | gRPC | Three reflectable gRPC services (UserService, OrderService, AccountService) | Go binary |
+| concat-spa | REST | SPA whose two API paths exist only as JS string concatenations in an external bundle, recoverable only by the concat extractor rather than by link-following (LAB-1368). Backs both the `concat-spa` and `concat-spa-two-stage` test targets | Go binary |
 | forms-target | REST (HTML forms) | Static HTML page whose POST/GET `<form>` endpoints are recovered by `analyze.ExtractForms` (LAB-2109) | Go binary |
 
 ## What the Test Runner Does
@@ -165,10 +174,12 @@ For each target:
 3. **Crawl** — `vespasian crawl <url> --dangerous-allow-private -o capture.json`
 4. **Validate capture** — Check request count and expected URLs
 5. **Generate** — `vespasian generate <type> capture.json -o spec.<ext>`
-6. **Validate spec** — Path/operation coverage, schema structure, no static assets. For `rest-api` and `scan-rest`, this additionally asserts an exact path count (the generated spec has exactly the number of paths the fixture declares — not merely "at least"), that each POST-only form action (`/api/subscribe`) carries a `post` operation and no `get` (`assert_post_get_operations`), and that each urlencoded POST form's input names (`email`, `name`) surface as request-body schema properties under that action's own endpoint (`assert_form_body_fields`) — the same operation- and body-field-level checks documented for `forms-target` below
+6. **Validate spec** — Path/operation coverage, schema structure, no static assets. For `rest-api` and `scan-rest`, this additionally asserts an exact path count (the generated spec has exactly the number of paths the fixture declares — not merely "at least"), that each POST-only form action (`/api/subscribe`) carries a `post` operation and no `get` (`assert_post_get_operations`), and that each urlencoded POST form's input names (`email`, `name`) surface as request-body schema properties under that action's own endpoint (`assert_form_body_fields`) — the same operation- and body-field-level checks documented for `forms-target` below. Both targets additionally pin each declared path's method list, asserting its {get,post} membership against the generated spec (`assert_path_methods`), which is what makes the deliberate two-stage versus scan divergence on `/api/login` and `/api/upload` a tested invariant rather than a documented claim
 7. **Print summary** — Pass/fail status with endpoint counts and durations
 
 > **Why `--dangerous-allow-private`?** All live targets run on `localhost`, which the crawler's SSRF gate treats as a private host. The flag is required on every `vespasian crawl` invocation in this suite; running without it will exit non-zero with `seed URL rejected by frontier ...`. The flag name reflects production-risk semantics — pass it only when you intend to crawl a known-private host (e.g., this suite, or an internal-network assessment).
+
+Steps 3 and 5 describe the generic two-stage shape. Several targets deviate from it: `concat-spa` and `no-download` have their own sections below, `scan-rest` runs single-stage `scan` in place of steps 3 and 5, and `soap-service` generates its WSDL from a synthetic capture the runner builds rather than from the crawl capture. The REST-counts note further down covers what `scan-rest` changes.
 
 For the GraphQL live test (`graphql-server`):
 
@@ -205,12 +216,23 @@ For the JS bundle static-analysis test (`generate-js-static`, offline — no ser
 2. **Assert** the recovered path count matches `js-static/expected-paths.json` and every operation carries `x-vespasian-source: js-bundle`
 3. **Assert opt-out** — re-generating with `--analyze-js=false` yields zero `/api` paths and no `x-vespasian-source` extension
 
+For the concatenated-URL SPA tests (`concat-spa`, `concat-spa-two-stage`):
+
+Both drive the same `concat-spa` server, whose two API endpoints (`/api/users/{id}/orders`, `/api/products/{id}/reviews`) appear only as `String.prototype.concat` / `+`-string expressions with non-literal operands inside an external `app.js`. Neither full path is ever an `<a href>` or a plain string literal, so link-following alone cannot reach them: the concat extractor (Strategy 5) reconstructs them from the bundle text, and `scan` / `generate` additionally probe the reconstructions. Both targets share one fixture (`concat-spa/expected-paths.json`, `total_paths: 2`) and one validation battery (`validate_concat_spec`).
+
+1. **`concat-spa`** — single-stage `vespasian scan`, which runs crawl, JS-replay, and generate in one process. Writes `spec.yaml` only; no capture file is produced.
+2. **`concat-spa-two-stage`** — `vespasian crawl` followed by `vespasian generate rest`. The crawl records the index page and `app.js`, and statically reconstructs all three concat paths, the two real endpoints plus the `/api/missing/` control (`--analyze-js` defaults on); `generate`'s post-crawl JS-replay step (`crawl.ReplayJSExtracted`, gated on `--probe && --analyze-js`, both default true) re-fetches the bundle from the capture's recorded origin and probes those reconstructions, which is what drops the 404 control. This target exists to prove the two-stage workflow reaches parity with `scan` (LAB-3892).
+3. **Both assert** exactly `total_paths` (2) paths survive, and that three paths are absent: the bare receiver literals `/api/users` and `/api/products`, plus the `/api/missing/` subtree. The control path `/api/missing/0/gone` is referenced in `app.js` exactly like the two real ones (`fetch("/api/missing/".concat(x, "/gone"))`), so the extractor *does* reconstruct and probe it — it is dropped because the server answers it 404. Its absence is what proves the 404 filter still works; a regression that kept it would fail the exact-count assertion and `validate_paths_absent` together.
+
+Plain `vespasian crawl` does reconstruct these paths statically — `--analyze-js` defaults on, so the concat extractor runs and the paths enter the capture tagged `static:js-concat`. What `crawl` alone does not do is probe them, so the `/api/missing/0/gone` control survives and the counts will not match the fixture. Reproducing either target by hand therefore needs `scan`, or `crawl` followed by `generate`.
+
 For the HTML form-extraction live test (`forms-target`):
 
 1. **Crawl** the running server (both backends) — it serves one HTML page with POST forms (`/api/login`, `/api/register`, `/api/feedback`) and a GET search form, none of the POST actions backed by a real handler or reachable via a link/fetch
 2. **Generate** at the default confidence — the POST `<form>` endpoints reach the spec ONLY because `analyze.ExtractForms` (LAB-2109) parsed the captured HTML, so their presence is an end-to-end regression guard; `/api/search` is captured directly via its `<a href>` link
 3. **Assert** the form-derived paths in `forms-target/expected-paths.json` are present, each POST endpoint carries a `post` operation, and each urlencoded POST form's input names (`username`, `password`, `csrf_token`, …) surface as request-body schema properties
-4. **Re-generate with `--confidence 0`** and assert the GET search form's query parameters (`q`, `category`) merge onto `/api/search` — a GET form scores 0 confidence and is filtered out at the default threshold, so it needs the lower threshold to surface (multipart/form-data body-field schemas are not inferred, so `/api/feedback`'s fields are intentionally not asserted)
+4. **Re-generate with `--confidence 0`** into `spec-fields.yaml` and assert the GET search form's query parameters (`q`, `category`) merge onto `/api/search` — a GET form scores 0 confidence and is filtered out at the default threshold, so it needs the lower threshold to surface (multipart/form-data body-field schemas are not inferred, so `/api/feedback`'s fields are intentionally not asserted)
+5. **Assert value-blanking** — the hidden-field sentinels seeded in `forms-target/main.go` (`live-test-csrf`, `live-test-token`) must appear in neither generated spec: `ExtractForms` keeps hidden/password/CSRF field *names* and blanks their *values*
 
 For the slug-merging test (`generate-merge-slugs`, offline — no server or browser):
 
@@ -238,11 +260,11 @@ For importer tests:
 
 Options:
   --targets <list>   Comma-separated targets (default: all)
-                     Valid: rest-api,soap-service,graphql-server,grpc-server,
-                            concat-spa,forms-target
+                     Valid: rest-api,soap-service,graphql-server,grpc-server,concat-spa,forms-target
   --skip-start       Only build, don't start services
   --teardown         Stop all running targets and clean up
-  --sweep            With --teardown, also sweep untracked orphans by name/port
+  --sweep            With --teardown, also sweep untracked orphans by
+                     name/port (off by default; can match unrelated processes)
   --help             Show this help message
 ```
 
@@ -426,20 +448,18 @@ for this script.
 The setup script writes `.live-test-config` with resolved ports:
 
 ```
+# Auto-generated by setup-live-targets.sh on <timestamp>
+# Source this or let run-live-tests.sh read it automatically.
 REST_API_PORT=8990
 SOAP_SERVICE_PORT=8991
 GRAPHQL_SERVER_PORT=8992
 GRPC_SERVER_PORT=50051
 CONCAT_SPA_PORT=8993
 FORMS_TARGET_PORT=8994
-TARGETS_SETUP=rest-api,soap-service,graphql-server,grpc-server,concat-spa,forms-target
+TARGETS_SETUP=rest-api,soap-service,graphql-server,grpc-server,concat-spa,concat-spa-two-stage,forms-target
 ```
 
-That is what a **default** `./test/setup-live-targets.sh` writes: all six port keys
-and every member of the setup script's `ALL_TARGETS`. A partial run
-(`--targets <subset>`) writes an empty value for each port it did not configure,
-which is why `load_config` skips empty values rather than treating them as
-invalid.
+That is what a **default** `./test/setup-live-targets.sh` writes: all six port keys, every member of the setup script's `ALL_TARGETS`, and `concat-spa-two-stage` appended after `concat-spa`. That last entry is not an `ALL_TARGETS` member and is never built or started on its own: it is a test that reuses the `concat-spa` server, so the setup script appends it to the run-list it writes here while leaving the server single-instance. A partial run (`--targets <subset>`) writes an empty value for each port it did not configure, which is why `load_config` skips empty values rather than treating them as invalid.
 
 > **`TARGETS_SETUP` is additive, not restrictive.** A bare `./test/run-live-tests.sh`
 > resolves the full `all` group (every `OFFLINE_TARGETS` + `LIVE_TARGETS`).
@@ -471,15 +491,37 @@ Results are saved to `test/.results/` with one subdirectory per test:
 ```
 .results/
 ├── rest-api/
-│   ├── capture.json        # Crawl output
+│   ├── capture-false.json  # net/http backend crawl (the capture spec generation uses)
+│   ├── capture-true.json   # rod/Chrome backend crawl (parity check; absent if Chrome is unavailable)
+│   ├── capture.json        # copy of capture-false.json
 │   └── spec.yaml           # Generated OpenAPI spec
+├── scan-rest/
+│   └── spec.yaml           # Single-stage `scan` of the same server (no capture file)
 ├── soap-service/
-│   ├── capture.json        # Crawl output
+│   ├── capture-false.json  # net/http backend crawl
+│   ├── capture-true.json   # rod/Chrome backend crawl
+│   ├── capture.json        # copy of capture-false.json
 │   ├── soap-capture.json   # Direct SOAP requests
 │   └── spec.xml            # Generated WSDL
 ├── graphql-server/
 │   ├── capture.json        # Live GraphQL traffic
+│   ├── capture-rod.json    # rod/Chrome capture backing the SPA-fetch assertion
 │   └── spec.graphql        # Generated GraphQL SDL
+├── grpc-server/
+│   ├── capture.json        # Synthetic capture seeding the reflection probe
+│   ├── spec.proto          # Generated proto3 from server reflection
+│   └── proto-validate.err  # protocompile stderr; empty on success
+├── concat-spa/
+│   └── spec.yaml           # Single-stage `scan`; 2 concat-derived paths, no capture file
+├── concat-spa-two-stage/
+│   ├── capture.json        # Crawl output; includes app.js and 3 static:js-concat reconstructions (incl. the 404 control)
+│   └── spec.yaml           # The 2 real paths; generate's JS-replay probes the reconstructions and drops the 404 control
+├── forms-target/
+│   ├── capture-false.json  # net/http backend crawl
+│   ├── capture-true.json   # rod/Chrome backend crawl
+│   ├── capture.json        # copy of capture-false.json
+│   ├── spec.yaml           # Default confidence (POST form endpoints)
+│   └── spec-fields.yaml    # --confidence 0 (GET form query params)
 ├── generate-rest/
 │   └── spec.yaml           # OpenAPI spec from reference capture
 ├── generate-wsdl/
@@ -489,6 +531,8 @@ Results are saved to `test/.results/` with one subdirectory per test:
 ├── generate-graphql/
 │   └── spec.graphql        # Deterministic SDL from reference capture
 ├── generate-graphql-imports/
+│   ├── burp-imported.json  # Intermediate capture from Burp XML
+│   ├── har-imported.json   # Intermediate capture from HAR
 │   ├── burp-spec.graphql   # SDL from Burp import
 │   └── har-spec.graphql    # SDL from HAR import
 ├── generate-js-static/
@@ -505,26 +549,35 @@ Results are saved to `test/.results/` with one subdirectory per test:
 │   └── imported.json       # Imported from base64-encoded Burp XML
 ├── import-mitmproxy/
 │   └── imported.json       # Imported from mitmproxy JSON
+├── import-mitmproxy-native/
+│   └── imported.json       # Imported from mitmproxy's native tnetstring .mitm
 ├── import-unicode/
 │   └── imported.json       # Imported from Burp XML with unicode
 ├── import-duplicates/
 │   └── imported.json       # Imported from HAR with duplicate requests
 ├── import-malformed/
-│   └── (empty on success)  # Validates graceful failure on bad input
+│   ├── truncated-burp.xml  # Generated input: truncated XML
+│   ├── invalid-burp.xml    # Generated input: not XML
+│   └── invalid-har.json    # Generated input: broken JSON
+│                           # Imports write to /dev/null — only the inputs remain
 ├── import-empty/
-│   └── imported.json       # Imported from empty Burp/HAR
+│   ├── empty-burp.json     # Imported from empty Burp XML
+│   └── empty-har.json      # Imported from empty HAR
 ├── auth-capture/
 │   └── imported.json       # Authorization header preserved through import (LAB-3890 A5)
 ├── edge-cases/
-│   └── (crawl artifacts)   # Timeout, redirects, HTTP errors, encoding
+│   ├── capture.json        # Timeout, redirects, HTTP errors, encoding
+│   └── spec.yaml           # Spec from the edge-case capture
 ├── crawl-depth/
 │   ├── shallow.json        # Depth-limited crawl
 │   ├── limited.json        # Max-pages-limited crawl
 │   └── loop.json           # Infinite loop detection
 ├── crawl-unreachable/
 │   └── capture.json        # Crawl of unreachable host
-├── ssrf-rejection/
-│   └── (no artifact)       # Asserts SSRF gate rejects a private target (LAB-3890 A4)
+├── no-download/
+│   ├── home/               # Isolated HOME; must contain no chromium-<rev> dir
+│   ├── capture.json        # Crawl performed under that HOME
+│   └── crawl.log           # Crawl output, kept for diagnosis
 ├── classifier-edge/
 │   ├── capture.json        # Synthetic edge case requests
 │   └── spec.yaml           # Spec from classifier edge cases
@@ -532,6 +585,10 @@ Results are saved to `test/.results/` with one subdirectory per test:
     ├── capture.json        # Synthetic edge case requests
     └── spec.yaml           # Spec with UUID/multi-param paths
 ```
+
+`ssrf-rejection` writes nothing and creates no directory — it asserts that `vespasian crawl` rejects `http://127.0.0.1:9` without `--dangerous-allow-private`, with output sent to `/dev/null` (LAB-3890 A4).
+
+Every `capture-true.json` and `capture-rod.json` above is a rod/Chrome capture. `rest-api`, `soap-service`, and `forms-target` crawl with both backends and skip the rod leg with a `[WARN]` when Chrome is unavailable or unlaunchable, so those files are absent on a machine without a usable Chrome. None of those three generates from its rod capture, so those three still pass without Chrome: `rest-api` and `forms-target` generate from the net/http capture, and `soap-service` generates from the synthetic `soap-capture.json` the runner builds instead.
 
 ## Expected Results
 
@@ -576,6 +633,8 @@ All 32 tests should pass. Order is non-deterministic and durations vary by machi
   Total: 32 passed, 0 failed, 0 skipped
 ```
 
+> **Why the three REST targets report different counts.** `generate-rest` is offline: it reads the fixed `rest-api/reference-capture.json` and byte-compares against `rest-api/expected-spec.yaml`, which holds **10** paths, with `/api/login` and `/api/upload` as real POSTs carrying form request bodies (`application/x-www-form-urlencoded` and `multipart/form-data`, added by LAB-2106 form-body parsing and LAB-2109 HTML-form extraction). The two live targets crawl the running server and pick up an eleventh path, `/api/subscribe`, which exists only as a static `<form method="post">` on the index page and reaches the spec through `analyze.ExtractForms` (LAB-3890 T2) — hence **11** for both `rest-api` and `scan-rest`. Those two agree on the path set and on `total_paths`, and deliberately disagree on the *methods* for `/api/login` and `/api/upload`: `rest-api` generates from the non-headless `capture-false.json` leg with `--probe=false`, so no JavaScript executes and the inline `fetch(…, {method:'POST'})` literals are recovered statically as GET candidates. `crawl` itself defaults to `--headless=true` and does run JS, so reproducing this by hand needs the `--headless=false` leg the runner uses; `scan-rest` runs single-stage `scan` with probing on, observes the JS-fired POSTs, and records both paths as GET+POST. `_assert_fixture_parity` in `test/validate_test.sh` pins `rest-api/expected-paths.json` and `rest-api/scan-expected-paths.json` in lockstep on the path set, `total_paths`, `post_form_paths`, and `post_form_body_fields_by_path` — but not on the method lists. The method lists are enforced separately by `assert_path_methods` in `test/form-spec-asserts.sh`, which both live REST targets run, so a regression that flipped either path's classification fails the suite.
+
 Some tests emit warnings (`[WARN]`) for soft behavioral checks. These are informational and do not cause failures.
 
 ## Directory Structure
@@ -587,7 +646,10 @@ test/
 ├── install-chrome.sh        # Provisions a real non-snap Chrome (see "Chrome in containers")
 ├── common.sh                # Shared logging + Chrome detection (detect_chrome_binary)
 ├── validate.sh              # Shared validation functions
+├── form-spec-asserts.sh     # Form operation/body-field assertions
+├── check-docs.py            # Community-health docs guard (LAB-5870)
 ├── README.md                # This file
+├── live-test-gaps.md        # Known coverage gaps
 ├── .live-test-config        # Auto-generated (gitignored)
 ├── .results/                # Test output (gitignored)
 │
@@ -601,18 +663,33 @@ test/
 ├── internal/
 │   └── target/              # Shared bind-host + server-timeout helper for the Go targets
 │
+├── spec-validators/         # Node parser-backed validators (LAB-3890 T1; npm ci)
+│   ├── package.json
+│   ├── package-lock.json
+│   ├── validate-openapi.mjs # Real OpenAPI validation (@apidevtools/swagger-parser)
+│   └── validate-graphql.mjs # Real GraphQL SDL validation (graphql-js)
+│
 ├── rest-api/
 │   ├── main.go              # REST API server
-│   └── expected-paths.json  # Expected paths for validation
+│   ├── reference-capture.json    # Fixed capture for generate-rest
+│   ├── expected-spec.yaml        # Expected OpenAPI for generate-rest (byte comparison)
+│   ├── expected-paths.json       # Expected paths for the two-stage rest-api target
+│   └── scan-expected-paths.json  # Expected paths for the single-stage scan-rest target
 │
 ├── soap-service/
 │   ├── main.go              # SOAP service server
 │   ├── service.wsdl         # WSDL definition
-│   └── expected-paths.json  # Expected operations for validation
+│   ├── reference-capture.json      # Fixed capture for generate-wsdl
+│   ├── expected-spec.xml           # Expected WSDL for generate-wsdl
+│   ├── matrix-capture.json         # Param-extraction matrix capture (SOAP 1.1/1.2, RPC + doc/literal)
+│   ├── matrix-expected-paths.json  # Expected ops for generate-wsdl-matrix
+│   ├── matrix-expected-spec.xml    # Expected WSDL for generate-wsdl-matrix
+│   └── expected-paths.json         # Expected operations for validation
 │
 ├── graphql-server/
 │   ├── server.js            # Apollo Server (GraphQL)
 │   ├── package.json         # Node.js dependencies
+│   ├── package-lock.json
 │   ├── reference-capture.json  # Fixed capture for deterministic tests
 │   ├── test-burp.xml        # Burp XML import test data
 │   ├── test-traffic.har     # HAR import test data
@@ -621,6 +698,10 @@ test/
 │
 ├── grpc-server/
 │   ├── main.go              # gRPC server (UserService, OrderService, AccountService)
+│   ├── doc.go               # Package documentation
+│   ├── Makefile             # run/build/clean plus `proto` codegen for labpb/
+│   ├── README.md            # What the target registers and how to regenerate
+│   ├── labpb/               # Generated protobuf/gRPC stubs
 │   └── expected-paths.json  # Expected services/methods for validation
 │
 ├── proto-validate/          # NESTED MODULE (own go.mod, no workspace) — keeps
@@ -631,17 +712,32 @@ test/
 │   ├── main.go              # Compiles a generated .proto in-process (protocompile); AC4 check
 │   └── main_test.go         # Reject cases + the exit-code contract
 │
+├── concat-spa/
+│   ├── main.go              # SPA whose API paths exist only as JS string concatenations (LAB-1368)
+│   └── expected-paths.json  # Expected concat-derived paths (shared by both concat targets)
+│
 ├── forms-target/
 │   ├── main.go              # HTML forms server (POST/GET <form> endpoints)
 │   └── expected-paths.json  # Expected form-derived paths + query params for validation
 │
+├── js-static/
+│   ├── reference-capture.json  # HTML page + JS bundle for offline generate-js-static
+│   └── expected-paths.json     # Expected JS-bundle-derived paths
+│
 └── fixtures/
+    ├── README.md                         # Fixture provenance and licensing
+    ├── LICENSE.mitmproxy                 # Upstream MIT notice for real-mitmproxy.mitm
+    ├── gen_mitmproxy_native/main.go      # Generator for sample-mitmproxy.mitm
     ├── sample-burp-export.xml            # Burp XML (standard)
     ├── sample-burp-base64.xml            # Burp XML (base64-encoded bodies)
     ├── sample-burp-unicode.xml           # Burp XML (unicode content)
     ├── sample-capture.har                # HAR file (standard)
+    ├── sample-auth.har                   # HAR with an Authorization header (auth-capture)
     ├── sample-har-duplicates.json        # HAR file (duplicate requests)
     ├── sample-mitmproxy.json             # mitmproxy JSON export
+    ├── sample-mitmproxy.mitm             # mitmproxy native tnetstring stream
+    ├── real-mitmproxy.mitm               # Vendored from mitmproxy upstream (MIT); bytes written by mitmproxy itself
+    ├── merge-slugs-capture.json          # Slug + numeric-ID siblings (generate-merge-slugs)
     ├── malformed-burp.xml                # Malformed Burp XML
     ├── malformed-har.json                # Malformed HAR file
     ├── empty-burp.xml                    # Empty Burp XML
@@ -656,6 +752,8 @@ test/
     ├── expected-mitmproxy-capture.json   # Expected: mitmproxy capture
     └── expected-empty-capture.json       # Expected: empty capture
 ```
+
+> **Reading the `expected-*-capture.json` fixtures:** the `query_params` field is multi-value (`map[string][]string`) from LAB-2110 onward, so every value is a JSON array — e.g. `"sort": ["price", "name"]`, and single-value params as `"category": ["electronics"]`. Capture files produced before LAB-2110 used the old single-value `map[string]string` shape and are not comparable byte-for-byte.
 
 ## Troubleshooting
 
@@ -707,6 +805,14 @@ exec can take longer, which surfaces as a spurious `Found <path> but it is not
 runnable`. Set `CHROME_PROBE_TIMEOUT` (seconds, fractions allowed) to widen
 the budget: `CHROME_PROBE_TIMEOUT=10 ./test/setup-live-targets.sh`.
 
+### `spec-validators deps missing or incomplete`
+
+The Node validators in `test/spec-validators/` are not installed, or an interrupted `npm ci` left `node_modules` present but unusable. `setup-live-targets.sh` does not install them — do it directly:
+
+```bash
+(cd test/spec-validators && npm ci --ignore-scripts)
+```
+
 ### Crawl produces empty capture
 
 Ensure the target service is running and healthy. Run the check from the host that started the services (`setup-live-targets.sh` binds to localhost there):
@@ -724,6 +830,15 @@ The seed URL is a private host (`localhost`, `127.0.0.1`, RFC1918, or link-local
 ```bash
 ./bin/vespasian crawl http://localhost:8990 --dangerous-allow-private \
     -o /tmp/cap.json --depth 2 --max-pages 50
+```
+
+### `concat-spa` by hand keeps the 404 control path
+
+`vespasian crawl` alone does not run JS-replay, so the concat-derived paths enter the capture unprobed and the 404 control is never filtered out. Reproduce with `scan`, or with `crawl` followed by `generate` (whose JS-replay step probes them):
+
+```bash
+./bin/vespasian scan http://localhost:8993 --api-type rest \
+    --dangerous-allow-private -o /tmp/spec.yaml
 ```
 
 ### Build failures
