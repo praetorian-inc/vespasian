@@ -1920,6 +1920,38 @@ else
             pass "every script live-tests.yml direct-execs is committed 100755 ($(wc -l <<< "$direct_exec_scripts") scripts checked)"
         fi
     fi
+    # SIGPIPE under `set -o pipefail` makes a guard report the OPPOSITE of what it
+    # measured. `grep -q` exits the instant it matches, closing the pipe; printf's
+    # next write takes EPIPE and returns 1; pipefail promotes that to the PIPELINE's
+    # status; and a leading `!` or a trailing `||` then reads "matched" as "did not
+    # match". It is a race between the reader exiting and printf draining, so it is
+    # intermittent rather than a clean size cutoff.
+    #
+    # MEASURED in run 33405732303 on head 47685bb: the yq-less step's
+    # `printf | grep -qE "$yqpat"` matched at byte 9763 of a 31933-byte output,
+    # printf logged `write error: Broken pipe`, and the step died with "produced no
+    # 'yq is required' diagnostic" -- while 40 such diagnostics sat in the log it had
+    # just printed. 500 local trials of the identical command reproduced it 0 times.
+    # That is why prose cannot hold this: live-tests.yml ALREADY carried a measured
+    # comment prescribing the herestring, and five other sites in the same file kept
+    # the broken form regardless. Asserted mechanically instead.
+    #
+    # `head -N` is the same class -- it exits after N lines and upstream takes the
+    # EPIPE -- so it is matched too. Whole-line comments are stripped first, because
+    # the explanatory comment in live-tests.yml necessarily names the bad idiom. The
+    # pattern uses [|] rather than \| because `awk -v` processes escapes in the
+    # value: `\|` would arrive as a bare `|`, turning the regex into an alternation
+    # that matches nearly every line and making this a permanent false FAIL.
+    sigpipe_re='printf.*[|].*(grep([[:space:]]+-[a-zA-Z]+)*[[:space:]]+-[a-zA-Z]*q|head[[:space:]]+-)'
+    sigpipe_hits=$(awk -v r="$sigpipe_re" '
+        { line = $0; sub(/^[[:space:]]+/, "", line)
+          if (line ~ /^#/) next
+          if ($0 ~ r) printf "%d ", NR }' "$WORKFLOW")
+    if [[ -n "${sigpipe_hits// /}" ]]; then
+        fail "live-tests.yml pipes printf into an early-exiting reader (grep -q / head -N) at line(s) ${sigpipe_hits}-- under 'set -o pipefail' the reader exits on its first match, printf takes SIGPIPE, and the pipeline's non-zero status INVERTS the guard's verdict. Measured in run 33405732303: 40 yq-attributed FAILs were read as zero and the step reported the opposite. Use a herestring: grep -q PATTERN <<< \"\$out\""
+    else
+        pass "live-tests.yml feeds no printf into an early-exiting reader (the SIGPIPE-under-pipefail verdict-inversion class)"
+    fi
 
     # The per-suite/continue-on-error/if: checks below all operate on
     # the preflight-selftest JOB BLOCK, which by construction starts after the
@@ -1954,17 +1986,24 @@ else
     # removed or altered key is a mismatch. sort_keys makes it order-independent so
     # a benign reformat cannot trip it.
     #
-    # If you INTENTIONALLY change the trigger, update EXPECTED_PR_TRIGGER below and
+    # If you INTENTIONALLY change the trigger, update EXPECTED_TRIGGERS below and
     # say why in the commit — that edit is exactly the review moment this pin exists
     # to force.
-    EXPECTED_PR_TRIGGER='{"branches":["main"],"types":["opened","synchronize","reopened","labeled","unlabeled"]}'
-    actual_pr_trigger="$(yq_query '.on.pull_request | sort_keys(..)' -o=json -I=0)"
-    case "$actual_pr_trigger" in
-        __NO_YQ__) fail_no_yq "live-tests.yml's pull_request trigger shape" ;;
-        __YQ_ERROR__) fail_yq_error "live-tests.yml's pull_request trigger shape" ;;
-        "$EXPECTED_PR_TRIGGER")
-            pass "live-tests.yml's pull_request trigger carries no paths/paths-ignore narrowing, so a shell-only PR still runs the un-gated guard suites (branches and types are expected and are part of EXPECTED_PR_TRIGGER)" ;;
-        *)  fail "live-tests.yml's pull_request trigger shape changed: expected ${EXPECTED_PR_TRIGGER}, got ${actual_pr_trigger} — a paths/paths-ignore narrowing switches off every un-gated guard suite for the PRs they exist to police, and dropping a types entry (labeled/unlabeled) stops a label change re-evaluating the gate; if the change is deliberate, update EXPECTED_PR_TRIGGER" ;;
+    # Pins the WHOLE `on:` node, not just `.on.pull_request`. It was the pull_request
+    # subtree alone, which left `.on.push` readable by nothing in this file — measured:
+    # deleting the `push:` block left the suite at 195/0 while install-chrome-e2e's
+    # push-to-main arm became unreachable, i.e. exactly the coverage the `e2e_if=` field
+    # further down was added to protect, defeated one level up. Widening to the whole node
+    # closes `push` and `workflow_dispatch` in the same outcome at no extra assertion, which
+    # is what the comment above already argues for: complete by construction.
+    EXPECTED_TRIGGERS='{"pull_request":{"branches":["main"],"types":["opened","synchronize","reopened","labeled","unlabeled"]},"push":{"branches":["main"]},"workflow_dispatch":null}'
+    actual_triggers="$(yq_query '.on | sort_keys(..)' -o=json -I=0)"
+    case "$actual_triggers" in
+        __NO_YQ__) fail_no_yq "live-tests.yml's on: node" ;;
+        __YQ_ERROR__) fail_yq_error "live-tests.yml's on: node" ;;
+        "$EXPECTED_TRIGGERS")
+            pass "live-tests.yml's whole on: node matches its pin — pull_request with no paths/paths-ignore narrowing so a shell-only PR still runs the un-gated guard suites, push restricted to main, and workflow_dispatch present" ;;
+        *)  fail "live-tests.yml's on: node changed: expected ${EXPECTED_TRIGGERS}, got ${actual_triggers} — a paths/paths-ignore narrowing under pull_request switches off every un-gated guard suite for the PRs they exist to police; dropping a types entry (labeled/unlabeled) stops a label change re-evaluating the gate; and losing or retargeting push:branches[main] makes install-chrome-e2e unreachable (the only automated coverage of install-chrome.sh's privileged path) and stops the main-push runs the harden-runner allowlist provenance is derived from. If the change is deliberate, update EXPECTED_TRIGGERS" ;;
     esac
 
     # The test job's OWN gate. The per-step if: check further below asks
@@ -2633,6 +2672,533 @@ TIMEOUT_STUB
 fi
 
 echo ""
+echo "=== harden-runner egress policy ==="
+# LAB-6015 flipped the five policy-carrying jobs in live-tests.yml from
+# `egress-policy: audit` to `block` with a per-job allowlist. This block is what
+# stops that from being silently undone.
+#
+# It compares each job's policy against a PINNED EXPECTATION below rather than
+# checking its shape, because the first version of this guard checked shape —
+# "is the value `block`, are there one or more endpoints" — and eight mutations
+# walked straight through it: an allowlist collapsed to `*:443` (one entry, so it
+# passed), an extra endpoint added, a SECOND harden-runner step on `audit` in the
+# same job, `if: false` on the step so the policy never installs, the step moved
+# below checkout so it polices nothing before it, a changed SHA, a look-alike
+# action name, and a deleted `disable-sudo: true`. Each left the suite at 141/0,
+# exit 0. Comparing an exact normalised value makes every one of those a
+# mismatch, because they all change the value and none of them changes the shape.
+#
+# That last sentence is MEASURED, not argued — but by hand, and there is no
+# standing mutation test that would fail if it stopped being true. The full run
+# (these eight, plus the two the shape check did already catch) is recorded with
+# the EXPECTED_ASSERTIONS pin at the bottom of this file. Re-run it by hand when
+# this block or hr_policy() changes.
+#
+# EXPECTED_HR_JOBS is HARDCODED, deliberately, and this is the second half of the
+# fix. The first version derived the job list from the workflow, which meant a
+# job that should carry the step but does not was invisible (check-label is the
+# live example), and DELETING a step removed an assertion instead of failing one
+# — so the only signal was the accounting pin at the bottom of this file, whose
+# message reads "a case was added or removed without updating
+# EXPECTED_ASSERTIONS", i.e. it instructs the maintainer to bump the pin and turn
+# a removed egress control green. Iterating a constant list fails the named job
+# instead, and keeps this block's counted-outcome total CONSTANT — the derived
+# version emitted six outcomes with yq and one without, so EXPECTED_ASSERTIONS
+# was wrong on any host lacking yq (measured: 136 against a pin of 141, where
+# base was exact at 135).
+#
+# Changing a job's egress policy therefore means editing this table. That is the
+# point: LAB-6015's AC6 asks for a job leaving `block` to be RECORDED rather than
+# silent, and editing the pin is the recording.
+EXPECTED_HR_JOBS=(preflight-selftest validator-regression docs-check integration-tests test)
+
+# The three devcontainer jobs LAB-5766 added carry harden-runner in `audit`, not `block`,
+# and that is deliberate rather than an oversight — it is the case AC6 of LAB-6015 exists
+# for ("if any job cannot be flipped, the reason is recorded and that job keeps `audit`
+# EXPLICITLY rather than silently"). They cannot be flipped in this PR because AC2 requires
+# every allowlist to be derived from harden-runner telemetry of real runs, and these three
+# have none yet: they landed on main after this branch's six source runs were captured, and
+# a docker/devcontainer build's egress set is exactly the kind that must be measured rather
+# than guessed. Flipping them blind would either break the build or produce a folklore
+# allowlist — the thing AC2 was written to prevent.
+#
+# Pinned as audit ANYWAY, so the state is explicit in BOTH directions: a silent flip to
+# `block` and a silent removal of the step each fail. Deriving their allowlists is tracked
+# on LAB-6015's AC6 note.
+EXPECTED_AUDIT_JOBS=(devcontainer-changes devcontainer-image devcontainer-image-arm64)
+
+# One entry per job above, and the value is the whole policy: the pinned action,
+# the egress mode, disable-sudo, whether the step carries an `if:`, whether
+# harden-runner is the job's FIRST step, the job's `runs-on`, whether the step is
+# marked `continue-on-error`, and the allowlist as a sorted set.
+#
+# `runs=` and `coe=` were added in review of this PR, both measured MISSED first.
+# `runs-on` matters because harden-runner only enforces on Linux GitHub-hosted
+# runners: switching a job to `macos-14` leaves every other field byte-identical
+# and the policy simply does not apply — `block` degrades to nothing, job green.
+# `continue-on-error: true` on the harden-runner step was caught for three of the
+# five jobs by the un-gated-job guards further up, but NOT for docs-check or
+# integration-tests, which those guards do not cover; folding it in here makes the
+# coverage uniform across all five rather than incidental.
+# hr_policy() below builds the same string from the workflow with one yq call.
+HR_PIN='step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920'
+# The two gated jobs legitimately carry a job-level `if:`; the three un-gated guard jobs
+# must not. So `jobif` is pinned per job by VALUE rather than as a blanket absence — the
+# same reasoning as the shell-override pin below, where one job's override is required.
+GATED_JOB_IF="needs.check-label.outputs.should-run == 'true'"
+hr_expected() {
+    local endpoints jobif needs usesset
+    case "$1" in
+        preflight-selftest)   endpoints='github.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='false:' ; needs='' ; usesset='actions/checkout,step-security/harden-runner' ;;
+        validator-regression) endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='false:' ; needs='' ; usesset='actions/checkout,actions/setup-node,step-security/harden-runner' ;;
+        docs-check)           endpoints='github.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='false:' ; needs='' ; usesset='actions/checkout,step-security/harden-runner' ;;
+        integration-tests)    endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,proxy.golang.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,sum.golang.org:443' ; jobif="true:$GATED_JOB_IF" ; needs='check-label' ; usesset='actions/checkout,actions/setup-go,step-security/harden-runner' ;;
+        test)                 endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,proxy.golang.org:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,sum.golang.org:443' ; jobif="true:$GATED_JOB_IF" ; needs='check-label,preflight-selftest' ; usesset='actions/checkout,actions/setup-go,actions/setup-node,actions/upload-artifact,step-security/harden-runner' ;;
+        *) printf '%s\n' '<no expectation pinned>'; return 0 ;;
+    esac
+    printf 'first=true runs=ubuntu-24.04 container=false services=false jobcoe=false jobif=%s needs=%s usesset=%s || uses=%s policy=block sudo=true if=false coe=false eptype=!!str withkeys=allowed-endpoints,disable-sudo,egress-policy endpoints=%s\n' "$jobif" "$needs" "$usesset" "$HR_PIN" "$endpoints"
+}
+
+# The observed counterpart. Built with ONE yq call so each job costs exactly one
+# counted outcome on every path, yq present or absent.
+#
+# `[.with."allowed-endpoints"] | flatten | join(" ")` rather than `split` on the
+# raw value: the previous version called `split(" ")` directly, which type-errors
+# on a SEQUENCE-valued allowed-endpoints ("cannot split !!seq") and routed a
+# perfectly parseable workflow into fail_yq_error's "the workflow is broken"
+# wording. Wrapping in a list and flattening accepts a scalar and a sequence
+# alike. The `sub("\s+"; " ")` then collapses the newline a `>` block scalar
+# leaves on its last element, which a plain space-split silently carried into the
+# endpoint name.
+#
+# BUT accepting both shapes is not the same as ACCEPTING both shapes as equal, and
+# the first version of this fix conflated them: a block sequence of the same
+# entries normalised to a string byte-identical to the pin, so rewriting a list as
+# a YAML sequence passed (measured: 141/0), where the pre-fix `split(" ")` had
+# type-errored into a counted FAIL. That is a coverage regression dressed as a bug
+# fix. `eptype=` restores the distinction by pinning the NODE TYPE alongside the
+# entries: the folded scalar every job uses is `!!str`, a sequence is `!!seq`, and
+# only the former matches. The shape matters because harden-runner takes a string
+# input — a sequence is not an equivalent spelling of the same policy.
+hr_policy() {
+    local job=$1
+    yq_query "\"first=\" + ((.jobs.\"${job}\".steps[0].uses // \"\") | test(\"step-security/harden-runner\") | tostring)
+      + \" runs=\" + ((.jobs.\"${job}\".\"runs-on\" // \"<unset>\") | tostring)
+      + \" container=\" + ((.jobs.\"${job}\" | has(\"container\")) | tostring)
+      + \" services=\" + ((.jobs.\"${job}\" | has(\"services\")) | tostring)
+      + \" jobcoe=\" + ((.jobs.\"${job}\".\"continue-on-error\" // false) | tostring)
+      + \" jobif=\" + ((.jobs.\"${job}\" | has(\"if\")) | tostring) + \":\" + ((.jobs.\"${job}\".\"if\" | tostring))
+      + \" needs=\" + (([.jobs.\"${job}\".needs] | flatten | map(select(. != null)) | sort | join(\",\")))
+      + \" usesset=\" + (([.jobs.\"${job}\".steps[] | select(.uses) | (.uses | sub(\"@.*\"; \"\"))] | sort | join(\",\")))
+      + \" || \" + ([.jobs.\"${job}\".steps[] | select((.uses // \"\") | test(\"step-security/harden-runner\"))]
+        | map(\"uses=\" + (.uses // \"<none>\")
+            + \" policy=\" + (.with.\"egress-policy\" // \"<unset>\")
+            + \" sudo=\" + ((.with.\"disable-sudo\" // \"<unset>\") | tostring)
+            + \" if=\" + ((has(\"if\")) | tostring)
+            + \" coe=\" + ((.\"continue-on-error\" // false) | tostring)
+            + \" eptype=\" + (.with.\"allowed-endpoints\" | type)
+            + \" withkeys=\" + ([.with | keys | .[]] | sort | join(\",\"))
+            + \" endpoints=\" + ([.with.\"allowed-endpoints\"] | flatten | join(\" \") | sub(\"\s+\"; \" \") | split(\" \") | map(select(. != \"\")) | sort | join(\",\")))
+        | join(\" ;; \"))" -r
+}
+
+if [[ ! -f "$WORKFLOW" ]]; then
+    fail "live-tests.yml not found at $WORKFLOW (harden-runner egress assertions vacuous)"
+    for _ in "${EXPECTED_HR_JOBS[@]}"; do
+        fail "harden-runner policy for a pinned job could not be checked: $WORKFLOW is missing"
+    done
+    # Keep this arm's counted-outcome total equal to the `else` arm's. The else emits FOURTEEN:
+    # five per-job policy pins, the carrying-jobs set, the full job set, the AC3 step, the
+    # exemption rationale, and the workflow-shape (shell / permissions / env) pin. This arm
+    # emits the "not found" line above plus five per-job pads, so it owes eight more —
+    # which is why the hr_pad loop below has eight entries. Count the loop, not this
+    # sentence: it has been wrong three times now (rounds 2, 8, and again when the
+    # LAB-5766 merge added the three audit-job pins and the AC5 guard).
+    #
+    # Adding a check to the else without a pad here is what silently unbalanced it in review
+    # round 2, and again in round 8 — the second time the count was right and only this
+    # comment was stale, which is its own defect in a file whose audit trail IS these
+    # MEASURED annotations. Re-measure both arms when you touch either.
+    #
+    # This makes THIS SECTION constant, not the file. With the workflow absent the whole
+    # suite still comes up short of its pin — 173 outcomes against 253, MEASURED at this
+    # head — because three other blocks (at the `if [[ -f "$WORKFLOW" ]]` guards further up
+    # and down this file) have no else arm and emit nothing. That imbalance predates this
+    # ticket and is not LAB-6015's to fix; stated here so the next reader does not take a
+    # balanced section for a balanced suite. Those two figures are a measurement, not a pin,
+    # and will drift as the suite grows — re-measure rather than trusting them. Only
+    # EXPECTED_ASSERTIONS at the bottom of this file is self-enforcing.
+    for hr_pad in "the set of jobs carrying harden-runner" "the full job set" "the AC3 enforcement step and the exemption rationale" "the workflow-shape pin (shell overrides, permissions, env)" "devcontainer-changes's audit policy" "devcontainer-image's audit policy" "devcontainer-image-arm64's audit policy" "the AC5 stale-comment guard"; do
+        fail "${hr_pad} could not be checked: $WORKFLOW is missing"
+    done
+else
+    for hr_job in "${EXPECTED_HR_JOBS[@]}"; do
+        hr_want=$(hr_expected "$hr_job")
+        hr_got=$(hr_policy "$hr_job")
+        case "$hr_got" in
+            __NO_YQ__)    fail_no_yq "${hr_job}'s harden-runner egress policy" ;;
+            __YQ_ERROR__) fail_yq_error "${hr_job}'s harden-runner egress policy" ;;
+            *)
+            # Literal [[ == ]] with the right side quoted. NOTE, because an earlier
+            # review round got this wrong and the wrong version was briefly documented here:
+            # the `case "$hr_got" in "$hr_want")` form this replaced was ALREADY literal. A
+            # quoted expansion in a case pattern does not glob — measured in bash 5.2.21,
+            # `case "$got" in "$want")` does not match when $want holds
+            # `*.blob.core.windows.net:443` and $got holds the `evil.` variant, while the
+            # UNQUOTED `in $want)` does. The review probe that "proved" a glob had used the
+            # unquoted form, which is not what the code did. So this conversion is
+            # behaviour-identical, kept only because `[[ == ]]` makes the literal intent
+            # unmistakable at the call site rather than depending on the reader knowing that
+            # rule. It fixes no defect, and there was none.
+                if [[ "$hr_got" == "$hr_want" ]]; then
+                    pass "${hr_job} harden-runner policy matches the pin (block, sudo, no step if:, first step, exact allowlist, plus the job shape that decides whether the policy applies at all or whether the job runs at all: runs-on, no container:, no services:, job-level continue-on-error, job-level if: by presence AND value, needs:, the set of actions the job uses, and the exact with: key set)"
+                else
+                    # Rendered ONE FIELD PER LINE, not as two 600-character strings. The
+                    # pin now compares fourteen fields per job and the old output put them on
+                    # a single line, so a one-token drift — `needs=check-label` to `needs=` —
+                    # was a byte-diff a reader had to find by eye between a quoted `if:`
+                    # expression and a comma-joined action list. Two review lanes independently
+                    # called that the failure people bump the pin to silence rather than
+                    # investigate. `sed` on a herestring, not a pipe: this file has a
+                    # pipefail/SIGPIPE history on large inputs.
+                    # `[a-z0-9_][a-z0-9_]*=` and not `[a-z0-9_]*=`: the star form matches the
+                    # EMPTY name, so it split on the bare ` =` inside the gated jobs' `if:`
+                    # expression (`== 'true'`) and broke one field across two lines.
+                    # awk, not sed: `\n` on the RIGHT-hand side of a sed `s///` is a GNU extension, and
+                    # BSD/macOS sed substitutes a literal `n` — so on the platform AGENTS.md says these
+                    # scripts are AUTHORED on, the sed form rendered the fourteen fields as one line with
+                    # `n        needs=` at each boundary: noisier than the single line it replaced, and the
+                    # opposite of what this change is for. awk's `\n` in a replacement is POSIX. Same
+                    # reason `shasum -a 256` sits beside `sha256sum` further down.
+                    hr_want_lines=$(awk '{gsub(/ [a-z0-9_]+=/, "\n        &")}1' <<< "$hr_want")
+                    hr_got_lines=$(awk '{gsub(/ [a-z0-9_]+=/, "\n        &")}1' <<< "$hr_got")
+                    fail "${hr_job} harden-runner policy does not match the pin. Any of these lands here: the egress policy leaving 'block'; a second harden-runner step; a changed action SHA; a dropped disable-sudo; a widened allowlist or a changed allowed-endpoints node type; a fourth with: input; a step-level if: or continue-on-error; a moved step; or — the job-shape half — a changed runs-on, a container: or services: key, a job-level continue-on-error or if:, a changed needs:, or an action added to or removed from the job. Update this file's pin deliberately if the change is intended.
+        want:${hr_want_lines}
+        got: ${hr_got_lines}"
+                fi ;;
+        esac
+    done
+
+    # The pin above says which jobs MUST carry the policy; this says no OTHER job
+    # may. A sixth job appearing with harden-runner is not covered by a pin, so it
+    # would otherwise be unchecked — the mirror image of the check-label gap that
+    # the derived job list had.
+    hr_actual=$(yq_query '[.jobs | to_entries[] | select([.value.steps[]? | select((.uses // "") | test("step-security/harden-runner"))] | length > 0) | .key] | sort | join(" ")' -r)
+    # ...but that query only sees jobs that ALREADY carry harden-runner, so a NEW
+    # job added WITHOUT one is invisible to it: measured, appending a job whose
+    # only step is `run: curl ...` left this suite at 141/0 and shipped a job with
+    # unrestricted egress. Pinning the FULL job list closes that direction. Every
+    # new job now forces a decision — carry the policy and join EXPECTED_HR_JOBS,
+    # or have its exemption recorded here. The two standing exemptions are
+    # install-chrome-e2e (a CONTAINER job; the action does not support those) and
+    # check-label (one inline bash gate, no checkout, no network).
+    EXPECTED_ALL_JOBS=(check-label devcontainer-changes devcontainer-image devcontainer-image-arm64 docs-check install-chrome-e2e integration-tests preflight-selftest test validator-regression)
+    all_actual=$(yq_query '[.jobs | keys | .[]] | sort | join(" ")' -r)
+    all_pinned=$(printf '%s\n' "${EXPECTED_ALL_JOBS[@]}" | sort | tr '\n' ' ' | sed 's/ $//')
+    case "$all_actual" in
+        __NO_YQ__)    fail_no_yq "the full set of jobs in live-tests.yml" ;;
+        __YQ_ERROR__) fail_yq_error "the full set of jobs in live-tests.yml" ;;
+        *)
+            if [[ "$all_actual" == "$all_pinned" ]]; then
+                pass "the job set is exactly the pinned ${#EXPECTED_ALL_JOBS[@]} (${all_pinned})"
+            else
+                fail "live-tests.yml's job set has changed — pinned '${all_pinned}', found '${all_actual}'. A new job must either carry harden-runner (add it to EXPECTED_HR_JOBS and hr_expected), keep recorded audit (EXPECTED_AUDIT_JOBS), or have its exemption recorded in EXPECTED_ALL_JOBS' comment. A job that went away needs the removal recorded here."
+            fi ;;
+    esac
+    # BLOCK jobs plus AUDIT jobs: every job that carries the step at all. Keeping the two
+    # arrays separate is what makes a silent audit<->block flip a per-job policy failure
+    # rather than an invisible reshuffle inside one combined set.
+    hr_pinned_sorted=$(printf '%s\n' "${EXPECTED_HR_JOBS[@]}" "${EXPECTED_AUDIT_JOBS[@]}" | sort | tr '\n' ' ' | sed 's/ $//')
+
+    # The AC3 runtime proof is the only assertion in the repo that tests egress
+    # ENFORCEMENT rather than the YAML that describes it, and it shipped unpinned:
+    # measured, deleting the whole step left this suite green. It is now a COMMITTED
+    # SCRIPT, so this pin is one exact invocation string plus its position.
+    #
+    # WHY THE PIN LOOKS LIKE THIS. The probe used to be inline shell, and pinning
+    # inline shell from here failed five review rounds running. Each round closed the
+    # measured bypass and left an adjacent one, because a text pin over free-form shell
+    # cannot be exhaustive. Everything below kept the suite green AND left the step
+    # exiting 0: a bare `exit 0`; an `if false` wrapper; an argument-less `exit`
+    # appended to the `set` line (the count pattern required whitespace after `exit`);
+    # two exits on one line (`grep -c` counts lines, not occurrences); ` && false`
+    # appended to the probe (the first-op glob only anchored the line prefix); a `#`
+    # inside a string ahead of `; exit 0` (the comment strip has no notion of quoting);
+    # and a trailing `# exit 1` comment. Extracting the body removes the whole class:
+    # there is no free-form shell left in the workflow to pattern-match.
+    #
+    # `shell=` is pinned because the invocation string alone was not enough. Measured:
+    # `shell: cat {0}` leaves the run value byte-identical, so the pin stayed green while
+    # the runner merely CAT-ed the script and exited 0 — the only runtime enforcement check
+    # permanently no-op, job green, suite 144/0. `shell: bash -n {0}` and `shell: python3
+    # {0}` are the same bypass in shapes a reviewer might wave through, and both were
+    # measured. Nothing else in this file reads `shell:`. `if:` and `continue-on-error:`
+    # need no entry here — the un-gated-job guards above already catch both on this job,
+    # measured at 141/2 each.
+    #
+    # RESIDUAL, narrowed twice. The probe calls and hosts are pinned by grep just below,
+    # and the script's BEHAVIOUR is pinned by executing it against a stub `curl` in three
+    # scenarios after that — so an inverted condition and a no-op'd body both fail now,
+    # each measured. What remains unpinned is everything the three scenarios do not
+    # distinguish: the log wording, the timeout value, and any behaviour that depends on a
+    # real network rather than the stub's exit code. Content-pinning the whole file is
+    # still deliberately not done, because a digest fails on every comment edit; this file
+    # likewise pins that preflight-selftest INVOKES its four guard suites, never what they
+    # contain. `bash -n` in the un-gated syntax-check step covers syntax.
+    # AGENTS.md records the same reasoning for test/assert-chrome-install.sh.
+    ac3_got=$(yq_query '"preflight=" + ("last=" + (((.jobs."preflight-selftest".steps[-1].name) // "") == "Assert egress policy enforces (AC3)" | tostring)
+      + " shell=" + ([.jobs."preflight-selftest".steps[] | select(.name == "Assert egress policy enforces (AC3)") | (.shell // "<default>")] | join(""))
+      + " run=" + (([.jobs."preflight-selftest".steps[] | select(.name == "Assert egress policy enforces (AC3)") | .run] | join("")) | sub("\s+$"; "")))
+      + " validator=" + ("last=" + (((.jobs."validator-regression".steps[-1].name) // "") == "Assert egress policy enforces (AC3)" | tostring)
+      + " shell=" + ([.jobs."validator-regression".steps[] | select(.name == "Assert egress policy enforces (AC3)") | (.shell // "<default>")] | join(""))
+      + " run=" + (([.jobs."validator-regression".steps[] | select(.name == "Assert egress policy enforces (AC3)") | .run] | join("")) | sub("\s+$"; "")))' -r)
+    ac3_want='preflight=last=true shell=<default> run=./test/assert-egress-enforced.sh validator=last=true shell=<default> run=./test/assert-egress-enforced.sh'
+    # The script's BODY is checked too — the two probe calls and the two hostname
+    # assignments — the same way and for the same reason install-chrome-e2e's render
+    # assertion is checked above: grep the file, comments stripped, for the invocations it
+    # exists to make. An earlier version of the residual note below cited that block as
+    # PRECEDENT FOR NOT checking a script's contents, which was backwards: that block does
+    # exactly this. Two invocations rather than a whole-body digest, because a digest fails
+    # on every comment edit while these four lines ARE the assertion — delete or retype one
+    # and the step becomes a no-op that still exits 0.
+    ac3_body=no
+    if [[ -f "$SCRIPT_DIR/assert-egress-enforced.sh" ]]; then
+        ac3_src=$(grep -vE '^[[:space:]]*#' "$SCRIPT_DIR/assert-egress-enforced.sh" || true)
+        ac3_p=$(printf '%s\n' "$ac3_src" | grep -cE 'curl .*"\$UNLISTED_URL"' || true)
+        ac3_c=$(printf '%s\n' "$ac3_src" | grep -cE 'curl .*"\$CONTROL_URL"' || true)
+        ac3_h=$(printf '%s\n' "$ac3_src" | grep -cE '^(UNLISTED_URL="https://proxy\.golang\.org/"|CONTROL_URL="https://github\.com/")$' || true)
+        [[ "$ac3_p" == 1 && "$ac3_c" == 1 && "$ac3_h" == 2 ]] && ac3_body=yes
+    fi
+    case "$ac3_got" in
+        __NO_YQ__)    fail_no_yq "the AC3 egress-enforcement step" ;;
+        __YQ_ERROR__) fail_yq_error "the AC3 egress-enforcement step" ;;
+        *)
+            if [[ "$ac3_got" == "$ac3_want" && "$ac3_body" == "yes" ]]; then
+                pass "AC3 enforcement step is last in preflight-selftest and validator-regression, invokes test/assert-egress-enforced.sh, and that script still makes both probe calls against both pinned hosts"
+            else
+                fail "the AC3 egress-enforcement step no longer matches its pin — deleted, renamed, moved off the end of preflight-selftest or validator-regression, or pointed at something other than test/assert-egress-enforced.sh. This is the only runtime check that block mode actually ENFORCES; the policy pin above only checks what the YAML says. Restore it, or record the decision to drop it here deliberately, or the script stopped making both probe calls against both pinned hosts (body=${ac3_body}).
+        want: ${ac3_want}
+        got:  ${ac3_got}"
+            fi ;;
+    esac
+
+
+    # A `defaults.run.shell` override defeats EVERY run: step in one place, so pin its
+    # absence. The AC3 pin above reads the STEP's own `shell:` key, and GitHub also honours
+    # `defaults.run.shell` at workflow level and at job level, neither of which appears on
+    # the step. Measured: adding three lines at the top of the file —
+    #
+    #     defaults:
+    #       run:
+    #         shell: cat {0}
+    #
+    # left the AC3 pin reading `shell=<default>`, every other assertion untouched, and the
+    # suite green at 194/0 — while every `run:` in the workflow became `cat <file>`. That is
+    # all four guard suites AND the AC3 enforcement proof turned into no-ops at once, with
+    # the job still green. It is a strictly wider bypass than the per-step `shell:` this
+    # file already pins, and it was invisible to every existing check.
+    #
+    # `env` and `defaults.run` render through `tojson(0)` rather than a hand-rolled
+    # `key=value` join, because the join was delimiter-injectable: deleting a key while folding
+    # its rendered text into a lexicographically-earlier sibling's value produced a
+    # byte-identical string, measured surviving at 195/0. JSON quoting cannot collide.
+    #
+    # `map_values(tostring)` on top of that, and it is not decoration: `tojson` preserves the
+    # YAML type, so `VESPASIAN_REQUIRE_CHROME: 1` and `: "1"` rendered differently and the pin
+    # fired on a quote-style edit with no runtime effect at all — Actions coerces every `env`
+    # value to a string. The hand-rolled join used `tostring` and so did not have that problem;
+    # converting to JSON reintroduced it in the other direction. Coercing first keeps JSON's
+    # unambiguous quoting AND drops the false positive, measured both ways: the two quote-style
+    # edits render identically, and the deletion-collision above still differs.
+    #
+    # `permissions` and a workflow-level `env` ride along on this same yq call, for zero
+    # extra counted outcomes. Both were measured MISSED before being added: widening the
+    # workflow's `contents: read` to `contents: write` left the suite green at 195/0, and
+    # nothing read `.env` at all — which matters because the AC3 proof resolves `curl` from
+    # PATH, so a workflow-level `env: PATH:` prepending a fake `curl` is the same bypass as
+    # the `defaults.run.shell` one in a different key. Token scope is also the one thing
+    # the two egress-UNRESTRICTED jobs inherit: `check-label` and `install-chrome-e2e` run
+    # with no policy, so what their token can do is the whole of their blast radius. The
+    # in-file comment on install-chrome-e2e's `permissions:` block previously said
+    # detecting a widening "is a separate job for a workflow-shape guard, not something
+    # this block can do" — this file now IS that guard, so the reason no longer holds.
+    #
+    # Pinned as an exact SET rather than a blanket absence, because there is one legitimate
+    # override and pinning `0` would have been a lie that failed on the first run. The
+    # container job install-chrome-e2e sets `defaults.run.shell: bash` and MUST: a container
+    # job's `run:` defaults to `sh -e {0}`, so `set -euo pipefail` dies on line 1 with
+    # "Illegal option -o pipefail" before any assertion executes — measured in run
+    # 32388761616, the first time that job ran. So the expectation names that job and its
+    # value, and everything else must be empty. A NEW job-level override, a change to this
+    # one, a workflow-level override, or any step-level `shell:` all fail. If another job
+    # ever legitimately needs one, add it here deliberately — forcing that review is the
+    # point.
+    wfshape_got=$(yq_query '"wfdefrun=" + ((.defaults.run // {} | sort_keys(..) | map_values(tostring)) | tojson(0))
+      + " jobdefrun=" + ([.jobs | to_entries[] | select(.value.defaults.run)
+                     | {(.key): (.value.defaults.run | sort_keys(..) | map_values(tostring))}]
+                     | sort_by(keys[0]) | tojson(0))
+      + " steps=" + ([.jobs[].steps[] | select(.shell)] | length | tostring)
+      + " wfperms=" + ((.permissions | tostring))
+      + " jobperms=" + ([.jobs | to_entries[] | select(.value.permissions)
+                     | .key + ":" + (.value.permissions | tostring)] | sort | join(","))
+      + " wfenv=" + ((.env // {} | sort_keys(..) | map_values(tostring)) | tojson(0))
+      + " jobenv=" + ([.jobs | to_entries[] | select(.value.env)
+                     | {(.key): (.value.env | sort_keys(..) | map_values(tostring))}]
+                     | sort_by(keys[0]) | tojson(0))
+      + " stepenv=" + ([.jobs | to_entries[] | .key as $j | .value.steps[]? | select(.env)
+                     | {($j): (.env | sort_keys(..) | map_values(tostring))}] | tojson(0))' -r)
+    wfshape_want='wfdefrun={} jobdefrun=[{"install-chrome-e2e":{"shell":"bash"}}] steps=0 wfperms=contents: read jobperms=devcontainer-image-arm64:contents: read,devcontainer-image:contents: read,install-chrome-e2e:contents: read wfenv={} jobenv=[{"devcontainer-image":{"DEVCONTAINER_CLI":"@devcontainers/cli@0.88.0"}},{"integration-tests":{"VESPASIAN_NO_SANDBOX":"true","VESPASIAN_REQUIRE_CHROME":"1"}},{"preflight-selftest":{"GOTOOLCHAIN":"local"}},{"test":{"VESPASIAN_NO_SANDBOX":"true"}}] stepenv=[{"devcontainer-changes":{"BASE_REF":"${{ github.base_ref }}","EVENT_NAME":"${{ github.event_name }}"}},{"devcontainer-changes":{"EVENT_NAME":"${{ github.event_name }}","FILTER":"${{ steps.filter.outputs.devcontainer }}","REF":"${{ github.ref }}"}}]'
+    case "$wfshape_got" in
+        __NO_YQ__)    fail_no_yq "the workflow-shape pin (shell overrides, permissions, env)" ;;
+        __YQ_ERROR__) fail_yq_error "the workflow-shape pin (shell overrides, permissions, env)" ;;
+        *)
+            if [[ "$wfshape_got" == "$wfshape_want" ]]; then
+                pass "workflow shape pinned: the whole defaults.run node at both levels (only install-chrome-e2e's shell: bash), no step-level shell:, permissions contents: read at both levels, no workflow-level env:, and every env: block — workflow-level and per-job — matches its pinned JSON encoding, keys AND values"
+            else
+                fail "the workflow SHAPE changed in live-tests.yml — a defaults.run override (shell OR working-directory), a step-level shell:, a permissions widening, a workflow-level env:, or an edit to a job-level env: block. A workflow- or job-level \`defaults.run.shell\` applies to every run: step without appearing on any of them, so it silently redirects all four guard suites and the AC3 egress proof through a different interpreter — measured green at 194/0 with \`shell: cat {0}\`, every step a no-op. If an override is genuinely wanted, update this pin deliberately.
+        want: ${wfshape_want}
+        got:  ${wfshape_got}"
+            fi ;;
+    esac
+
+    # The two checks above cover jobs that carry the policy and the job (LAB-6015 review)
+    # SET, but not the two jobs that are exempt from it. Measured: appending a
+     # `curl` step to check-label leaves EXPECTED_ALL_JOBS matching, the carrying
+    # set the pinned five, every hr_expected comparison untouched, and the suite at
+    # 143/0 — an exempt job silently gaining unrestricted egress. Each exemption
+    # rests on a specific, checkable fact, so pin the fact rather than the name:
+    #   * check-label is exempt because its single step is an inline bash gate with
+    #     no checkout and no network. Its step body is pinned by DIGEST, which is
+    #     exhaustive without enumerating anything. Two weaker versions were tried and
+    #     measured first: counting steps alone missed a `curl` added INSIDE the existing
+    #     single `run:` block, and grepping that body for a fixed command list
+    #     (curl/wget/npm/go/git) missed `gh api`, `python3 -c "urllib.request..."` and
+    #     `exec 3<>/dev/tcp/host/443` — all three left the suite green with the job
+    #     making network calls under no egress policy. Enumerating egress methods has no
+    #     end; pinning the body has one. ANY edit to that step now fails here, whatever
+    #     it does, and the failure message says to re-pin deliberately.
+    #   * install-chrome-e2e is exempt because it is a CONTAINER job and
+    #     harden-runner does not support those. Losing `container:` makes it an
+    #     ordinary non-container job with no egress policy at all.
+    # sha256sum is GNU; shasum -a 256 ships with perl and is what macOS has. Both were
+    # verified to produce the same digest for this body, so the fallback is sound rather
+    # than assumed, and a MISSING hasher fails as a counted outcome rather than aborting.
+    #
+    # `head=`/`body=` split on the FIRST ` body=`: `${r%% body=*}` removes the longest
+    # matching SUFFIX and `${r#* body=}` the shortest matching PREFIX, so both cut at the
+    # same, first, delimiter. That is what makes a body containing ` body=` safe — the head
+    # ends before the real delimiter and the body starts after it. An earlier version of
+    # this comment said "split on the LAST field", which was the wrong rule for the right
+    # code; recorded because the same commit corrects another wrong bash rule elsewhere.
+    exempt_raw=$(yq_query '"checklabel_steps=" + (.jobs."check-label".steps | length | tostring)
+      + " e2e_container=" + ((.jobs."install-chrome-e2e" | has("container")) | tostring)
+      + " e2e_container_node=" + ((.jobs."install-chrome-e2e".container // {} | sort_keys(..) | tojson(0)))
+      + " e2e_if=" + ((.jobs."install-chrome-e2e".if | tostring))
+      + " body=" + (.jobs."check-label" | sort_keys(..) | tojson(0))' -r)
+    # Double-quoted with the JSON's own quotes escaped: the value now carries BOTH quote
+    # styles — `e2e_container_node=` renders JSON (double quotes) and `e2e_if=` contains the
+    # trigger expression's single quotes — so neither plain '...' nor plain "..." holds it.
+    exempt_want="checklabel_steps=1 e2e_container=true e2e_container_node={\"image\":\"ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea\"} e2e_if=github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') bodysha=03883c7aed8cf43558774ccfa505a3a0c65f823b7f04bbcd6cc97298c36c16cc"
+    case "$exempt_raw" in
+        __NO_YQ__)    fail_no_yq "the harden-runner exemption rationale for check-label and install-chrome-e2e" ;;
+        __YQ_ERROR__) fail_yq_error "the harden-runner exemption rationale for check-label and install-chrome-e2e" ;;
+        *)
+            exempt_head=${exempt_raw%% body=*}
+            exempt_body=${exempt_raw#* body=}
+            # A missing hasher must FAIL as a counted outcome, not abort the suite. Under
+            # set -euo pipefail the bare fallback died before the EXPECTED_ASSERTIONS check
+            # ran, so the run ended on the generic "terminated before reaching the summary"
+            # guard without naming the cause — the shape yq_query's __NO_YQ__ sentinel
+            # exists to avoid. Measured with both tools hidden from PATH.
+            if command -v sha256sum >/dev/null 2>&1; then
+                exempt_sha=$(printf '%s' "$exempt_body" | sha256sum | cut -d' ' -f1)
+            elif command -v shasum >/dev/null 2>&1; then
+                exempt_sha=$(printf '%s' "$exempt_body" | shasum -a 256 | cut -d' ' -f1)
+            else
+                exempt_sha='<no sha256 tool on PATH: install coreutils or perl>'
+            fi
+            exempt_got="${exempt_head} bodysha=${exempt_sha}"
+            if [[ "$exempt_got" == "$exempt_want" ]]; then
+                pass "both harden-runner-exempt jobs still match their exemption rationale (check-label: one inline step, and a digest over its WHOLE job node — if:, outputs:, step ids, runs-on and all — unchanged; install-chrome-e2e: a container job with its trigger if: unchanged)"
+            else
+                fail "a harden-runner-EXEMPT job no longer matches the rationale that exempts it. Two things land here: it may now make network calls under no egress policy, OR — for check-label, whose whole node is digested because both gated jobs depend on its outputs — an edit to its if:, outputs:, step ids or runs-on that would skip integration-tests and test on every event while every other pin stays green; OR — for install-chrome-e2e — an edit to its container image or to its trigger if:, including a narrowing like \`if: false && (...)\` that keeps both trigger-arm names visible to the grep-based pin above and is caught only here, which drops the installer's only privileged-path coverage. Either restore the rationale, or give the job a harden-runner step and add it to EXPECTED_HR_JOBS and hr_expected.
+        want: ${exempt_want}
+        got:  ${exempt_got}
+        check-label node, which is what the digest is over: ${exempt_body}"
+            fi ;;
+    esac
+
+    case "$hr_actual" in
+        __NO_YQ__)    fail_no_yq "the set of jobs carrying harden-runner" ;;
+        __YQ_ERROR__) fail_yq_error "the set of jobs carrying harden-runner" ;;
+        *)
+            if [[ "$hr_actual" == "$hr_pinned_sorted" ]]; then
+                pass "exactly the pinned jobs carry harden-runner (${hr_pinned_sorted})"
+            else
+                fail "the set of jobs carrying harden-runner has changed — pinned '${hr_pinned_sorted}', found '${hr_actual}'. A new job carrying the policy needs an entry in EXPECTED_HR_JOBS and hr_expected; a job that lost it needs the removal recorded here."
+            fi ;;
+    esac
+
+    # AC5 of LAB-6015 ("the now-stale 'block ... once telemetry confirms the set'
+    # comments are removed or updated") was satisfied by DELETING those comments, with
+    # nothing to keep it satisfied. Measured: merging main's LAB-5766 work reintroduced
+    # three of them verbatim — one per new devcontainer job — and every other pin in
+    # this file stayed green, because they are all structural and this is prose. An AC
+    # met by deletion needs a guard or it regresses on the next merge from anyone who
+    # copied the old block.
+    stale_hr=$(grep -c "once telemetry confirms the set" "$WORKFLOW" || true)
+    if [[ "$stale_hr" == "0" ]]; then
+        pass "no stale \"flip to 'block' once telemetry confirms the set\" comment survives in live-tests.yml (LAB-6015 AC5)"
+    else
+        fail "${stale_hr} stale \"once telemetry confirms the set\" comment(s) are back in live-tests.yml. LAB-6015 AC5 requires them removed or updated: they tell a reader the allowlist has never been derived, which is false for the five block-mode jobs and misleading for the three audit ones (those are on audit deliberately under AC6, with the reason recorded in place). This most often returns via a merge that adds a job by copying an older harden-runner block."
+    fi
+
+            # The carrying-set check above sees WHICH jobs have the step, not what policy it sets, so
+            # an audit->block flip on a devcontainer job is invisible to it (the job still carries
+            # harden-runner either way). Pin each audit job's policy directly. Both directions matter:
+            # flipping one to `block` without a telemetry-derived allowlist is the AC2 violation this
+            # section exists to prevent, and it would most likely break a docker build; and a job
+            # silently LOSING `audit` is the same hole the block-mode pins close for the other five.
+            for aud_job in "${EXPECTED_AUDIT_JOBS[@]}"; do
+                # Policy value AND the three job-shape keys that decide whether harden-runner runs
+    # at all. Not the full hr_policy string the block jobs get: those five ENFORCE, so
+    # replicating fourteen fields here would triple the re-pin friction on a file that
+    # took 25 commits in six months. But `container:` (the action does not support
+    # container jobs), `services:` (service containers start before steps[0]) and
+    # harden-runner not being steps[0] each make the step a no-op while `egress-policy`
+    # still reads `audit` — and what is lost then is the very telemetry AC6's follow-up
+    # needs to derive these three allowlists, while the pin still reports them healthy.
+    aud_got=$(yq_query "\"policy=\" + ([.jobs.\"${aud_job}\".steps[] | select((.uses // \"\") | test(\"step-security/harden-runner\")) | (.with.\"egress-policy\" // \"<unset>\")] | join(\",\"))
+      + \" first=\" + ((.jobs.\"${aud_job}\".steps[0].uses // \"\") | test(\"step-security/harden-runner\") | tostring)
+      + \" container=\" + ((.jobs.\"${aud_job}\" | has(\"container\")) | tostring)
+      + \" services=\" + ((.jobs.\"${aud_job}\" | has(\"services\")) | tostring)
+      + \" \" + ([.jobs.\"${aud_job}\".steps[] | select((.uses // \"\") | test(\"step-security/harden-runner\"))]
+        | map(\"sudo=\" + ((.with.\"disable-sudo\" // \"<unset>\") | tostring)
+            + \" if=\" + ((has(\"if\")) | tostring)
+            + \" coe=\" + ((.\"continue-on-error\" // false) | tostring)
+            + \" withkeys=\" + ([.with | keys | .[]] | sort | join(\",\"))) | join(\" ;; \"))" -r)
+                # Per job, because devcontainer-changes sets `disable-sudo: true` and the two image
+    # jobs deliberately do not (line ~776 records why). Measured: WITHOUT the step-level
+    # half of this string, `if: false` on an audit job's harden-runner step and a dropped
+    # `disable-sudo` both survived at 253/0 — the step is skipped, the job records NO
+    # telemetry, and the pin still reported "runs harden-runner in audit, explicitly".
+    # That matters doubly here: telemetry is the only route off `audit` under AC2, so
+    # silently removing it makes the AC6 follow-up unsatisfiable while looking green.
+    case "$aud_job" in
+        devcontainer-changes) aud_want='policy=audit first=true container=false services=false sudo=true if=false coe=false withkeys=disable-sudo,egress-policy' ;;
+        *)                    aud_want='policy=audit first=true container=false services=false sudo=<unset> if=false coe=false withkeys=egress-policy' ;;
+    esac
+    case "$aud_got" in
+                    __NO_YQ__)    fail_no_yq "${aud_job}'s harden-runner policy" ;;
+                    __YQ_ERROR__) fail_yq_error "${aud_job}'s harden-runner policy" ;;
+                    "$aud_want")
+                                  pass "${aud_job} still runs harden-runner in audit as its FIRST step, with no container: or services:, explicitly (LAB-6015 AC6: recorded, not silent)" ;;
+                    *)            fail "${aud_job}'s harden-runner egress-policy is '${aud_got}', expected 'audit'. If this job is being flipped to block, its allowed-endpoints must be derived from harden-runner telemetry of real runs (LAB-6015 AC2) — not guessed — and it must move from EXPECTED_AUDIT_JOBS to EXPECTED_HR_JOBS with an hr_expected entry. If it lost the step entirely, the carrying-jobs pin above should have caught that first." ;;
+                esac
+            done
+fi
+
+echo ""
 echo "=== test job wiring ==="
 # preflight-selftest and install-chrome-e2e got step-list wiring guards above
 # because a hand-maintained YAML block can silently lose a step with every
@@ -2976,6 +3542,81 @@ else
         pass "every BROWSER_TARGETS entry is a real target"
     fi
 fi
+
+# ── AC3 script behaviour: workflow-INDEPENDENT, so it sits OUTSIDE the guard above ──
+# This block reads only test/assert-egress-enforced.sh. It was first written inside the
+# harden-runner section's workflow-PRESENT arm, which quietly broke the constant-outcome
+# property that section documents: 3 outcomes with the workflow present and 0 with it
+# missing, so the arms were 12 and 9 while the comment there claimed 12 in both. Caught in
+# review of this PR. Moving it out here is the fix rather than padding the other arm,
+# because the check genuinely does not need the workflow — a pad would have preserved the
+# count and kept the coverage asymmetry, which is the thing that actually mattered.
+
+# BEHAVIOUR, not text: run the script against a stub `curl` and assert its exit code
+# in three scenarios. This exists because the grep pin above counts the probe calls
+# but cannot read their SENSE, and a reviewer on PR #226 pointed out the consequence:
+# flipping `-eq 0` to `-ne 0`, or `if ! curl` to `if curl`, leaves all three counts at
+# 1/1/2 and the pin green while the assertion means the OPPOSITE of what AC3 needs —
+# the unlisted host becoming reachable would then pass as proof of enforcement. Both
+# inversions were measured MISSED before this block was written. No pattern over
+# free-form shell closes that; executing it does.
+#
+# The stub also removes the last of the "editing the body to a no-op still passes"
+# residual: an early `exit 0` passes scenario 1 and fails 2 and 3.
+#
+# Three outcomes in every arm, including when the script is absent, so the count stays
+# constant by construction the way the rest of this section is.
+# TMPDIR is pinned to the suite root created at the top of this file rather than left to an
+# inherited TMPDIR: this directory holds an executable fixture that gets PATH-prepended and
+# RUN, which is exactly the case the header comment says a bare `mktemp -d` is wrong for. It
+# also means the EXIT trap removes it if the suite aborts before the rm below.
+ac3_beh_dir=$(TMPDIR="$TMPDIR_T" mktemp -d)
+cat > "$ac3_beh_dir/curl" <<'AC3SHIM'
+#!/usr/bin/env bash
+# Stub curl: exit code chosen per host from the environment. Any other URL exits 0.
+for a in "$@"; do
+case "$a" in
+    *proxy.golang.org*) exit "${SHIM_UNLISTED_RC:-7}" ;;
+    *github.com*)       exit "${SHIM_CONTROL_RC:-0}" ;;
+esac
+done
+exit 0
+AC3SHIM
+chmod +x "$ac3_beh_dir/curl"
+# $1 = stubbed exit for the unlisted host, $2 = for the allowlisted control host.
+_ac3_behaviour() {
+    local _rc
+    set +e
+    SHIM_UNLISTED_RC="$1" SHIM_CONTROL_RC="$2" PATH="$ac3_beh_dir:$PATH" \
+        bash "$SCRIPT_DIR/assert-egress-enforced.sh" >/dev/null 2>&1
+    _rc=$?
+    set -e
+    printf '%s' "$_rc"
+}
+if [[ -f "$SCRIPT_DIR/assert-egress-enforced.sh" ]]; then
+    ac3_b_enforcing=$(_ac3_behaviour 7 0)
+    ac3_b_notenforcing=$(_ac3_behaviour 0 0)
+    ac3_b_noegress=$(_ac3_behaviour 7 7)
+else
+    ac3_b_enforcing=absent; ac3_b_notenforcing=absent; ac3_b_noegress=absent
+fi
+rm -rf "$ac3_beh_dir"
+
+if [[ "$ac3_b_enforcing" == 0 ]]; then
+    pass "AC3 behaviour: a correctly enforcing runner (unlisted refused, control reachable) exits 0"
+else
+    fail "test/assert-egress-enforced.sh does NOT exit 0 on the enforcing case (stub: unlisted exit 7, control exit 0) — got exit ${ac3_b_enforcing}. A working block policy would fail this job. The usual cause is an inverted condition: \`-ne 0\` where the unlisted probe needs \`-eq 0\`, or a dropped \`!\` on the control probe."
+fi
+if [[ "$ac3_b_notenforcing" == 1 ]]; then
+    pass "AC3 behaviour: an unlisted host that is REACHABLE fails the job (the policy is not enforcing)"
+else
+    fail "test/assert-egress-enforced.sh does NOT fail when the unlisted host is reachable (stub: unlisted exit 0, control exit 0) — got exit ${ac3_b_notenforcing}, expected 1. This is the inversion that matters: the one runtime proof that block mode enforces would pass on a runner where it does not. Check the sense of the unlisted-probe condition."
+fi
+if [[ "$ac3_b_noegress" == 1 ]]; then
+    pass "AC3 behaviour: a runner with NO egress at all fails the job rather than passing vacuously"
+else
+    fail "test/assert-egress-enforced.sh does NOT fail when the allowlisted control host is also unreachable (stub: both exit 7) — got exit ${ac3_b_noegress}, expected 1. Without this the refusal above proves nothing: a total egress outage would read as a working policy."
+    fi
 
 echo ""
 
@@ -4437,6 +5078,19 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #         test/test-runner-args.sh`) — a plain `bash` here inherits an exported
 #         ugrep `grep` function that gives different answers than CI.
 #
+#   +1    round 14: the printf-into-`grep -q` SIGPIPE guard. Under `set -o pipefail`
+#         the reader exits on its first match and printf's EPIPE becomes the
+#         PIPELINE's status, so `!`/`||` read the verdict backwards. Run 33405732303
+#         failed that way on a green suite. Six sites in live-tests.yml carried the
+#         form; the file already documented why not to.
+#
+#         The structured entries above stop at 236. Rounds 8-13 raised the pin to
+#         253 without extending this ledger, so 236 -> 253 is UNATTRIBUTED here --
+#         EXPECTED_ASSERTIONS is the authority on the running total, not the sum of
+#         these bands.
+#
+#   = 254  MEASURED, in a clean child shell (same caveat as the 236 entry).
+#
 # The recurring lesson, recorded because it cost six rounds: when a block gains a
 # counted outcome, its vacuity-sentinel arms must gain the matching credit in the
 # same edit. That was missed five times, each time caught by RUNNING a degraded
@@ -4617,9 +5271,146 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # working-directory AND -race again. The awk form it replaced checked both; the
 # first yq rewrite kept only working-directory, so dropping -race from the only job
 # that runs the nested module's tests survived at 179/0.
+#
+# ── LAB-6015 (harden-runner egress: audit -> block) ───────────────────────────
+# This branch adds SEVENTEEN counted outcomes on top of main's 236 (main's own base moved
+# from 182 to 236 when LAB-5766 landed), all in the
+# "harden-runner egress policy" section. Measured at each step, never computed:
+#   +5  one per job in EXPECTED_HR_JOBS — each job's WHOLE policy compared against a
+#       pinned expectation (action SHA, `block`, disable-sudo, no `if:`, harden-runner
+#       first, the job's `runs-on`, the step's `continue-on-error`, allowed-endpoints node
+#       type, exact endpoint set) rather than its shape. `runs-on` and `continue-on-error`
+#       were folded into this same string in review rather than added as new outcomes, so
+#       the count did not move. Round 8 folded in five more for the same reason —
+#       `container=`, `services=`, `jobcoe=`, `jobif=` and `withkeys=` — each a measured
+#       survivor at 195/0: a `container:` key on any policy job (the workflow's own comment
+#       says harden-runner does not support container jobs, so the policy stops applying),
+#       `services:` (service containers start before steps[0], so `first=true` does not mean
+#       nothing ran first), job-level `continue-on-error: true` and job-level `if:` on
+#       docs-check or integration-tests (the step-level `coe=` does not see either, and the
+#       text-grep neutering guards cover only three of the five policy jobs), and any FOURTH
+#       `with:` input — `use-policy-store: true` moves the enforced allowlist to
+#       StepSecurity's off-repo control plane with every pinned field byte-identical, which
+#       is the widest of the five. `withkeys=` pins the key SET rather than enumerating
+#       inputs, the same way check-label's body is pinned by digest rather than by grepping
+#       for egress methods. Round 9 folded in three more, again for zero new outcomes, again
+#       each a measured survivor at 195/0: `needs=` (dropping `check-label` from a gated
+#       job's `needs:` makes the pinned `if:` expression resolve false, so the job is skipped
+#       on every event with every field byte-identical), and `jobif=` re-spelled as
+#       presence-AND-value because `//` substitutes on FALSE as well as null — `if: false`
+#       rendered identically to no `if:` at all, and docs-check is on neither grep-based
+#       if-guard list, so `if: false` there was green. The workflow-shape pin likewise moved
+#       from the `.defaults.run.shell` leaf to the whole node and gained per-job `env:` —
+#       both accounted under the workflow-shape +1 below, where they are counted. Round 9
+#       also folded in `usesset=`, the
+#       per-job set of `uses:` action names: `first=true` pins that harden-runner is
+#       steps[0], but the runner hoists every action's `pre:` script to the start of the
+#       job. Be exact about what that does and does not buy, because the first version of
+#       this entry overstated it: harden-runner ITSELF declares a `pre:` (read at the pinned
+#       SHA — `runs.using: node24`, `pre: dist/pre/index.js`), and the runner executes `pre`
+#       scripts in step-declaration order, so harden-runner being steps[0] means its own
+#       `pre:` runs BEFORE any other action's. Another action's `pre:` therefore runs after
+#       the policy is installed, not before it, and `first=true` already carries that. Of the
+#       four other actions here, none declares a `pre:` at its pinned SHA anyway (checkout,
+#       setup-go and setup-node are `post:`-only; upload-artifact has neither).
+#
+#       So `usesset=` is NOT closing a live hole, and the earlier claim that it was is
+#       withdrawn. What it buys is narrower and still worth one field: any action ADDED to or
+#       REMOVED from a policy job becomes a counted failure rather than a silent edit, which
+#       matters because every action is extra code running inside a job whose whole point is
+#       a constrained egress policy. Measured CAUGHT: `actions/cache` added to three
+#       different policy jobs, the upload-artifact step deleted, and its action name
+#       swapped at the same SHA. Original evidence: `runs-on: macos-14` left the policy byte-identical while
+#       harden-runner silently does not enforce off Linux, and `continue-on-error: true`
+#       on the step was caught for three of the five jobs by the un-gated-job guards
+#       above but not for docs-check or integration-tests. Both measured MISSED first.
+#       A shape check ("is it block, is the list non-empty") let eight mutations through.
+#   +1  the set of jobs that CARRY harden-runner — the only check that catches the step
+#       being ADDED to a job meant to be exempt.
+#   +1  the FULL job set (EXPECTED_ALL_JOBS) — the carrying-jobs check is one-directional
+#       and cannot see a new job added WITHOUT a policy. Measured: appending a job whose
+#       only step was `run: curl ...` left the suite green before this pin existed.
+#   +1  the AC3 enforcement step — its position, its `shell:` key and its exact
+#       invocation of test/assert-egress-enforced.sh. Measured: the step shipped
+#       unpinned and deleting it left the suite green; later, `shell: cat {0}` left the
+#       run value byte-identical while the runner merely CAT-ed the script and exited 0.
+#   +3  one per job in EXPECTED_AUDIT_JOBS — the three devcontainer jobs LAB-5766 added,
+#       each pinned as `audit` AND on the job-shape keys that decide whether the step
+#       runs at all (first, container, services). AC6 says a job that cannot be flipped
+#       keeps `audit` EXPLICITLY; these are that, and the pin makes both directions —
+#       a silent flip to `block`, a silent no-op of the step — a named failure.
+#   +1  the AC5 stale-comment guard. AC5 was met by DELETING the four stale
+#       "flip once telemetry confirms the set" comments, and the LAB-5766 merge
+#       reintroduced three of them verbatim while every structural pin stayed green,
+#       because they are YAML/digest-based and this is prose. A criterion met by
+#       deletion needs a guard or it regresses on the next merge.
+#   +1  the workflow SHAPE, in one outcome: the whole `defaults.run` NODE at workflow and
+#       job level (so `working-directory`, which re-roots every relative guard invocation,
+#       is covered alongside `shell`), no step-level `shell:`, `permissions` at both levels,
+#       and EVERY `env:` block — workflow-level and per-job. The per-job half matters because
+#       three policy jobs already carry one, `preflight-selftest` included, where a `PATH:`
+#       entry shadows the `yq` this whole section depends on; pinning only the workflow level
+#       left the exposure one key away. Shell came first, since that is why the pin exists. A
+#       workflow- or job-level `defaults.run.shell` applies to every `run:` step without
+#       appearing on any of them, so it is a strictly wider bypass than the per-step
+#       `shell:` pinned by the AC3 entry above. Measured: three lines of
+#       `defaults: run: shell: cat {0}` at the top of the file left every assertion
+#       untouched and the suite green at 194/0 while all four guard suites and the AC3
+#       proof became `cat` no-ops. `permissions` and `env:` were folded onto this same yq
+#       call in round 8 for zero extra outcomes, both also measured survivors: widening the
+#       workflow's `contents: read` to `contents: write` was green at 195/0, and nothing read
+#       `.env` at all — which matters because the AC3 proof resolves `curl` from `PATH`, so a
+#       workflow-level `env: PATH:` is the shell bypass in a different key.
+#   +3  the AC3 script's BEHAVIOUR — the script executed against a stub `curl` in three
+#       scenarios (enforcing; unlisted host reachable; no egress at all), asserted on exit
+#       code. Measured: inverting `-eq 0` to `-ne 0`, and dropping the `!` from the control
+#       probe, each left every grep count identical and the suite green at 191/0 while the
+#       assertion meant the opposite of what AC3 needs. Text pins cannot read a condition's
+#       sense; running it can.
+#   +1  the two harden-runner-EXEMPT jobs' rationale — check-label's WHOLE JOB NODE by
+#       sha256 digest over its canonical JSON, plus install-chrome-e2e's `container:` key,
+#       its digest-pinned image and its trigger `if:`. The digest covered only check-label's
+#       step BODIES until round 10, which left every job-level key on the one gate-bearing
+#       job unread: `if: false`, a deleted or renamed `outputs.should-run`, a renamed gate
+#       step `id:`, a job-level `continue-on-error` and a changed `runs-on` were each
+#       measured surviving at 195/0, and each skips BOTH gated jobs on every event. Two weaker versions were measured
+#       first: counting steps missed a `curl` added INSIDE the existing single `run:`
+#       block, and grepping that body for a command list missed `gh api`,
+#       `python3 -c "urllib.request..."` and `exec 3<>/dev/tcp/host/443`. Enumerating
+#       egress methods has no end; pinning the body has one.
+#
+# The +17 is CONSTANT BY CONSTRUCTION across all three arms — workflow present with yq,
+# present without yq, and missing — at 17 outcomes each. The three behavioural
+# outcomes read only the script file, never the workflow or yq, so they are constant too. That property is why
+# EXPECTED_HR_JOBS is a HARDCODED list: the first version derived it from the workflow,
+# which emitted six outcomes with yq and one without, leaving this pin wrong on any host
+# lacking yq and producing a spurious "accounting drift" failure that blamed deleted
+# assertions for a missing tool. A derived list also cannot see a job that SHOULD carry
+# the step but does not, and deleting a step removed an assertion instead of failing one.
+#
+# Be exact about where the drift branch fires: it runs on every host, but a count that
+# varied with yq's presence would only trip it on a host WITHOUT yq. CI always has yq, so
+# no CI job exercises that arm; its coverage is a local run with yq shorn from PATH, and
+# that is the whole of it. A standing CI check would mean building a yq-free PATH inside
+# the job — `disable-sudo: true` rules out moving the binary — which is more machinery
+# than the developer-experience bug it guards warrants. Stated rather than left implied,
+# per the AGENTS.md rule on claims like this one.
+#
+# Mutation-proven. Every mutation below was applied, PROVEN applied, then judged by exit
+# code and reverted. Caught by the per-job pin: policy -> audit; allowlist emptied; a
+# second harden-runner step on audit; allowlist -> `*:443`; an extra endpoint added;
+# SHA -> 000...0; a look-alike action name; `if: false`; the step moved below checkout;
+# disable-sudo deleted; allowed-endpoints rewritten as a YAML sequence. Caught by the
+# newer pins: a job added without harden-runner; install-chrome-e2e losing `container:`;
+# the AC3 step deleted, moved off the end, repointed, or given a `shell:` override; any
+# edit at all to check-label's job node; the AC3 script's unlisted host retyped, its
+# control probe deleted, its whole body no-op'd, its unlisted condition inverted to
+# `-ne 0`, and its control condition un-negated. The last two are caught only by the
+# behavioural scenarios — every grep count stays identical under both. The first two of the per-job list are the only
+# ones the pre-LAB-6015 shape check also caught.
 # ── end merged-from-main history ─────────────────────────────────────────────
 
-EXPECTED_ASSERTIONS=236
+EXPECTED_ASSERTIONS=254
 if [[ $((PASS + FAIL + SKIP_CREDIT)) -ne "$EXPECTED_ASSERTIONS" ]]; then
     echo "test-runner-args: FAIL — assertion accounting drift: expected ${EXPECTED_ASSERTIONS} assertions (pass+fail+skip credit), saw $((PASS + FAIL + SKIP_CREDIT))."
     echo "  A case was added or removed without updating EXPECTED_ASSERTIONS."
