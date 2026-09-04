@@ -43,6 +43,8 @@
 // limiter and a 10 MB per-page read cap. goquery parses each page once with the
 // same link selectors as the headless path; jsluice reads inline <script> blocks.
 //
+// [FakeCrawler] is the no-network test double for [Crawler].
+//
 // # Browser binary (LAB-4999)
 //
 // The headless path pins [BrowserOptions.ChromePath] or the system browser from

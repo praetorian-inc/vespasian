@@ -834,6 +834,8 @@ func extractServicePrefixes(jsBody []byte, requests []ObservedRequest) []string 
 }
 
 // addStandaloneCandidates emits bare prefix literals: filter, count, cap, sort.
+// Pulled out so the prefix-discovery pipeline reads top-down and this rubric stays
+// independent of the other strategies.
 //
 // len(seen) on entry is what the earlier strategies emitted, so the remaining
 // budget must be taken before adding — that is what holds the bundle under

@@ -54,7 +54,8 @@ type staticFormField struct {
 }
 
 // sentinelSelectedOption marks a <option selected> seen before its value
-// resolved. The NUL prefix cannot collide with a real parsed value.
+// resolved. x/net/html replaces NUL with U+FFFD in parsed attribute values and
+// text, so the prefix distinguishes the marker from a real value.
 const sentinelSelectedOption = "\x00selected"
 
 // ExtractForms returns at most one synthetic ObservedRequest per <form>, ready to
@@ -352,7 +353,8 @@ func handleTextareaTag(tok html.Token, stack []*staticForm, pending **pendingFie
 	})
 	// Points INTO f.Fields, so it survives only while nothing appends to that
 	// slice. Safe because parseForms routes every tag through
-	// handlePendingStartTag while pending is set, and that never adds a field.
+	// handlePendingStartTag while pending is set, and no path there adds a field
+	// today.
 	fieldPtr := &f.Fields[len(f.Fields)-1]
 	*pending = &pendingFieldState{
 		field:      fieldPtr,
@@ -373,7 +375,7 @@ func handleSelectTag(tok html.Token, stack []*staticForm, pending **pendingField
 		Required:    hasAttr(tok, "required"),
 		Sensitive:   isSensitiveName(name),
 	})
-	// See handleTextareaTag on why no append can invalidate this.
+	// See handleTextareaTag for the invariant that keeps this pointer valid.
 	fieldPtr := &f.Fields[len(f.Fields)-1]
 	*pending = &pendingFieldState{
 		field:    fieldPtr,

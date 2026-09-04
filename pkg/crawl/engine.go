@@ -482,11 +482,10 @@ func (e *rodEngine) worker(ctx context.Context, id int, onResult func(ObservedRe
 		//
 		// The cancellation paths further down requeue their entry as uncovered WITHOUT
 		// releasing the slot this call consumed, so pageCount can transiently exceed
-		// the number of pages actually covered. That is deliberate: releasing it would
-		// add a lock acquisition on a terminating path for no observable gain, since
-		// the count is local to Crawl, is never persisted into the checkpoint, and
-		// every path that requeues has ctx already canceled, so a worker that reads
-		// the inflated count exits on its own ctx check first.
+		// the number of pages actually covered. That is deliberate: the count is local
+		// to Crawl, is never persisted into the checkpoint, and every path that
+		// requeues has ctx already canceled, so a worker that reads the inflated count
+		// exits on its own ctx check first.
 		reservation, admitted := budget.TryReserve()
 		if !admitted {
 			// Return the entry to the queue: it was dequeued but never visited, so it

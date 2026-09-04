@@ -282,9 +282,9 @@ func (b *BrowserManager) Close() {
 	b.cleanup()
 }
 
-// SetCookies goes through CDP Storage.setCookies, not
-// Network.setExtraHTTPHeaders: only those survive redirects, new tabs and
-// page-initiated fetch().
+// SetCookies goes through CDP Storage.setCookies rather than
+// Network.setExtraHTTPHeaders: only Storage-domain cookies survive redirects,
+// new tabs and page-initiated fetch().
 func (b *BrowserManager) SetCookies(cookies []*proto.NetworkCookieParam) error {
 	if b == nil || b.browser == nil {
 		return fmt.Errorf("browser not connected")

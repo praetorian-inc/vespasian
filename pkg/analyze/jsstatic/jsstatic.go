@@ -125,15 +125,15 @@ type Result struct {
 // Stats counts what the analyser saw and emitted, for verbose output and tests.
 type Stats struct {
 	BundlesAnalyzed     int // handed to jsluice, post-filter and size-cap
-	BundlesSkipped      int // oversized, or a parse timeout; NOT empty bodies
+	BundlesSkipped      int // oversized, or a parse timeout or panic; NOT empty bodies
 	SourcemapsRecovered int // decoded via sourcesContent
 	SourcemapFetchFails int // sourceMappingURL seen, fetch failed
 	EndpointsFound      int // before the cap and toRequests synthesis
 	EndpointsKept       int // survived both, in Requests
 
-	SourcemapSourceTimeouts   int // one per "parse timeout" warn
+	SourcemapSourceTimeouts   int // one per "parse timeout" warn with kind=sourcemap-source
 	SourcemapSourcesOversized int // over MaxBundleSize, never reach jsluice
-	SourcemapSourcePanics     int // one per "jsluice panic" error
+	SourcemapSourcePanics     int // one per "jsluice panic" error with kind=sourcemap-source
 
 	// Bundles that produced no result before cancellation — still queued, or
 	// dequeued by a worker that then saw ctx.Done(). 0 on a clean run.
