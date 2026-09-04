@@ -110,7 +110,7 @@ func recoverSourcemap(ctx context.Context, bundle []byte, bundleURL string, opts
 			logger.Warn("jsstatic: Proxy configured but ignored — an injected HTTPClient owns its transport; sourcemap fetches will BYPASS the proxy")
 		}
 		// Both mutations are overlaid on a shallow copy, so the caller's client is never
-		// mutated.
+		// mutated; TestSourcemap_CallerClient_SSRFOverlayEnforced pins that for Transport.
 		//
 		// httpx.NoFollowRedirects: a same-host .js.map that 302s to an attacker host would
 		// bypass the sameHost pre-flight above.

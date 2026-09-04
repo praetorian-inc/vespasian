@@ -23,7 +23,10 @@ import (
 // in the value, trimming both.
 //
 // Errors name the header but NEVER echo its value, which routinely carries an auth
-// token.
+// token; TestParseHeader_ErrorOmitsValue pins the invalid-value path. The guarantee
+// covers the value only — SplitN puts everything before the first colon into the
+// name, so a malformed --header "Bearer tok: x" lands the token in the name that the
+// invalid-name error echoes with %q.
 func ParseHeader(raw string) (name, value string, err error) {
 	parts := strings.SplitN(raw, ":", 2)
 	if len(parts) != 2 {

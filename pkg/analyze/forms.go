@@ -563,8 +563,10 @@ var sensitiveSubstrings = []string{
 
 // isSensitiveName substring-matches sensitiveSubstrings, plus an exact "_token".
 // fieldValue blanks whatever matches, so the value never reaches the synthesized
-// request that becomes capture.json and the probe input;
-// TestExtractForms_SensitiveNonHiddenValueNotReplayed pins that.
+// request that becomes capture.json and the probe input.
+// TestExtractForms_SensitiveNonHiddenValueNotReplayed pins that for the POST body;
+// the GET branch puts values in obs.URL and obs.QueryParams instead and has no
+// equivalent assertion for a non-hidden sensitive field.
 //
 // "nonce" and "state" are deliberately absent: they collide with ordinary
 // parameters, e.g. state=California in an address form.

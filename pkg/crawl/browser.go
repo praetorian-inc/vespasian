@@ -69,7 +69,9 @@ type BrowserManager struct {
 // vespasianEnablesNoSandbox is the single source of truth for the sandbox
 // decision. Separate from the launcher's own state because go-rod's
 // launcher.New() adds --no-sandbox by default in containers, which masks the flag
-// as observed on the launcher (LAB-4994).
+// as observed on the launcher (LAB-4994). Kept a separate helper so
+// TestConfigureLauncher can assert this decision directly; the launcher-baseline
+// assertion beside it goes vacuous in a container.
 func vespasianEnablesNoSandbox(opts BrowserOptions) bool {
 	return opts.NoSandbox || os.Getenv("VESPASIAN_NO_SANDBOX") == "true"
 }
@@ -290,7 +292,9 @@ func (b *BrowserManager) SetCookies(cookies []*proto.NetworkCookieParam) error {
 	return b.browser.SetCookies(cookies)
 }
 
-// PID returns the Chrome process ID.
+// PID returns the Chrome process ID. Consumed only by the browser-lifecycle
+// integration tests (TestBrowserManager_LaunchAndKill, TestBrowserManager_Close),
+// which sit behind the `integration` build tag, so it has no production caller.
 func (b *BrowserManager) PID() int {
 	return b.launcher.PID()
 }

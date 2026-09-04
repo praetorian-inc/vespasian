@@ -126,7 +126,8 @@
 // "static:" prefix for x-vespasian-source ("js-bundle", "js-sourcemap",
 // "js-bundle-concat", "js-nextroute", "js-nextpage"); the last two never appear in
 // emitted output because pkg/classify Rule 6a reports both chunk sources as
-// not-an-API, and exist so the tag vocabulary stays total. A group mixing distinct
+// not-an-API at any --confidence (TestNextRoute_NeverAnOperationAtAnyThreshold),
+// and exist so the tag vocabulary stays total. A group mixing distinct
 // JS-static tags resolves to its least-confident member, not to "dynamic", which is
 // reserved for a group holding a genuinely non-JS-static source. The distinct tags
 // let consumers weight speculative reconstructions and chunk-URL recoveries below

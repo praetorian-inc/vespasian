@@ -2006,8 +2006,7 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 
 		// doRequest deliberately re-derives this for header forwarding instead of
 		// taking it, so forwarding cannot be widened by this loop's control flow.
-		// Do not collapse the two; keep them in sync. Pinned by
-		// TestReplayJSExtracted_DoesNotForwardHeadersCrossOrigin.
+		// Do not collapse the two; keep them in sync.
 		sameOrigin := isSameOrigin(fullURL, targetOrigin)
 
 		// Skipped URLs must NOT consume the MaxEndpoints budget, or an attacker
@@ -2081,7 +2080,9 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 // into the spec via the mirror. Candidates for paths that were never probed, or
 // that answered with any non-404 status, are left untouched — the offline
 // fallback (LAB-4992 AC1) and the additive-replay guarantee (QUAL-004)
-// respectively. Matching is host-agnostic (path-only, QUAL-001): the mirror is
+// respectively; TestReplayJSExtracted_KeepsMirrorForNonDispositiveStatuses covers
+// the non-404 statuses (200 text/html SPA catch-all, 204, HTML-bodied 401/403, 302
+// to /login). Matching is host-agnostic (path-only, QUAL-001): the mirror is
 // dropped whether or not the bundle it was reconstructed against shares a host
 // with the probe target.
 //

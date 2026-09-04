@@ -246,12 +246,16 @@ func extractWithTimeout(ctx context.Context, source []byte, sourceURL, kind stri
 // testInjectPanic fires at exactly two sites: the top of safeAnalyzeOne
 // (loc="analyzeOne") and inside the extraction goroutine (loc="bundle" or
 // "sourcemap-source"). Neither has a naturally-panicking path a test can trigger
-// from outside, so the recover/counter contracts need an injected fault.
+// from outside, so the recover/counter contracts need an injected fault. All three
+// loc values are driven today: TestSafeAnalyzeOne_PanicRecovery ("analyzeOne"),
+// TestAnalyze_BundlePanic_IncrementsBundlesSkipped and
+// TestAnalyze_NextRouteSurvivesFailedBodyExtraction ("bundle"), and
+// TestAnalyze_SourcemapSourcePanic_IncrementsPanicCounter ("sourcemap-source").
 var testInjectPanic func(loc string)
 
-// testInjectDelay fires in the extraction goroutine after the panic hook, so a
-// test can force a deterministic per-kind timeout without large inputs or timing
-// assumptions.
+// testInjectDelay fires in the extraction goroutine after the panic hook, so
+// TestAnalyze_SourcemapSourcePerSourceTimeout can force a deterministic per-kind
+// timeout without large inputs or timing assumptions.
 var testInjectDelay func(loc string)
 
 // safeAnalyzeOne recovers panics from outside the extraction goroutines, which
