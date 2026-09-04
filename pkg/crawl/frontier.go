@@ -100,7 +100,6 @@ func (f *urlFrontier) Push(entries []urlEntry) int {
 
 	added := 0
 	for _, e := range entries {
-
 		if f.maxDepth >= 0 && e.Depth > f.maxDepth {
 			continue
 		}
