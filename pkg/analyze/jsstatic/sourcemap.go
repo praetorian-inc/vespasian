@@ -97,9 +97,9 @@ func recoverSourcemap(ctx context.Context, bundle []byte, bundleURL string, opts
 	if client == nil {
 		client = defaultSourcemapClient(opts.AllowPrivate, opts.Proxy)
 	} else {
-		// SEC-BE-004: an injected HTTPClient owns its transport, so a configured Proxy is
-		// ignored here — the shallow copy below overwrites Transport with ssrfSafeTransport,
-		// which would clobber a proxied dialer. Warn rather than bypass it silently.
+		// An injected HTTPClient owns its transport, so a configured Proxy is ignored
+		// here — the shallow copy below overwrites Transport with ssrfSafeTransport, which
+		// would clobber a proxied dialer. Warn rather than bypass it silently.
 		// opts.Logger is nil when recoverSourcemap is called directly by tests, without
 		// Analyze's withDefaults.
 		if opts.Proxy.Enabled() {

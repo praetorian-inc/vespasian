@@ -430,7 +430,7 @@ func synthesizeRequest(f staticForm, baseURL string) (crawl.ObservedRequest, boo
 				q.Add(k, v)
 			}
 		}
-		// SEC-BE-001: cap before encoding or the URL and QueryParams disagree.
+		// Cap before encoding or the URL and QueryParams disagree.
 		crawl.CapQueryValues(q)
 		u.RawQuery = q.Encode()
 		obs.URL = u.String()
@@ -442,7 +442,7 @@ func synthesizeRequest(f staticForm, baseURL string) (crawl.ObservedRequest, boo
 		obs.Headers = map[string]string{"content-type": enctype}
 		obs.Body = []byte(values.Encode())
 		if u, err := url.Parse(resolved); err == nil {
-			// SEC-BE-001: bound per-key memory from an untrusted action URL.
+			// Bound per-key memory from an untrusted action URL.
 			obs.QueryParams = crawl.CapQueryValues(u.Query())
 		}
 	}

@@ -59,7 +59,7 @@ const maxHostVerdictCacheEntries = 4096
 // path. urlFrontier.Restore calls the scope predicate once PER PENDING ENTRY, and
 // LoadCheckpoint admits up to MaxCheckpointEntries (1,000,000), so an uncached
 // checker made resume startup stall for an unbounded, uninterruptible wall-clock
-// period on work that is one lookup per distinct host (LAB-4678, SEC-BE-003).
+// period on work that is one lookup per distinct host (LAB-4678).
 //
 // lookupHost is a field so tests can supply a deterministic resolver instead of
 // depending on the environment's DNS. A crawl builds one checker, so a verdict is
@@ -215,8 +215,7 @@ func scopeCheckerWith(seedURL string, scope string, allowPrivate bool, hc *hostC
 //     is seed identity rather than depth 0 because resume breaks depth as a proxy:
 //     resumeFrontier restores pending entries before the seed is pushed and honors the
 //     Depth the artifact claims, so a crafted checkpoint could put a non-seed URL at
-//     depth 0 ahead of the seed and pick which page learned the origin (LAB-4678,
-//     SEC-BE-004).
+//     depth 0 ahead of the seed and pick which page learned the origin (LAB-4678).
 //
 //  2. It is one-shot and adds exactly ONE origin: the scheme://host the seed resolved
 //     to. It is not a domain-level relaxation, and a second call (a resumed depth-0
@@ -234,7 +233,7 @@ func scopeCheckerWith(seedURL string, scope string, allowPrivate bool, hc *hostC
 //     https://www.target.com redirecting to https://staging-abc.target.com, via an
 //     open redirect, a subdomain takeover or a misconfigured vhost — and operator
 //     --header values are applied per page with no origin check, so a static
-//     Authorization header goes with it (LAB-4678, SEC-BE-009). Under --scope
+//     Authorization header goes with it (LAB-4678). Under --scope
 //     same-domain the narrow bound costs nothing, because the base predicate already
 //     accepts every host under the registrable domain;
 //     TestSeedScope_NarrowingDoesNotAffectSameDomainScope pins that.

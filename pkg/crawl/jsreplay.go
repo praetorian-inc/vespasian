@@ -117,8 +117,8 @@ func (cfg JSReplayConfig) withDefaults() JSReplayConfig {
 		}
 	} else {
 		if cfg.Proxy.Enabled() {
-			// SEC-BE-004: an injected Client owns its transport, so a configured Proxy
-			// is ignored here. Warn rather than bypass the proxy without a trace.
+			// An injected Client owns its transport, so a configured Proxy is ignored
+			// here. Warn rather than bypass the proxy without a trace.
 			fmt.Fprintf(cfg.Stderr, "js-extract: warning: Proxy configured but ignored — an injected Client owns its transport; replay traffic will BYPASS the proxy\n") //nolint:errcheck // best-effort warning
 		}
 		// Caller supplied a client. SSRF-wrap when AllowPrivate is false, and always
@@ -498,8 +498,8 @@ func defaultPortForScheme(scheme string) string {
 // one string. Without it isSameOrigin skips valid same-origin probes. Returns ""
 // if unparseable or hostless.
 //
-// SEC-BE-001: u.Hostname() strips the brackets from an IPv6 literal ("[::1]" ->
-// "::1"), so an IPv6 host is re-bracketed before being joined with ":" + port.
+// u.Hostname() strips the brackets from an IPv6 literal ("[::1]" -> "::1"), so an
+// IPv6 host is re-bracketed before being joined with ":" + port.
 // Without that, two distinct URLs rebuild to the IDENTICAL bracket-less string
 // "https://2001:db8::1:8443" — one with a real port outside the brackets
 // ("https://[2001:db8::1]:8443/x") and one where that digit sequence is part of the
@@ -621,7 +621,7 @@ func firstHTMLOrigin(requests []ObservedRequest) string {
 // Returns "" if none yields a usable origin.
 //
 // A non-empty targetURL that fails to canonicalize does NOT fall through to the
-// capture-derived steps (SEC-BE-001, LAB-4992). The request set may contain synthetic
+// capture-derived steps (LAB-4992). The request set may contain synthetic
 // static:js entries whose URLs are reconstructed from bundle text, because
 // pipeline.Augment runs before the JS-replay hook, so falling through would let a
 // hostile bundle supply the origin that receives --header credentials — silently
@@ -692,7 +692,7 @@ func sanitizeForLog(s string) string {
 	return strconv.Quote(s)
 }
 
-// SanitizeForLog is the exported form of sanitizeForLog (SEC-BE-002, LAB-4992).
+// SanitizeForLog is the exported form of sanitizeForLog (LAB-4992).
 // internal/pipeline's probe-stage cross-origin gate prints attacker-influenced URLs
 // and origins to the same always-on operator sink this package's own warnings use, so
 // it must apply the identical sanitizer rather than growing a second one that can
@@ -733,7 +733,7 @@ func copyHeaders(h map[string]string) map[string]string {
 // does NOT reject private IP literals — callers MUST also run ssrf.ValidateURL before
 // issuing a request.
 //
-// Exported for pkg/analyze/jsstatic (SEC-BE-001, LAB-4992): the fully-offline concat
+// Exported for pkg/analyze/jsstatic (LAB-4992): the fully-offline concat
 // extractor emits absolute reconstructions too and must apply this same gate. A
 // host-only comparison does not suffice, because net/url puts userinfo in u.User, not
 // u.Host, so `"https://".concat("u:p@<bundlehost>/api/x")` has a host equal to the
@@ -2040,10 +2040,10 @@ func ReplayJSExtracted(ctx context.Context, requests []ObservedRequest, cfg JSRe
 		// status that refutes the offline concat mirror for this path — see refuted's
 		// doc comment.
 		//
-		// SEC-BE-004: the drop is announced on Warnings rather than performed silently,
-		// because no probe can separate "absent" from "unauthorized" (again, see
-		// refuted). Naming each dropped path is what lets an operator notice the loss
-		// and re-run with --header or --probe=false.
+		// The drop is announced on Warnings rather than performed silently, because no
+		// probe can separate "absent" from "unauthorized" (again, see refuted). Naming
+		// each dropped path is what lets an operator notice the loss and re-run with
+		// --header or --probe=false.
 		if resp.StatusCode == http.StatusNotFound {
 			refuted[reachedPathKey(fullURL)] = true
 			warnf("js-extract: %s answered 404; dropping its offline js-concat mirror "+

