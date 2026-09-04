@@ -108,7 +108,8 @@
 // [ExtractCookieHeader] pulls the Cookie header out, [ParseCookiesToParams]
 // converts it, and the result is set on the browser before navigating. Cookies
 // must go through the CDP Storage domain rather than Network.setExtraHTTPHeaders:
-// only those survive redirects, new tabs and page-initiated fetch().
+// only Storage-domain cookies survive redirects, new tabs and page-initiated
+// fetch().
 //
 // The package also defines the capture format: a JSON array of ObservedRequest,
 // the interchange between the capture and generation stages.
