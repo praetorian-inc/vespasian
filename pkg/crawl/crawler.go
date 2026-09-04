@@ -34,7 +34,9 @@ const (
 	// unresponsive page blocking the crawl.
 	PageTimeout = 30
 
-	// MaxHTTPBodySize is the per-response read cap.
+	// MaxHTTPBodySize is the per-response read cap (10 MB). It bounds memory against
+	// an attacker-controlled response body; link extraction runs over this read,
+	// MaxResponseBodySize is what is retained.
 	MaxHTTPBodySize = 10 * 1024 * 1024
 
 	interruptMessage = "\ninterrupt received, stopping crawl...\n"

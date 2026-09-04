@@ -40,7 +40,9 @@ type ObservedRequest struct {
 // pkg/generate/rest reads them for the x-vespasian-source extension, so this keeps
 // them in sync without either importing the other.
 const (
-	SourceStaticJS          = "static:js"
+	// SourceStaticJS marks a request recovered as an AST literal from a JS bundle.
+	SourceStaticJS = "static:js"
+	// SourceStaticJSSourcemap marks one recovered from a .js.map sourcesContent entry.
 	SourceStaticJSSourcemap = "static:js-sourcemap"
 	// SourceStaticJSConcat marks a request reconstructed from JS string
 	// concatenation (concat / +-chain / service-prefix, LAB-4992). These are

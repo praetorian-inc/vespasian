@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Threat model: every URL here comes from an attacker-controlled JS bundle.
-// Three defenses, each opt-out-able: same-origin gate (probes and headers stay on
-// the scan target; AllowCrossOrigin), SSRF validation plus SafeDialContext
-// against DNS rebinding (AllowPrivate), and bounds on attempts (MaxEndpoints)
-// and wall-clock (MaxTotalTime).
+// Threat model: every URL here comes from an attacker-controlled JS bundle. Three
+// defenses. Same-origin gate: probes stay on the scan target unless
+// AllowCrossOrigin, operator headers stay on it unconditionally — doRequest
+// re-derives that, and TestReplayJSExtracted_DoesNotForwardHeadersCrossOrigin pins
+// it. SSRF validation plus SafeDialContext against DNS rebinding (AllowPrivate).
+// Bounds on attempts (MaxEndpoints) and wall-clock (MaxTotalTime).
 
 package crawl
 
@@ -164,6 +165,8 @@ func wrapClientWithSSRF(caller *http.Client, timeout time.Duration, stderr io.Wr
 				"Falling back to request-time ssrf.ValidateURLContext on every request.\n", t)
 		clone.Transport = ssrfValidatingRoundTripper{base: caller.Transport}
 	}
+	// A caller Timeout of zero means no limit, which leaves a slow-drip body read
+	// unbounded. Client.Timeout covers the body read too.
 	if clone.Timeout == 0 {
 		clone.Timeout = timeout
 	}

@@ -25,7 +25,10 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
-// maxGRPCWebBundleSize mirrors jsstatic.DefaultMaxBundleSize.
+// maxGRPCWebBundleSize caps the JS body handed to jsluice per capture entry,
+// mirroring jsstatic.DefaultMaxBundleSize. Unlike that path there is no
+// per-bundle timeout and no panic recovery here, so this size cap is the only
+// bound on parse work — do not raise it without adding one.
 const maxGRPCWebBundleSize = 5 * 1024 * 1024 // 5 MB
 
 // ExtractGRPCWebBindings recovers service/method/type names and streaming flags

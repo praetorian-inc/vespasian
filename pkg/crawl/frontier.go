@@ -249,11 +249,15 @@ func (f *urlFrontier) Pop() (urlEntry, bool) {
 			return urlEntry{}, false
 		}
 
+		// Woken by Push, Requeue, MarkIdle or Close.
 		f.cond.Wait()
 	}
 }
 
-// MarkIdle decrements the active counter, after pushing discovered links.
+// MarkIdle decrements the active counter, after pushing discovered links. It is one
+// of the four cond.Broadcast sites (with Push, Requeue and Close) that release a Pop
+// parked in cond.Wait, which has no timeout — a return path that skips MarkIdle
+// parks every waiting worker for the rest of the run.
 func (f *urlFrontier) MarkIdle() {
 	f.mu.Lock()
 	f.active--

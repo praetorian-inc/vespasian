@@ -756,8 +756,10 @@ func networkIdleReached(inFlight int, sinceActivity, elapsed, floor, quiet time.
 //
 // Retaining the bundle is not a scope escape. The browser had already fetched it as a
 // subresource of an in-scope page, so no new request is issued, and nothing downstream
-// treats it as an endpoint: pkg/classify rejects ".js" as a static asset in rule 1 of
-// every classifier, so it cannot reach the spec or the `servers` list. What it can do
+// treats it as an endpoint: pkg/classify's isStaticAssetRequest excludes on the same
+// mediatype.IsJavaScript predicate this filter retains on, plus .js/.mjs/.cjs by
+// extension, so it cannot reach the spec or the `servers` list;
+// TestScopeExemptionCannotBecomeAnEndpoint pins that. What it can do
 // is contribute the paths inside it, which jsstatic resolves against the PAGE url,
 // keeping recovered endpoints on the in-scope origin. Third-party XHR/fetch to
 // analytics and external APIs — the traffic the filter exists for — is JSON, not
@@ -887,7 +889,9 @@ func mergeEnrichedLinks(
 		// Without this, <form action="https://attacker/x"> on an in-scope page
 		// reaches capture.json and then the probe stage, which re-requests it with
 		// the operator's headers attached. Empty Action spec-defaults to pageURL and
-		// is same-origin, so keep those.
+		// is same-origin, so keep those. Everything else is absolute per
+		// resolveFormAction, which is what lets scopeFn judge it — a relative action
+		// would fail parseHTTPURL and be dropped rather than admitted.
 		//
 		// Nil scopeFn aliases `forms` to avoid an allocation — do NOT mutate
 		// scopedForms in that case, the alias reaches the caller's slice.
