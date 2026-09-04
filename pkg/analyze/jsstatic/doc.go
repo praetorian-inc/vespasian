@@ -74,7 +74,7 @@
 //     Scheme="https", Host="" (a single slash after the scheme is not an
 //     authority marker), and without this check it produced a degenerate
 //     "https://" spec server entry that sorted before every real host and
-//     blanked info.title (LAB-4992 review). A hostile bundle literal cannot
+//     blanked info.title (LAB-4992). A hostile bundle literal cannot
 //     steer the offline candidate set — or the probe stage that later
 //     consumes it — at an attacker-chosen host, credential, or byte-spoofed
 //     path.

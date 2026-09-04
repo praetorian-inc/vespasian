@@ -191,11 +191,10 @@ const chromeEgressSink = "https://vespasian-blocked.invalid"
 //     Browsing interstitials interrupt assessment of intentionally-hostile
 //     targets, and should not leak hashed target URLs to Google. Together with
 //     the --disable-component-update CRLSet/list-refresh tradeoff above, the
-//     reduced defense-in-depth is a reviewed, accepted posture (capability-pr-
-//     review SEC-BE-001) tracked under LAB-4732's block-mode flip; it is
-//     bounded by the retained TLS chain verification against the OS trust
-//     store, the cached hash-prefix list, the SSRF/scope guards, and the
-//     short-lived, operator-initiated nature of a crawl.
+//     reduced defense-in-depth is an accepted posture tracked under LAB-4732's
+//     block-mode flip; it is bounded by the retained TLS chain verification
+//     against the OS trust store, the cached hash-prefix list, the SSRF/scope
+//     guards, and the short-lived, operator-initiated nature of a crawl.
 //
 // Investigated and rejected: --safebrowsing-disable-auto-update was removed
 // from Chromium in November 2017 and no longer exists — it would be silently
@@ -204,10 +203,9 @@ const chromeEgressSink = "https://vespasian-blocked.invalid"
 // Known gap: no reliable CLI switch was found for www.google.com. The one
 // candidate, --google-url, defaults to "google.com" (not "www.google.com")
 // and has a single low-confidence production consumer
-// (google_apis/gaia/gaia_urls.cc), so it is not added here. Per the LAB-4999
-// review (REQ-001), if a live audit still shows this host it is handled as a
-// justified egress-allowlist entry in LAB-4732 (the ticket that owns the
-// block-mode flip), not by a launch flag.
+// (google_apis/gaia/gaia_urls.cc), so it is not added here. If a live audit still
+// shows this host, it is handled as a justified egress-allowlist entry in
+// LAB-4732 (the ticket that owns the block-mode flip), not by a launch flag.
 //
 // This change has not been re-validated against a live step-security/harden-runner
 // audit of branded Chrome — that verification is tracked under LAB-4732's

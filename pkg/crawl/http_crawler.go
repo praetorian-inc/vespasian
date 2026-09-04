@@ -164,7 +164,7 @@ func (c *HTTPCrawler) Crawl(ctx context.Context, targetURL string) ([]ObservedRe
 	limiter := rate.NewLimiter(rate.Limit(150), 150)
 
 	// The per-page context already cancels hung fetches; Client.Timeout is defense
-	// in depth if it is ever mis-wired (SEC-BE-001). Both read c.pageTimeout.
+	// in depth if it is ever mis-wired. Both read c.pageTimeout.
 	client := newHTTPClient(scopeFn, c.opts.AllowPrivate, c.pageTimeout, proxyURL, c.opts.ProxyInsecure)
 
 	resumeCfg := c.opts.resume(targetURL)

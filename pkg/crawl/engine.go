@@ -117,7 +117,7 @@ type engineOptions struct {
 	// an empty capture. Only the visit of the SEED ITSELF calls it, gated on
 	// frontier-key identity rather than on Depth == 0 — resume restores pending
 	// entries before the seed is pushed and honors the depth the checkpoint claims,
-	// so depth 0 stopped being a reliable proxy for "is the seed" (LAB-4678 review).
+	// so depth 0 stopped being a reliable proxy for "is the seed" (LAB-4678).
 	// See [learnSeedOrigin] and [seedScope] for the containment reasoning.
 	LearnEffectiveOrigin func(effectiveURL string)
 
@@ -159,7 +159,7 @@ type rodEngine struct {
 	// backend, where one page is one request so it degenerates to a page cap.
 	// Removing `maxRequests := e.opts.MaxRequests` would have left --max-requests
 	// silently inert on the backend Guard actually uses, with every test still green
-	// (LAB-4678 review).
+	// (LAB-4678).
 	visit func(ctx context.Context, target urlEntry) ([]ObservedRequest, []string, error)
 }
 
