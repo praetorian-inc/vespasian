@@ -23,7 +23,7 @@ The `scan` command combines both stages. The `crawl`/`import` and `generate` com
 The CLI (`cmd/vespasian`) uses Kong for argument parsing. Each command (crawl, import, generate, scan) has a `Run()` method. The scan pipeline:
 
 1. Crawl target URL → `[]crawl.ObservedRequest`
-2. Augment requests with static HTML form analysis via `analyze.ExtractForms()` (emits synthetic `ObservedRequest` entries with `Source="static:html"` for every `<form>` in HTML response bodies) — done **before** auto-detection so form-derived REST signals feed the heuristic
+2. Augment requests **before** auto-detection: static HTML form analysis via `analyze.ExtractForms()` (synthetic `ObservedRequest` entries with `Source="static:html"`), then JavaScript static analysis via `pkg/analyze/jsstatic` (`Source="static:js"` / `"static:js-sourcemap"` / `"static:js-concat"`) so form- and JS-derived REST signals feed the heuristic
 3. Auto-detect API type (or use explicit `--api-type`)
 4. Classify requests via `classify.RunClassifiers()` with confidence threshold
 5. Deduplicate classified endpoints
