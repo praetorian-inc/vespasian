@@ -19,12 +19,14 @@ import (
 	"strings"
 )
 
-// ParseHeader parses a single "Key: Value" string, validating that the name is
-// an RFC 7230 token and the value contains no CR, LF, or NUL. Whitespace around
-// the name and value is trimmed.
+// ParseHeader validates the name as an RFC 7230 token and rejects CR, LF and NUL
+// in the value, trimming both.
 //
-// Validation errors deliberately never include the header value (only the
-// name), to avoid leaking secrets such as auth tokens carried in header values.
+// Errors name the header but NEVER echo its value, which routinely carries an auth
+// token; TestParseHeader_ErrorOmitsValue pins the invalid-value path. The guarantee
+// covers the value only — SplitN puts everything before the first colon into the
+// name, so a malformed --header "Bearer tok: x" lands the token in the name that the
+// invalid-name error echoes with %q.
 func ParseHeader(raw string) (name, value string, err error) {
 	parts := strings.SplitN(raw, ":", 2)
 	if len(parts) != 2 {
@@ -53,7 +55,7 @@ func isValidHeaderName(name string) bool {
 	return true
 }
 
-// isTokenChar reports whether c is a valid RFC 7230 tchar.
+// isTokenChar reports an RFC 7230 tchar.
 //
 //nolint:gocyclo // character-class lookup table
 func isTokenChar(c byte) bool {

@@ -25,8 +25,7 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 )
 
-// pendingRequest tracks a network request that has been sent but whose
-// response has not yet been fully received.
+// pendingRequest is a sent request whose response is still arriving.
 type pendingRequest struct {
 	method  string
 	url     string
@@ -48,9 +47,8 @@ type pendingRequest struct {
 	complete bool
 }
 
-// pageNetworkCapture passively captures all network requests and responses on
-// a single page via CDP Network domain events. It correlates request/response
-// pairs by request ID and produces ObservedRequest values.
+// pageNetworkCapture correlates CDP Network events by request ID into
+// ObservedRequest values.
 type pageNetworkCapture struct {
 	mu      sync.Mutex
 	pending map[proto.NetworkRequestID]*pendingRequest
@@ -73,10 +71,8 @@ type pageNetworkCapture struct {
 	lastActivity time.Time
 }
 
-// newPageNetworkCapture creates a capture session and wires up CDP event
-// listeners on the given page. The caller must call wait() (returned by
-// setupListeners) after page navigation completes to ensure all events are
-// processed.
+// newPageNetworkCapture wires up the CDP listeners. The caller must run the
+// returned wait function so events are processed.
 func newPageNetworkCapture(page *rod.Page, pageURL string) (*pageNetworkCapture, func()) {
 	c := &pageNetworkCapture{
 		pending:      make(map[proto.NetworkRequestID]*pendingRequest),
@@ -98,11 +94,9 @@ func newPageNetworkCapture(page *rod.Page, pageURL string) (*pageNetworkCapture,
 // overwritten so only the final hop survives. Appending unconditionally would put the
 // ID in the order index once per hop and Results() would emit that request N times.
 //
-// This is a named method rather than an inline closure so a test can drive the real
-// guard. The regression test used to build c.pending and c.order by hand and then
-// re-implement the guard in its own body ("Mirrors the handler's guard"), which meant
-// deleting the production guard left it green — it asserted against a copy of the code
-// rather than the code (LAB-4678 review, TEST-008).
+// A named method rather than an inline closure so a test can drive the real guard
+// instead of re-implementing it, which would leave the test green with the production
+// guard deleted (LAB-4678).
 func (c *pageNetworkCapture) recordSent(id proto.NetworkRequestID, req *pendingRequest) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -115,9 +109,8 @@ func (c *pageNetworkCapture) recordSent(id proto.NetworkRequestID, req *pendingR
 	c.lastActivity = now
 }
 
-// setupListeners registers CDP event handlers and returns a wait function.
-// The wait function blocks until all registered events resolve. Callers
-// should invoke it in a goroutine; it runs for the lifetime of the page.
+// setupListeners returns a function that blocks for the lifetime of the page; run
+// it in a goroutine.
 func (c *pageNetworkCapture) setupListeners(page *rod.Page) func() {
 	return page.EachEvent(
 		func(e *proto.NetworkRequestWillBeSent) {
@@ -156,21 +149,19 @@ func (c *pageNetworkCapture) setupListeners(page *rod.Page) func() {
 			c.mu.Lock()
 			c.lastActivity = time.Now()
 			req, ok := c.pending[e.RequestID]
+			// CDP replays events, so an already-finalized request must be skipped or
+			// it is written twice.
 			if !ok || req.complete {
-				// Not found or already finalized — skip to prevent
-				// duplicate writes from replayed CDP events (H-1 fix).
 				c.mu.Unlock()
 				return
 			}
-			// Mark complete under lock before releasing for the blocking
-			// CDP call. This ensures no other handler can finalize this
-			// request concurrently (H-1 fix).
+			// Set while still holding the lock, before releasing it for the blocking
+			// CDP call below, so no other handler can finalize this concurrently.
 			req.complete = true
 			c.mu.Unlock()
 
-			// Fetch response body outside the lock — this is a CDP call
-			// that can block. The body may be unavailable (e.g., for
-			// redirects or cached responses); that's fine.
+			// Outside the lock: this CDP call blocks. An unavailable body (redirect,
+			// cached response) is fine.
 			body, err := proto.NetworkGetResponseBody{RequestID: e.RequestID}.Call(page)
 			if err == nil && body != nil {
 				var bodyBytes []byte
@@ -182,9 +173,9 @@ func (c *pageNetworkCapture) setupListeners(page *rod.Page) func() {
 				} else {
 					bodyBytes = []byte(body.Body)
 				}
-				// Truncate at collection time to bound memory usage.
-				// Without this, a hostile page generating many large XHR
-				// responses could exhaust memory (H-3 fix).
+				// At collection time, not at use: a hostile page generating many large
+				// XHR responses would exhaust memory before anything downstream
+				// could cap it.
 				bodyBytes = truncateBody(bodyBytes)
 
 				c.mu.Lock()
@@ -195,13 +186,10 @@ func (c *pageNetworkCapture) setupListeners(page *rod.Page) func() {
 	)
 }
 
-// Results returns all captured network exchanges as ObservedRequest values, in
-// the order the requests were first sent. Call this after navigation and DOM
-// stability wait are complete.
-//
-// The order matters beyond aesthetics: capture.json is the pipeline's
-// intermediate artifact and the README documents identical input as producing
-// identical output, so a per-page order taken from Go's randomized map iteration
+// Results is valid once navigation and the stability wait are complete. Requests come
+// back in the order they were first sent, not map order: capture.json is the
+// pipeline's intermediate artifact and the README documents identical input as
+// producing identical output, so an order taken from Go's randomized map iteration
 // made the artifact differ byte-for-byte between runs on the same target.
 func (c *pageNetworkCapture) Results() []ObservedRequest {
 	c.mu.Lock()
@@ -218,12 +206,11 @@ func (c *pageNetworkCapture) Results() []ObservedRequest {
 	return results
 }
 
-// networkState reports how many requests are still in flight and how long it has
-// been since the last network activity, as of now. A request counts as in flight
-// only while it has not completed AND its age is under perReqTimeout, so a single
-// hung or never-finishing request stops blocking network-idle after perReqTimeout
-// rather than pinning the crawl to the page ceiling. Drives the engine's
-// completion-driven wait (LAB-4678 Phase 1).
+// networkState reports how many requests are still in flight and how long it has been
+// since the last network activity, as of now. A request counts as in flight only while
+// it has not completed AND its age is under perReqTimeout, so one hung request stops
+// blocking network-idle after perReqTimeout instead of pinning the crawl to the page
+// ceiling. Drives the engine's completion-driven wait (LAB-4678).
 func (c *pageNetworkCapture) networkState(perReqTimeout time.Duration, now time.Time) (inFlight int, sinceLastActivity time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -235,10 +222,8 @@ func (c *pageNetworkCapture) networkState(perReqTimeout time.Duration, now time.
 	return inFlight, now.Sub(c.lastActivity)
 }
 
-// mapNetworkToObservedRequest converts a captured network exchange to an
-// ObservedRequest and extracts query parameters. Body truncation is applied
-// at collection time (NetworkRequestWillBeSent for request bodies,
-// NetworkLoadingFinished for response bodies), not here.
+// mapNetworkToObservedRequest converts one exchange. Bodies were already
+// truncated at collection time, not here.
 func mapNetworkToObservedRequest(req *pendingRequest, pageURL string) ObservedRequest {
 	obs := ObservedRequest{
 		Method:  req.method,
@@ -259,7 +244,6 @@ func mapNetworkToObservedRequest(req *pendingRequest, pageURL string) ObservedRe
 		obs.Method = "GET"
 	}
 
-	// Parse query parameters from URL.
 	if obs.URL != "" {
 		if u, err := url.Parse(obs.URL); err == nil {
 			obs.QueryParams = CapQueryValues(u.Query())
@@ -269,7 +253,6 @@ func mapNetworkToObservedRequest(req *pendingRequest, pageURL string) ObservedRe
 	return obs
 }
 
-// truncateBody returns body truncated to MaxResponseBodySize.
 func truncateBody(body []byte) []byte {
 	if len(body) > MaxResponseBodySize {
 		return body[:MaxResponseBodySize]
@@ -277,8 +260,7 @@ func truncateBody(body []byte) []byte {
 	return body
 }
 
-// flattenNetworkHeaders converts CDP NetworkHeaders (map[string]gson.JSON) to
-// a simple map[string]string, lowercasing header names for consistency.
+// flattenNetworkHeaders lowercases header names.
 func flattenNetworkHeaders(headers proto.NetworkHeaders) map[string]string {
 	if len(headers) == 0 {
 		return nil

@@ -21,8 +21,7 @@ import (
 	"github.com/go-rod/rod"
 )
 
-// discoveredForm represents a form found in the DOM with its action, method,
-// and input fields extracted.
+// discoveredForm is a DOM form with its action, method and fields.
 type discoveredForm struct {
 	Action      string            // resolved absolute URL
 	Method      string            // GET or POST
@@ -30,13 +29,8 @@ type discoveredForm struct {
 	Fields      map[string]string // name → value (defaults or placeholders)
 }
 
-// extractForms finds all <form> elements in the page DOM and extracts their
-// action, method, and input fields. Explicit action="…" attributes are
-// resolved against baseURL (the page's <base href>-aware base) so that
-// relative refs on SPA routes produce the same URL the browser would submit
-// to. When a form has no action attribute the HTML spec (§4.10.21.3) says
-// the form submits to the document's URL — pageURL here — *not* the base
-// href, so no-action forms keep the current route.
+// extractForms reads every <form> in the DOM. See resolveFormAction for why
+// pageURL and baseURL are both needed.
 func extractForms(page *rod.Page, pageURL, baseURL string) ([]discoveredForm, error) {
 	formElements, err := page.Elements("form")
 	if err != nil {
@@ -50,7 +44,6 @@ func extractForms(page *rod.Page, pageURL, baseURL string) ([]discoveredForm, er
 			Fields:      make(map[string]string),
 		}
 
-		// Extract method (default GET).
 		method, err := form.Attribute("method")
 		if err == nil && method != nil {
 			df.Method = strings.ToUpper(strings.TrimSpace(*method))
@@ -59,8 +52,6 @@ func extractForms(page *rod.Page, pageURL, baseURL string) ([]discoveredForm, er
 			df.Method = "GET"
 		}
 
-		// Resolve action attribute (empty → pageURL; non-empty →
-		// resolved against baseURL). See resolveFormAction.
 		action, err := form.Attribute("action")
 		rawAction := ""
 		if err == nil && action != nil {
@@ -72,13 +63,11 @@ func extractForms(page *rod.Page, pageURL, baseURL string) ([]discoveredForm, er
 		}
 		df.Action = resolved
 
-		// Extract enctype if specified.
 		enctype, err := form.Attribute("enctype")
 		if err == nil && enctype != nil && *enctype != "" {
 			df.ContentType = strings.TrimSpace(*enctype)
 		}
 
-		// Extract input fields: <input>, <select>, <textarea>.
 		extractFormFields(form, df.Fields)
 
 		forms = append(forms, df)
@@ -87,17 +76,11 @@ func extractForms(page *rod.Page, pageURL, baseURL string) ([]discoveredForm, er
 	return forms, nil
 }
 
-// resolveFormAction returns the absolute URL that a form submits to.
+// resolveFormAction returns the absolute submit URL, or ("", false) for
+// unparseable or non-navigable actions so the caller drops the form.
 //
-//   - If rawAction is empty/whitespace, the HTML spec (§4.10.21.3) says
-//     the form submits to the document's URL — pageURL — so we return
-//     pageURL unchanged.
-//   - Otherwise, rawAction is resolved against baseURL (the page's
-//     <base href>-aware base) so relative refs on SPA routes produce
-//     the URL the browser would submit to.
-//   - Returns (resolved, true) for usable HTTP(S) actions and ("", false)
-//     for unparseable inputs or non-navigable schemes (javascript:,
-//     mailto:, etc.) so the caller can drop the form entirely.
+// An empty action submits to the document URL per HTML §4.10.21.3 — pageURL, NOT
+// the base href. A non-empty one resolves against baseURL.
 func resolveFormAction(rawAction, pageURL, baseURL string) (string, bool) {
 	if strings.TrimSpace(rawAction) == "" {
 		return pageURL, true
@@ -109,9 +92,8 @@ func resolveFormAction(rawAction, pageURL, baseURL string) (string, bool) {
 	return resolved, true
 }
 
-// formsToObservedRequests converts discovered forms into synthetic
-// ObservedRequest entries. For GET forms, the fields become query parameters.
-// For POST forms, the fields become a URL-encoded body.
+// formsToObservedRequests makes fields query params for GET, a URL-encoded body
+// otherwise.
 func formsToObservedRequests(forms []discoveredForm, pageURL string) []ObservedRequest {
 	var results []ObservedRequest
 	for _, f := range forms {
@@ -124,7 +106,6 @@ func formsToObservedRequests(forms []discoveredForm, pageURL string) []ObservedR
 
 		if f.Method == "POST" {
 			obs.Headers = map[string]string{}
-			// Encode fields as URL-encoded form body.
 			formData := url.Values{}
 			for k, v := range f.Fields {
 				formData.Set(k, v)
@@ -132,12 +113,10 @@ func formsToObservedRequests(forms []discoveredForm, pageURL string) []ObservedR
 			obs.Body = []byte(formData.Encode())
 			obs.Headers["content-type"] = f.ContentType
 
-			// Parse query params from the action URL.
 			if u, err := url.Parse(f.Action); err == nil {
 				obs.QueryParams = CapQueryValues(u.Query())
 			}
 		} else {
-			// GET form: merge fields into query params.
 			if u, err := url.Parse(f.Action); err == nil {
 				q := u.Query()
 				for k, v := range f.Fields {
@@ -155,8 +134,7 @@ func formsToObservedRequests(forms []discoveredForm, pageURL string) []ObservedR
 	return results
 }
 
-// extractFormFields populates the fields map from a form element's input,
-// select, and textarea children.
+// extractFormFields reads input, select and textarea children.
 func extractFormFields(form *rod.Element, fields map[string]string) {
 	inputs, err := form.Elements("input[name], select[name], textarea[name]")
 	if err != nil {
@@ -176,8 +154,7 @@ func extractFormFields(form *rod.Element, fields map[string]string) {
 	}
 }
 
-// isSkippableInputType returns true for input types that don't carry API data
-// (submit, button, image, file, reset).
+// isSkippableInputType covers submit, button, image, file and reset.
 func isSkippableInputType(input *rod.Element) bool {
 	inputType, err := input.Attribute("type")
 	if err != nil || inputType == nil {
@@ -190,8 +167,7 @@ func isSkippableInputType(input *rod.Element) bool {
 	return false
 }
 
-// getInputValue returns the value attribute of an input, falling back to
-// the placeholder attribute, or empty string.
+// getInputValue falls back to placeholder, then "".
 func getInputValue(input *rod.Element) string {
 	val, err := input.Attribute("value")
 	if err == nil && val != nil && *val != "" {

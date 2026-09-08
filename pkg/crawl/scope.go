@@ -28,57 +28,52 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/ssrf"
 )
 
-// isPrivateIP reports whether ip falls within a private or internal network.
-// It delegates to pkg/ssrf.IsPrivateIP, which is the single source of truth
-// for the CIDR list shared by the crawl and probe stages.
+// isPrivateIP delegates to pkg/ssrf.IsPrivateIP, the single source for the CIDR
+// list shared with the probe stage.
 func isPrivateIP(ip net.IP) bool {
 	return ssrf.IsPrivateIP(ip)
 }
 
-// isPrivateHost resolves a hostname via DNS and returns true if any of the
-// resolved IPs are private/internal. Also returns true for raw IP addresses
-// in private ranges. This prevents the browser from navigating to internal
-// network endpoints (SSRF protection).
+// isPrivateHost resolves the host and reports true if any address is private, as it
+// does for a raw IP literal in a private range. This is the upfront check only — it
+// cannot bind what Chrome later resolves, and the headless path has no dial-time
+// revalidation (see crawlHeadless).
 //
-// Uncached. Prefer a [hostChecker] for anything on a per-URL path; this remains
-// for one-shot call sites and for tests that assert the raw resolution behavior.
+// Uncached. Prefer a [hostChecker] for anything on a per-URL path; this remains for
+// one-shot call sites and for tests that assert the raw resolution behavior.
 func isPrivateHost(hostname string) bool {
 	return newHostChecker().isPrivate(hostname)
 }
 
-// maxHostVerdictCacheEntries bounds the memoization map. A crawl is scope-limited
-// to one origin or one registrable domain, so the distinct-host count is small in
-// practice; the cap exists so a wildcard-DNS target cannot grow the map without
-// bound. Past the cap the checker still answers correctly, it just stops caching.
+// maxHostVerdictCacheEntries bounds the memoization map. A crawl is scope-limited to
+// one origin or one registrable domain, so the distinct-host count is small in
+// practice; the cap exists so a wildcard-DNS target cannot grow the map without bound.
+// Past the cap the checker still answers correctly, it just stops caching.
 const maxHostVerdictCacheEntries = 4096
 
 // hostChecker answers "is this hostname private?" and MEMOIZES the verdict per
 // hostname for its own lifetime.
 //
-// Why memoization is load-bearing rather than an optimization: the verdict comes
-// from a blocking net.LookupHost that takes no context, and it sits on the
-// per-URL scope path. Every scope check of an out-of-origin URL paid a fresh
-// uncached resolution, and urlFrontier.Restore calls the scope predicate once PER
-// PENDING ENTRY, with LoadCheckpoint admitting up to MaxCheckpointEntries
-// (1,000,000). That made resume startup stall for an unbounded wall-clock period,
-// uninterruptible, on work that is one lookup per distinct host (LAB-4678 review,
-// SEC-BE-003). The prior fix removed the redundant lookup from seedScope.Check's
-// learned-origin comparison but left the class in place on s.base.
+// Memoization is load-bearing rather than an optimization: the verdict comes from a
+// blocking net.LookupHost that takes no context, and it sits on the per-URL scope
+// path. urlFrontier.Restore calls the scope predicate once PER PENDING ENTRY, and
+// LoadCheckpoint admits up to MaxCheckpointEntries (1,000,000), so an uncached
+// checker made resume startup stall for an unbounded, uninterruptible wall-clock
+// period on work that is one lookup per distinct host (LAB-4678).
 //
 // lookupHost is a field so tests can supply a deterministic resolver instead of
 // depending on the environment's DNS. A crawl builds one checker, so a verdict is
 // cached for the run and not across runs, which keeps the staleness window to a
 // single crawl.
 //
-// What backs that window differs by backend, and the difference is the reason to
-// state it rather than call the scope check a pre-filter and stop. On the net/http
-// backend pkg/ssrf's SafeDialContext re-resolves at connect time and is what
-// actually defeats DNS rebinding. On the HEADLESS backend Chrome does its own
-// dialing, so SafeDialContext never runs and this verdict is the only DNS-derived
-// gate; memoizing widens its staleness window from per-check to per-run. The TOCTOU
-// is not introduced by memoization — Chrome re-resolves independently of any check
-// Go made — but the run-length window is what this trades for bounding Restore's
-// per-entry resolution cost.
+// What backs that window differs by backend, which is why it is stated rather than
+// called a pre-filter. On the net/http backend pkg/ssrf's SafeDialContext re-resolves
+// at connect time and is what actually defeats DNS rebinding. On the HEADLESS backend
+// Chrome does its own dialing, so SafeDialContext never runs and this verdict is the
+// only DNS-derived gate; memoizing widens its staleness window from per-check to
+// per-run. The TOCTOU is not introduced by memoization — Chrome re-resolves
+// independently of any check Go made — but the run-length window is what this trades
+// for bounding Restore's per-entry resolution cost.
 type hostChecker struct {
 	lookupHost func(string) ([]string, error)
 
@@ -120,14 +115,14 @@ func (h *hostChecker) isPrivate(hostname string) bool {
 	return private
 }
 
-// resolveIsPrivate performs the resolution itself. Split out so the lookup is
-// never held under h.mu: two goroutines racing on the same new hostname each pay
-// one lookup, which is strictly better than serializing every caller behind the
-// lock for the duration of a DNS round trip.
+// resolveIsPrivate performs the resolution itself. Split out so the lookup is never
+// held under h.mu: two goroutines racing on the same new hostname each pay one lookup,
+// which is strictly better than serializing every caller behind the lock for the
+// duration of a DNS round trip.
 func (h *hostChecker) resolveIsPrivate(hostname string) bool {
 	addrs, err := h.lookupHost(hostname) //nolint:gosec // G704: intentional SSRF protection — taint flows to isPrivateIP below
 	if err != nil {
-		// DNS failure — reject to be safe.
+		// Fail closed.
 		return true
 	}
 	for _, addr := range addrs {
@@ -138,14 +133,12 @@ func (h *hostChecker) resolveIsPrivate(hostname string) bool {
 	return false
 }
 
-// scopeChecker returns a function that checks whether a URL is in scope
-// relative to the seed URL, based on the scope policy. Unless allowPrivate
-// is true, URLs that resolve to private/internal IP addresses are rejected
-// to prevent SSRF attacks when the crawl engine runs as a service component.
+// scopeChecker returns an in-scope predicate. Unless allowPrivate, URLs resolving
+// to private addresses are rejected, which matters when the engine runs as a
+// service component.
 //
-// Scope policies:
-//   - "same-origin": exact scheme + host + port match
-//   - "same-domain": registered domain match, allowing subdomains
+//   - "same-origin": exact scheme, host and port
+//   - "same-domain": registered domain, subdomains allowed
 //
 // The returned predicate memoizes private-host verdicts for its own lifetime; see
 // [hostChecker].
@@ -166,7 +159,6 @@ func scopeCheckerWith(seedURL string, scope string, allowPrivate bool, hc *hostC
 		return nil, fmt.Errorf("seed URL has no host: %q", redactSeedURL(seedURL))
 	}
 
-	// ssrfCheck returns false (reject) if the URL resolves to a private IP.
 	ssrfCheck := func(u *url.URL) bool {
 		if allowPrivate {
 			return true
@@ -204,77 +196,66 @@ func scopeCheckerWith(seedURL string, scope string, allowPrivate bool, hc *hostC
 	}
 }
 
-// seedScope is the crawl's scope predicate plus a one-shot widening to the origin
-// the SEED URL actually resolved to after redirects.
+// seedScope is the crawl's scope predicate plus a one-shot widening to the origin the
+// SEED URL actually resolved to after redirects.
 //
-// Why it exists: an operator who seeds http://example.com against a server that
-// 302s to https://example.com (or apex → www) gets a crawl where Chrome follows
-// the redirect and every CDP-captured request carries the POST-redirect origin.
-// The same-origin predicate compares "scheme://host" exactly, so it rejected all
-// of them and the run produced an empty capture with exit code 0 and no
-// diagnostic. Learning the seed's effective origin is what makes the common
-// "http → https" and "apex → www" deployments crawlable at all.
+// Why it exists: an operator who seeds http://example.com against a server that 302s
+// to https://example.com (or apex → www) gets a crawl where Chrome follows the
+// redirect and every CDP-captured request carries the POST-redirect origin. The
+// same-origin predicate compares "scheme://host" exactly, so it rejected all of them
+// and the run produced an empty capture with exit code 0 and no diagnostic.
 //
 // CONTAINMENT. Scope is an engagement containment control, so the widening is
 // deliberately narrow and auditable:
 //
-//  1. Only the SEED's own navigation can widen scope. LearnEffectiveOrigin is
-//     called from the visit of the entry whose frontier key EQUALS the seed's, and
-//     nowhere else, so a redirect issued by some arbitrary page deeper in the crawl
-//     — which an attacker-controlled page could trigger at will — never widens
-//     anything. The gate is seed identity rather than depth 0 because resume broke
-//     depth as a proxy: resumeFrontier restores pending entries before the seed is
-//     pushed and honors the Depth the artifact claims, so a crafted checkpoint could
-//     put a non-seed URL at depth 0 ahead of the seed and pick which page learned
-//     the origin (LAB-4678 review, SEC-BE-004).
+//  1. Only the SEED's own navigation can widen scope. LearnEffectiveOrigin is called
+//     from the visit of the entry whose frontier key EQUALS the seed's, and nowhere
+//     else, so a redirect issued by an arbitrary page deeper in the crawl — which an
+//     attacker-controlled page could trigger at will — never widens anything. The gate
+//     is seed identity rather than depth 0 because resume breaks depth as a proxy:
+//     resumeFrontier restores pending entries before the seed is pushed and honors the
+//     Depth the artifact claims, so a crafted checkpoint could put a non-seed URL at
+//     depth 0 ahead of the seed and pick which page learned the origin (LAB-4678).
 //
-//  2. It is one-shot and adds exactly ONE origin: the scheme://host the seed
-//     resolved to. It is not a domain-level relaxation, and a second call (a
-//     resumed depth-0 entry, a retry) cannot add another origin.
+//  2. It is one-shot and adds exactly ONE origin: the scheme://host the seed resolved
+//     to. It is not a domain-level relaxation, and a second call (a resumed depth-0
+//     entry, a retry) cannot add another origin.
 //
 //  3. The learned origin must be a HOST VARIANT of the seed: the same host, or the
 //     seed's host with a leading "www." added or removed. That is exactly the set of
 //     cases the widening exists for (http→https, apex→www) and nothing more. Scheme
-//     and port may change, because http→https is itself a port change and a
-//     different port on the same host crosses no host boundary.
+//     and port may change, because http→https is itself a port change and a different
+//     port on the same host crosses no host boundary.
 //
-//     This bound used to be the seed's REGISTRABLE DOMAIN, which is the
-//     "same-domain" policy applied regardless of what the operator configured. Under
-//     --scope same-origin the policy predicate is an exact scheme://host comparison,
-//     so that admitted one origin the operator had excluded: seed
-//     https://www.target.com redirecting to https://staging-abc.target.com put that
-//     host in scope, and operator --header values are applied per page with no origin
-//     check, so a static Authorization header went with it. It also contradicted the
-//     doc.go package comment, which names only http→https and apex→www, and
-//     scopeChecker, which documents same-domain as the mode that allows subdomains
-//     (LAB-4678 review, SEC-BE-009).
+//     Bounding on the host rather than the REGISTRABLE DOMAIN is what keeps the
+//     widening inside --scope same-origin, whose predicate is an exact scheme://host
+//     comparison. A domain bound admits an origin the operator excluded — seed
+//     https://www.target.com redirecting to https://staging-abc.target.com, via an
+//     open redirect, a subdomain takeover or a misconfigured vhost — and operator
+//     --header values are applied per page with no origin check, so a static
+//     Authorization header goes with it (LAB-4678). Under --scope
+//     same-domain the narrow bound costs nothing, because the base predicate already
+//     accepts every host under the registrable domain;
+//     TestSeedScope_NarrowingDoesNotAffectSameDomainScope pins that.
 //
-//     Narrowing this costs nothing under --scope same-domain, where the base
-//     predicate already accepts every host under the registrable domain and the
-//     learned origin was never load-bearing. TestSeedScope_NarrowingDoesNotAffectSameDomainScope
-//     pins that.
-//
-//     An IdP hand-off, an open redirect on the seed, or any other foreign-domain
-//     target is refused, and so is a sibling subdomain. Both refusals are reported
-//     with the remedy: re-seed at the resolved URL, which admits exactly the one
-//     origin the operator chose, rather than --scope same-domain, which would admit
-//     every subdomain. Without a bound here the widening turned one redirect into
-//     crawl scope the operator never authorized, defeating --scope as a containment
-//     control (Codex review, PR #189; narrowed by LAB-4678 review, SEC-BE-009).
+//     An IdP hand-off, an open redirect on the seed, any other foreign-domain target,
+//     and a sibling subdomain are all refused. Both refusals are reported with the
+//     remedy: re-seed at the resolved URL, which admits exactly the one origin the
+//     operator chose, rather than --scope same-domain, which would admit every
+//     subdomain.
 //
 //  4. The SSRF gate still applies. A seed that redirects to 127.0.0.1,
-//     169.254.169.254, or any RFC1918 address is refused unless the operator
-//     passed --dangerous-allow-private, exactly as for the seed itself. The
-//     verdict is taken once, at learn time, not per URL.
+//     169.254.169.254, or any RFC1918 address is refused unless the operator passed
+//     --dangerous-allow-private, exactly as for the seed itself. The verdict is taken
+//     once, at learn time, not per URL.
 //
-//  5. The widening is announced on stderr, so the operator sees the effective
-//     scope of the run instead of silently getting a wider crawl.
+//  5. The widening is announced on stderr, so the operator sees the effective scope of
+//     the run instead of silently getting a wider crawl.
 //
-// This applies to the headless backend only. On the net/http backend
-// redirectScopeGuard rejects the cross-origin redirect during the seed fetch and
-// the failure is already reported on stderr, so that path is loud rather than
-// silent; widening it would mean letting a redirect through the guard before the
-// guard has decided, which is a change to the control itself and out of scope here.
+// Headless backend only. On the net/http backend redirectScopeGuard rejects the
+// cross-origin redirect during the seed fetch and reports it on stderr, so that path
+// is loud rather than silent; widening it would mean letting a redirect through the
+// guard before the guard has decided, which is a change to the control itself.
 type seedScope struct {
 	base         func(string) bool // policy predicate from scopeChecker (origin/domain match + SSRF)
 	allowPrivate bool
@@ -316,9 +297,9 @@ func newSeedScope(seedURL, scope string, allowPrivate bool, stderr io.Writer) (*
 	}, nil
 }
 
-// Check reports whether rawURL is in scope: either the configured policy accepts
-// it, or it is on the seed's learned effective origin, which cleared the domain
-// and SSRF gates once at learn time.
+// Check reports whether rawURL is in scope: either the configured policy accepts it,
+// or it is on the seed's learned effective origin, which cleared the domain and SSRF
+// gates once at learn time.
 func (s *seedScope) Check(rawURL string) bool {
 	if s.base(rawURL) {
 		return true
@@ -329,12 +310,11 @@ func (s *seedScope) Check(rawURL string) bool {
 	if eff == "" {
 		return false
 	}
-	// A plain string comparison: the effective origin already cleared the domain
-	// and private-host gates in LearnEffectiveOrigin, and it is a single fixed
-	// host whose verdict cannot change within a run. Re-running isPrivateHost here
-	// re-did an unbounded, uncached net.LookupHost on the per-captured-request
-	// scope hot path, and s.base had already paid for one lookup before returning
-	// false (CodeRabbit review, PR #189).
+	// A plain string comparison: the effective origin already cleared the domain and
+	// private-host gates in LearnEffectiveOrigin, and it is a single fixed host whose
+	// verdict cannot change within a run. Re-running isPrivateHost here would re-do an
+	// unbounded, uncached net.LookupHost on the per-captured-request scope hot path,
+	// and s.base has already paid for one lookup before returning false.
 	return originOf(rawURL) == eff
 }
 
@@ -352,10 +332,9 @@ func (s *seedScope) LearnEffectiveOrigin(effectiveURL string) {
 
 	// Claim the one-shot under the lock, then RELEASE it before the domain and
 	// private-host checks. isPrivateHost is an unbounded, uncached net.LookupHost;
-	// holding the exclusive lock across it blocked every concurrent Check for the
-	// whole resolution. The learned flag already guarantees only one caller gets
-	// past here, so the checks need no lock — it is only reacquired to publish the
-	// result (CodeRabbit review, PR #189).
+	// holding the exclusive lock across it blocks every concurrent Check for the whole
+	// resolution. The learned flag already guarantees only one caller gets past here,
+	// so the checks need no lock — it is only reacquired to publish the result.
 	s.mu.Lock()
 	if s.learned {
 		s.mu.Unlock()
@@ -367,34 +346,9 @@ func (s *seedScope) LearnEffectiveOrigin(effectiveURL string) {
 	if origin == s.seedOrigin {
 		return
 	}
-	// The widening exists for http→https and apex→www, and the learned origin must be
-	// one of those: the SAME HOST, or the seed's host with a leading "www." added or
-	// removed. Anything else is refused.
-	//
-	// This used to be bounded by the seed's REGISTRABLE DOMAIN instead, which is the
-	// "same-domain" policy applied regardless of what the operator configured. Under
-	// --scope same-origin the policy predicate is an exact scheme://host comparison, so
-	// that bound admitted one origin the operator had excluded: seed
-	// https://www.target.com redirecting to https://staging-abc.target.com — via an
-	// open redirect on the seed, a subdomain takeover, or a misconfigured vhost — put
-	// that origin in scope, and operator --header values are applied per page with no
-	// origin check, so a static Authorization header went with it. Scope is an
-	// engagement containment boundary, so admitting a host the operator excluded is
-	// the more expensive error (LAB-4678 review, SEC-BE-009).
-	//
-	// The narrow rule is also what this package already documented: the doc.go
-	// package comment names "http -> https, apex -> www" as the cases the widening
-	// exists for, and scopeChecker documents same-domain as the mode that allows
-	// subdomains. The registrable-domain bound was the outlier.
-	//
-	// Bounded on the HOST, so scheme and port may change: http→https IS a port change
-	// (80→443) as far as origins go, so the rule cannot key on port, and a different
-	// port on the same host crosses no host boundary — the operator's credentials go
-	// to the same machine either way, and engagements scope by host.
-	//
-	// Under --scope same-domain this narrowing changes nothing, verified by test: the
-	// base predicate already accepts every host under the registrable domain there, so
-	// the learned origin was never load-bearing in that mode.
+	// Host-variant bound: same host, or the seed's host ± a leading "www.". See
+	// [seedScope]'s host-variant bound for why it is the host and not the registrable
+	// domain.
 	if !s.sameHostVariant(u.Hostname()) {
 		if s.stderr != nil {
 			// Two messages, because they are different operator situations: a foreign
@@ -441,10 +395,10 @@ func (s *seedScope) seedHostname() string {
 	return ""
 }
 
-// sameHostVariant reports whether host is the seed's own host, or the seed's host
-// with a leading "www." added or removed. That is the bound on how far the
-// seed-redirect widening may reach: exactly the two cases doc.go documents it for,
-// http→https (same host, scheme change) and apex→www.
+// sameHostVariant reports whether host is the seed's own host, or the seed's host with
+// a leading "www." added or removed. That is the bound on how far the seed-redirect
+// widening may reach: exactly the two cases doc.go documents it for, http→https (same
+// host, scheme change) and apex→www.
 //
 // Both directions of the www swap are accepted. doc.go names "apex -> www", but the
 // reverse redirect is just as common a deployment and is the same one-label
@@ -471,11 +425,11 @@ func (s *seedScope) sameHostVariant(host string) bool {
 
 // sameRegistrableDomain reports whether host shares the seed's registrable domain.
 //
-// It is no longer the widening GATE — sameHostVariant is, see LearnEffectiveOrigin
-// for why. It survives as a diagnostic classifier, to tell the operator whether a
-// refused redirect went to a foreign domain (usually an IdP hand-off or an open
-// redirect) or to a sibling host on their own domain (usually the real app on
-// another subdomain). Those are different situations and deserve different messages.
+// It is NOT the widening gate — sameHostVariant is, see [seedScope]'s host-variant
+// bound. It is a diagnostic classifier, to tell the operator whether a refused redirect
+// went to a foreign domain (usually an IdP hand-off or an open redirect) or to a
+// sibling host on their own domain (usually the real app on another subdomain). Those
+// are different situations and deserve different messages.
 //
 // It falls back to an exact hostname match when either side has no registrable
 // domain — an IP-literal or single-label seed such as http://127.0.0.1:8080 or
@@ -493,7 +447,7 @@ func (s *seedScope) sameRegistrableDomain(host string) bool {
 	return strings.EqualFold(seedDomain, hostDomain)
 }
 
-// parseHTTPURL parses a URL and returns nil if it is invalid or not HTTP(S).
+// parseHTTPURL returns nil for invalid or non-HTTP(S) URLs.
 func parseHTTPURL(rawURL string) *url.URL {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Host == "" {
@@ -505,8 +459,7 @@ func parseHTTPURL(rawURL string) *url.URL {
 	return u
 }
 
-// registeredDomain extracts the eTLD+1 (registered domain) from a hostname.
-// For example, "api.example.com" returns "example.com".
+// registeredDomain returns the eTLD+1: "api.example.com" -> "example.com".
 func registeredDomain(host string) (string, error) {
 	domain, err := publicsuffix.EffectiveTLDPlusOne(host)
 	if err != nil {
@@ -515,54 +468,38 @@ func registeredDomain(host string) (string, error) {
 	return domain, nil
 }
 
-// ssrfSafeDialContext is a net.Dialer DialContext replacement that re-resolves
-// the target host and rejects the connection if any resolved IP is private or
-// internal (SSRF protection). By performing the IP check at dial time — not
-// only in the upfront scope/SSRF check — it closes the DNS-rebinding TOCTOU
-// window: a short-TTL domain that resolves to a public IP during the scope
-// check can be re-resolved to 127.0.0.1 or another private address by the
-// time client.Do actually dials the connection.
-//
-// It delegates to pkg/ssrf.SafeDialContext, which is the shared implementation
-// used by both pkg/crawl and pkg/probe.
+// ssrfSafeDialContext re-resolves at dial time, closing the DNS-rebinding TOCTOU
+// window: a short-TTL domain can pass the upfront scope check as a public IP and
+// resolve to 127.0.0.1 by the time client.Do dials. Delegates to
+// pkg/ssrf.SafeDialContext, shared with pkg/probe.
 func ssrfSafeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	return ssrf.SafeDialContext(ctx, network, addr)
 }
 
-// seenKey returns the frontier's DEDUP key for rawURL: the canonicalized URL
-// with its query string intact. Two links differing only in query string get
-// different keys and are therefore separate pages
-// ([urlFrontier.Push], [urlFrontier.Restore], [urlFrontier.Snapshot]). It is also
-// the seed's identity for effective-origin learning (rodEngine.seedKey).
+// seenKey returns the frontier's DEDUP key for rawURL: the canonicalized URL with its
+// query string intact. Two links differing only in query string get different keys and
+// are therefore separate pages ([urlFrontier.Push], [urlFrontier.Restore],
+// [urlFrontier.Snapshot]). It is also the seed's identity for effective-origin
+// learning (rodEngine.seedKey).
 //
-// Paired with [frontierKey] rather than inlined: the two keys differ only in a
-// bool argument to canonicalizeURL, and while this one had no name every caller
-// that wanted it reached for frontierKey instead. Test fixtures for
-// Checkpoint.Seen and rodEngine.seedKey did exactly that, and passed only because
-// the URLs they used carried no query — the case in which the two agree.
+// Named rather than inlined because it and [frontierKey] differ only in one bool
+// argument to canonicalizeURL: a caller that reaches for the wrong one still passes
+// every fixture whose URLs carry no query, the case in which the two agree.
 func seenKey(rawURL string) string {
 	return canonicalizeURL(rawURL, false)
 }
 
 // frontierKey returns the PER-PATH key for rawURL: the canonicalized URL with its
-// query string removed. It is not the dedup key — see [seenKey] — and is used for
-// exactly one thing: counting how many query variants of a single path the
-// frontier has admitted, bounded by [maxQueryVariantsPerPath].
-//
-// It was the dedup key in LAB-4678 Phase 1, which collapsed every query variant of
-// a path to one visit. That was reverted later in the same ticket: collapsing
-// assumed the query selects which ROW a page shows, true for /product?id=N and
-// false for ?page=2 and ?tab=billing, where the query selects a different page and
-// normalizing the path does not normalize the results. The cap replaced the
-// collapse, so a path is visited up to maxQueryVariantsPerPath times rather than
-// once, and this function survives only as that cap's bucket key.
+// query string removed. It is NOT the dedup key — see [seenKey] — and is used for
+// exactly one thing: counting how many query variants of a single path the frontier
+// has admitted, bounded by [maxQueryVariantsPerPath], whose doc comment carries the
+// reasoning for capping rather than collapsing variants.
 func frontierKey(rawURL string) string {
 	return canonicalizeURL(rawURL, true)
 }
 
-// canonicalizeURL lowercases scheme and host, strips the fragment and any
-// default port, and — when stripQuery is set — removes the query string.
-// Returns "" on a parse error.
+// canonicalizeURL lowercases scheme and host, strips the fragment and any default
+// port, and — when stripQuery is set — removes the query string. "" on a parse error.
 func canonicalizeURL(rawURL string, stripQuery bool) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -575,7 +512,7 @@ func canonicalizeURL(rawURL string, stripQuery bool) string {
 	u.Host = strings.ToLower(u.Host)
 	u.Scheme = strings.ToLower(u.Scheme)
 
-	// Remove default ports to avoid treating example.com and example.com:443 as different.
+	// Or example.com and example.com:443 dedup as different URLs.
 	hostname := u.Hostname()
 	port := u.Port()
 	if (u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443") {

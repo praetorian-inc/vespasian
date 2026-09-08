@@ -23,15 +23,13 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 )
 
-// ExtractCookieHeader removes Cookie headers (case-insensitive) from the map
-// and returns the cookie value separately. If multiple Cookie headers exist
-// with different casings, they are concatenated with "; ".
+// ExtractCookieHeader pulls Cookie headers out case-insensitively, joining
+// multiple casings with "; ".
 func ExtractCookieHeader(headers map[string]string) (cookieValue string, remaining map[string]string) {
 	remaining = make(map[string]string, len(headers))
 	var cookieParts []string
-	// Iterate in sorted key order so concatenation of differently-cased
-	// "Cookie" headers is deterministic across runs (Go map iteration is
-	// randomized). Matters for duplicate cookie precedence.
+	// Sorted, because Go randomizes map iteration and duplicate cookie precedence
+	// depends on the order.
 	keys := make([]string, 0, len(headers))
 	for k := range headers {
 		keys = append(keys, k)
@@ -49,10 +47,8 @@ func ExtractCookieHeader(headers map[string]string) (cookieValue string, remaini
 	return strings.Join(cookieParts, "; "), remaining
 }
 
-// ParseCookiesToParams parses an HTTP Cookie header value into Chrome DevTools
-// Protocol NetworkCookieParam entries for injection into Chrome's cookie store.
-// The Cookie header format is "name=value; name2=value2". The targetURL provides
-// the domain and scheme for the generated cookie parameters.
+// ParseCookiesToParams converts "name=value; name2=value2" into CDP cookie params
+// scoped by targetURL. Errors unless targetURL is an absolute http(s) URL.
 func ParseCookiesToParams(targetURL, cookieValue string) ([]*proto.NetworkCookieParam, error) {
 	if cookieValue == "" {
 		return nil, nil
@@ -62,10 +58,9 @@ func ParseCookiesToParams(targetURL, cookieValue string) ([]*proto.NetworkCookie
 	if err != nil {
 		return nil, fmt.Errorf("parse target URL for cookies: %w", err)
 	}
-	// url.Parse accepts bare hostnames and scheme-only strings without
-	// erroring. Reject anything that isn't an absolute http(s) URL so we
-	// don't emit cookies with an empty Host (which Chrome would drop
-	// silently, causing LAB-2222 to regress without any signal).
+	// url.Parse accepts bare hostnames without erroring, and a cookie with an empty
+	// Host is dropped by Chrome silently — session propagation would just stop
+	// working with no signal (LAB-2222).
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, fmt.Errorf("invalid target URL for cookies %q: must be an absolute http(s) URL", redactSeedURL(targetURL))
 	}
@@ -90,20 +85,16 @@ func ParseCookiesToParams(targetURL, cookieValue string) ([]*proto.NetworkCookie
 		params = append(params, &proto.NetworkCookieParam{
 			Name:  name,
 			Value: value,
-			// Path is "/" regardless of the target URL's path so session cookies
-			// apply to all endpoints on the host, matching standard session-cookie
-			// behavior.
+			// "/" regardless of the target path, so session cookies cover every
+			// endpoint on the host.
 			Path:   "/",
 			Secure: u.Scheme == "https",
-			// HttpOnly is deliberately omitted so apps that read auth state via
-			// JS document.cookie continue to work. HttpOnly does not affect
-			// outbound request cookie attachment — it only restricts JS reads.
+			// HttpOnly omitted so apps reading auth state via document.cookie still
+			// work; it restricts JS reads only, never outbound attachment.
 			//
-			// Setting URL (and omitting Domain) produces a host-only cookie
-			// scoped to the exact hostname — subdomain redirects won't carry
-			// these cookies. This is the correct scope for LAB-2222's
-			// session-cookie propagation. Passing both Domain and URL is
-			// redundant: Chrome derives Domain from URL when Domain is unset.
+			// URL without Domain makes a host-only cookie, so subdomain redirects do
+			// not carry it. Chrome derives Domain from URL, so passing both is
+			// redundant.
 			URL: u.Scheme + "://" + u.Host,
 		})
 	}
@@ -111,25 +102,17 @@ func ParseCookiesToParams(targetURL, cookieValue string) ([]*proto.NetworkCookie
 	return params, nil
 }
 
-// CookieInjector installs cookies into a browser's cookie store. The
-// production implementation is BrowserManager.SetCookies; tests pass a
-// spy. The signature mirrors rod.Browser.SetCookies so production
-// callers can pass it as a method value (browserMgr.SetCookies).
+// CookieInjector mirrors rod.Browser.SetCookies so BrowserManager.SetCookies can
+// be passed as a method value; tests pass a spy.
 type CookieInjector func(cookies []*proto.NetworkCookieParam) error
 
-// ApplyCookieHeader is the full pipeline behind the LAB-2222 fix:
-// (1) strip Cookie from headers via ExtractCookieHeader,
-// (2) parse the cookie value into NetworkCookieParams,
-// (3) install them via inject (typically BrowserManager.SetCookies).
-// It returns the header map with Cookie removed so the caller can pass
-// it to the engine as extra HTTP headers without double-injecting the
-// cookie (which would land in Network.setExtraHTTPHeaders and get
-// stripped by Spring Security-style redirects — the original bug).
+// ApplyCookieHeader strips Cookie from headers, parses it, and installs it via
+// inject (LAB-2222). It returns the map WITHOUT Cookie, which is what stops the
+// caller double-injecting: a Cookie left in the extra-headers map goes out via
+// Network.setExtraHTTPHeaders and is stripped by Spring Security-style redirects.
 //
-// When headers contains no Cookie entry, inject is NOT called and the
-// headers map is returned with Cookie removal applied idempotently.
-// Parse and inject errors are wrapped with "parse cookies:" and
-// "inject cookies:" respectively — operators rely on these prefixes.
+// No Cookie entry means inject is not called. Errors are wrapped "parse cookies:"
+// and "inject cookies:"; operators rely on those prefixes.
 func ApplyCookieHeader(headers map[string]string, targetURL string, inject CookieInjector) (map[string]string, error) {
 	cookieValue, extraHeaders := ExtractCookieHeader(headers)
 	if cookieValue == "" {

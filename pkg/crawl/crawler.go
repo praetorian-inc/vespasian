@@ -23,28 +23,28 @@ import (
 )
 
 const (
-	// DefaultMaxPages is the maximum number of pages to crawl when no limit is specified.
+	// DefaultMaxPages applies when MaxPages is unset.
 	DefaultMaxPages = 1000
-	// MaxResponseBodySize is the maximum response body size to retain for classification (1 MB).
+
+	// MaxResponseBodySize is what is RETAINED for classification; link extraction
+	// runs over the larger MaxHTTPBodySize read.
 	MaxResponseBodySize = 1 * 1024 * 1024
-	// PageTimeout is the per-page timeout in seconds for go-rod and HTTP requests.
-	// This is an internal constant, not user-configurable — it prevents a single
-	// unresponsive page from blocking the sequential headless crawl.
+
+	// PageTimeout (seconds) is internal, not user-configurable: it stops one
+	// unresponsive page blocking the crawl.
 	PageTimeout = 30
-	// MaxHTTPBodySize is the maximum body size to read per HTTP response in the
-	// HTTPCrawler (10 MB DoS cap). Distinct from MaxResponseBodySize (1 MB
-	// retention cap) — both serve different purposes.
+
+	// MaxHTTPBodySize is the per-response read cap (10 MB). It bounds memory against
+	// an attacker-controlled response body; link extraction runs over this read,
+	// MaxResponseBodySize is what is retained.
 	MaxHTTPBodySize = 10 * 1024 * 1024
 
-	// interruptMessage is printed to Stderr when the crawl is stopped by a
-	// canceled context (e.g., SIGINT). Shared by HTTPCrawler and RodCrawler.
 	interruptMessage = "\ninterrupt received, stopping crawl...\n"
 
-	// DefaultConcurrency is the default number of concurrent browser tabs / HTTP workers.
+	// DefaultConcurrency is the tab/worker count when Concurrency is unset.
 	DefaultConcurrency = 10
-	// MaxConcurrency is the upper bound on concurrent browser tabs / HTTP workers. Each
-	// tab consumes significant Chrome process memory (~50 MB), so unbounded values
-	// could exhaust system resources.
+
+	// MaxConcurrency is capped because each tab costs ~50 MB of Chrome.
 	MaxConcurrency = 50
 )
 
@@ -52,7 +52,7 @@ const (
 type CrawlerOptions struct {
 	Depth         int
 	MaxPages      int
-	MaxRequests   int  // max captured requests before stopping (0 → unlimited); rate/politeness bound distinct from MaxPages
+	MaxRequests   int  // admission budget over captured requests (0 → unlimited); a page may overshoot it, see crawlBudget
 	Interact      bool // opt-in: click non-destructive elements to surface interaction-only endpoints (headless backend only)
 	Timeout       time.Duration
 	Scope         string
@@ -94,17 +94,14 @@ type CrawlerOptions struct {
 	BrowserMgr *BrowserManager
 }
 
-// Crawler is the interface for web crawling to capture HTTP traffic.
-// There are two implementations: RodCrawler (headless go-rod engine) and
-// HTTPCrawler (stdlib net/http engine).
+// Crawler captures HTTP traffic. See RodCrawler and HTTPCrawler.
 type Crawler interface {
 	Crawl(ctx context.Context, targetURL string) ([]ObservedRequest, error)
 }
 
-// resume builds the shared resume wiring for a crawl of targetURL under these
-// options. The fingerprint is computed here (rather than by the caller) so both
-// backends bind the checkpoint to the same config identity, including which
-// backend produced it.
+// resume builds the shared resume wiring for a crawl of targetURL. The fingerprint is
+// computed here, not by the caller, so both backends bind the checkpoint to the same
+// config identity, including which backend produced it.
 func (o CrawlerOptions) resume(targetURL string) resumeOptions {
 	return resumeOptions{
 		From:        o.ResumeFrom,
@@ -114,20 +111,16 @@ func (o CrawlerOptions) resume(targetURL string) resumeOptions {
 	}
 }
 
-// RodCrawler implements Crawler using the go-rod headless browser engine.
-// The Crawl method lives in rod_crawler.go.
+// RodCrawler is the headless go-rod backend; Crawl is in rod_crawler.go.
 type RodCrawler struct{ opts CrawlerOptions }
 
-// HTTPCrawler implements Crawler using the stdlib net/http engine.
-// The Crawl method lives in http_crawler.go.
+// HTTPCrawler is the net/http backend; Crawl is in http_crawler.go.
 type HTTPCrawler struct {
 	opts        CrawlerOptions
 	pageTimeout time.Duration // per-page fetch timeout; defaults to PageTimeout seconds when zero
 }
 
-// NewCrawler creates a new crawler with the given options.
-// When opts.Headless is true, it returns a RodCrawler (headless go-rod engine).
-// Otherwise it returns an HTTPCrawler (stdlib net/http engine).
+// NewCrawler returns a RodCrawler when opts.Headless, else an HTTPCrawler.
 func NewCrawler(opts CrawlerOptions) Crawler {
 	if opts.Headless {
 		return &RodCrawler{opts: opts}
@@ -135,9 +128,7 @@ func NewCrawler(opts CrawlerOptions) Crawler {
 	return &HTTPCrawler{opts: opts}
 }
 
-// clampConcurrency returns the effective worker concurrency for both the HTTP
-// and headless backends. Zero maps to DefaultConcurrency; values above
-// MaxConcurrency are capped.
+// clampConcurrency maps 0 to DefaultConcurrency and caps at MaxConcurrency.
 func clampConcurrency(n int) int {
 	if n <= 0 {
 		return DefaultConcurrency
@@ -148,9 +139,8 @@ func clampConcurrency(n int) int {
 	return n
 }
 
-// validateCrawlInputs validates the crawl options and target URL, returning the
-// effective maxPages and any validation error. The error strings are stable and
-// asserted by tests.
+// validateCrawlInputs returns the effective maxPages. Error strings are asserted
+// by tests, so keep them stable.
 func validateCrawlInputs(opts CrawlerOptions, targetURL string) (int, error) {
 	maxPages := opts.MaxPages
 	if maxPages <= 0 {

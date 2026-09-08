@@ -25,20 +25,17 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/crawl"
 )
 
-// maxGRPCWebBundleSize caps the JS body size processed per capture entry,
-// mirroring jsstatic.DefaultMaxBundleSize. Bundles larger than this are skipped
-// to bound parse work.
+// maxGRPCWebBundleSize caps the JS body handed to jsluice per capture entry,
+// mirroring jsstatic.DefaultMaxBundleSize. Unlike that path there is no
+// per-bundle timeout and no panic recovery here, so this size cap is the only
+// bound on parse work — do not raise it without adding one.
 const maxGRPCWebBundleSize = 5 * 1024 * 1024 // 5 MB
 
-// ExtractGRPCWebBindings scans the JavaScript response bodies in a capture for
-// generated gRPC-Web / Connect client artifacts and recovers service/method/type
-// names and streaming flags. It mirrors pkg/analyze/jsstatic: it reads each
-// entry's Response.Body, runs jsluice over JS-content-type bodies, and returns
-// the recovered services deduplicated by fully-qualified service name.
-//
-// Returns nil when no bindings are found.
+// ExtractGRPCWebBindings recovers service/method/type names and streaming flags
+// from generated gRPC-Web and Connect clients, deduplicated by service FQN. nil
+// when nothing is found.
 func ExtractGRPCWebBindings(captured []crawl.ObservedRequest) []classify.GRPCService {
-	// Accumulate methods per service FQN; a service may be split across bundles.
+	// Per FQN: one service may be split across bundles.
 	byService := map[string]map[string]classify.GRPCMethod{}
 
 	for _, req := range captured {
@@ -58,8 +55,7 @@ func ExtractGRPCWebBindings(captured []crawl.ObservedRequest) []classify.GRPCSer
 				byService[svc.Name] = methods
 			}
 			for _, m := range svc.Methods {
-				// First write wins on collision; bundles for the same service
-				// carry identical method shapes.
+				// First write wins: bundles for one service carry identical shapes.
 				if _, exists := methods[m.Name]; !exists {
 					methods[m.Name] = m
 				}
@@ -70,8 +66,7 @@ func ExtractGRPCWebBindings(captured []crawl.ObservedRequest) []classify.GRPCSer
 	return mergeServices(byService)
 }
 
-// mergeServices flattens the per-service method map into a sorted slice with
-// sorted methods for deterministic output.
+// mergeServices sorts services and their methods, for deterministic output.
 func mergeServices(byService map[string]map[string]classify.GRPCMethod) []classify.GRPCService {
 	if len(byService) == 0 {
 		return nil
@@ -100,9 +95,7 @@ func mergeServices(byService map[string]map[string]classify.GRPCMethod) []classi
 	return services
 }
 
-// isJSContentTypeForGRPC reports whether ct indicates a JavaScript body. It
-// replicates the (6-line) jsstatic predicate rather than importing the
-// unexported original (Rule of Three not yet met).
+// isJSContentTypeForGRPC duplicates jsstatic's predicate, which is unexported.
 func isJSContentTypeForGRPC(ct string) bool {
 	lower := strings.ToLower(ct)
 	return strings.Contains(lower, "javascript") ||
@@ -111,9 +104,7 @@ func isJSContentTypeForGRPC(ct string) bool {
 		lower == "application/x-js"
 }
 
-// extractFromJS runs the binding detectors over one JS source body. baseURL is
-// used only for diagnostic logging. ExtractGRPCWebBindings fans out over the
-// capture and merges results.
+// extractFromJS runs the detectors over one body; baseURL is for logging only.
 func extractFromJS(jsSource []byte, baseURL string) []classify.GRPCService {
 	if len(jsSource) == 0 {
 		return nil
@@ -156,8 +147,7 @@ func extractFromJS(jsSource []byte, baseURL string) []classify.GRPCService {
 //	  },
 //	}
 //
-// It walks object literals, identifies those carrying a typeName + methods
-// object, and maps each method entry to a GRPCMethod.
+// Matches object literals carrying both typeName and methods.
 func detectConnectES(analyzer *jsluice.Analyzer, add func(string, classify.GRPCMethod)) {
 	analyzer.Query("(object) @obj", func(n *jsluice.Node) {
 		obj := n.AsObject()
@@ -180,8 +170,7 @@ func detectConnectES(analyzer *jsluice.Analyzer, add func(string, classify.GRPCM
 
 			name := mo.GetString("name", "")
 			if name == "" {
-				// Fall back to the property key when no explicit name literal.
-				name = key
+				name = key // no explicit name literal
 			}
 			method := classify.GRPCMethod{
 				Name:       name,
@@ -205,11 +194,10 @@ func detectConnectES(analyzer *jsluice.Analyzer, add func(string, classify.GRPCM
 //	  responseType: GetUserResponse,
 //	};
 //
-// Method-descriptor objects carry methodName + request/response stream flags.
-// The owning service FQN is taken from the matching `<Service>.serviceName`
-// assignment; absent that, methods are skipped (no reliable FQN).
+// The FQN comes from the matching `<Service>.serviceName` assignment; without one
+// the methods are skipped, since there is no reliable FQN.
 func detectPBService(analyzer *jsluice.Analyzer, add func(string, classify.GRPCMethod)) {
-	// Pass 1: map local service identifier → service FQN via `X.serviceName = "..."`.
+	// Pass 1: local identifier -> FQN.
 	serviceFQN := map[string]string{}
 	analyzer.Query("(assignment_expression) @assign", func(n *jsluice.Node) {
 		left := n.ChildByFieldName("left")
@@ -232,7 +220,7 @@ func detectPBService(analyzer *jsluice.Analyzer, add func(string, classify.GRPCM
 		return
 	}
 
-	// Pass 2: map `X.<Method> = { methodName, requestStream, responseStream, ... }`.
+	// Pass 2: the method descriptors.
 	analyzer.Query("(assignment_expression) @assign", func(n *jsluice.Node) {
 		if fqn, method, ok := pbServiceMethodFromAssignment(n, serviceFQN); ok {
 			add(fqn, method)
@@ -240,10 +228,8 @@ func detectPBService(analyzer *jsluice.Analyzer, add func(string, classify.GRPCM
 	})
 }
 
-// pbServiceMethodFromAssignment parses a grpc-web method-descriptor assignment
-// (`X.<Method> = { methodName, requestStream, responseStream, requestType,
-// responseType }`) into a service FQN + GRPCMethod. Returns ok=false when the
-// node is not such an assignment or the owning service FQN is unknown.
+// pbServiceMethodFromAssignment parses one descriptor assignment. ok=false when
+// the node is not one, or its service FQN is unknown.
 func pbServiceMethodFromAssignment(n *jsluice.Node, serviceFQN map[string]string) (string, classify.GRPCMethod, bool) {
 	left := n.ChildByFieldName("left")
 	right := n.ChildByFieldName("right")
@@ -280,8 +266,8 @@ func pbServiceMethodFromAssignment(n *jsluice.Node, serviceFQN map[string]string
 //	new grpc.web.MethodDescriptor('/users.v1.UserService/GetUser',
 //	  grpc.web.MethodType.UNARY, RequestType, ResponseType, ...)
 //
-// Service FQN and method name are parsed from the "/pkg.Service/Method" path;
-// streaming is derived from the MethodType argument.
+// FQN and method come from the "/pkg.Service/Method" path, streaming from the
+// MethodType argument.
 func detectGRPCWebMethodDescriptors(analyzer *jsluice.Analyzer, add func(string, classify.GRPCMethod)) {
 	analyzer.Query("(new_expression) @new", func(n *jsluice.Node) {
 		ctor := n.ChildByFieldName("constructor")
@@ -312,8 +298,8 @@ func detectGRPCWebMethodDescriptors(analyzer *jsluice.Analyzer, add func(string,
 	})
 }
 
-// applyMethodKind sets streaming flags from a Connect-ES `kind: MethodKind.*`
-// reference. Unary leaves both flags false.
+// applyMethodKind reads a Connect-ES `kind: MethodKind.*`; Unary leaves both
+// flags false.
 func applyMethodKind(n *jsluice.Node, m *classify.GRPCMethod) {
 	if n == nil {
 		return
@@ -329,8 +315,7 @@ func applyMethodKind(n *jsluice.Node, m *classify.GRPCMethod) {
 	}
 }
 
-// applyMethodType sets streaming flags from a grpc-web
-// `grpc.web.MethodType.UNARY|SERVER_STREAMING` reference.
+// applyMethodType reads a grpc-web `grpc.web.MethodType.*`.
 func applyMethodType(n *jsluice.Node, m *classify.GRPCMethod) {
 	if n == nil {
 		return
@@ -340,24 +325,18 @@ func applyMethodType(n *jsluice.Node, m *classify.GRPCMethod) {
 	}
 }
 
-// identifierName returns the message class name referenced by node n. The
-// generated message type is a JS identifier (GetUserRequest) or a
-// module-qualified member expression (users_pb.GetUserRequest,
-// proto.users.v1.GetUserRequest). The JS module qualifier is a bundler
-// namespace, not a proto package, so only the final identifier segment is
-// kept; FileDescriptorsFromServices re-qualifies it with the service's proto
-// package. When the node is missing or unusable, fallback is returned so the
-// rpc line still renders.
+// identifierName returns the message class name, keeping only the final segment of
+// a member expression: the JS qualifier (users_pb., proto.users.v1.) is a bundler
+// namespace, not a proto package, and FileDescriptorsFromServices re-qualifies it.
+// Falls back so the rpc line still renders.
 func identifierName(n *jsluice.Node, fallback string) string {
 	if n == nil || !n.IsValid() {
 		return fallback
 	}
 	content := strings.TrimSpace(n.Content())
-	// A string-literal type name (rare) is unquoted; an identifier is used as-is.
 	if n.Type() == "string" {
 		content = trimJSString(content)
 	}
-	// Drop a JS module/namespace qualifier, keeping the final class name.
 	if idx := strings.LastIndex(content, "."); idx >= 0 {
 		content = content[idx+1:]
 	}
@@ -367,18 +346,15 @@ func identifierName(n *jsluice.Node, fallback string) string {
 	return content
 }
 
-// boolLiteral reports whether n is the JS literal `true`.
 func boolLiteral(n *jsluice.Node) bool {
 	return n != nil && n.IsValid() && n.Content() == "true"
 }
 
-// trimJSString strips surrounding quote characters from a JS string literal.
 func trimJSString(s string) string {
 	return strings.Trim(s, "\"'`")
 }
 
-// splitMethodPath parses a "/pkg.Service/Method" gRPC path into (serviceFQN,
-// method). Returns ("", "") when the path is not in that form.
+// splitMethodPath splits "/pkg.Service/Method"; ("", "") if malformed.
 func splitMethodPath(path string) (svcFQN, method string) {
 	path = strings.TrimPrefix(path, "/")
 	idx := strings.LastIndex(path, "/")

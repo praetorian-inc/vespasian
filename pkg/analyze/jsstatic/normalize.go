@@ -21,51 +21,40 @@ import (
 	"github.com/BishopFox/jsluice"
 )
 
-// NormalizeEXPRPath replaces jsluice EXPR placeholders in a URL's path with
-// OpenAPI-style {paramName} segments using the supplied template tokens. If a
-// segment's identifier cannot be resolved, it is replaced with {param},
-// {param1}, {param2}, … in left-to-right order. Query string and fragment are
-// preserved unchanged.
+// NormalizeEXPRPath turns jsluice EXPR placeholders into OpenAPI {paramName} from
+// the supplied tokens, falling back to {param}, {param1}, … left to right. Query
+// and fragment are preserved.
 //
-// This function never fails — every input string is normalized to some output.
-// (Earlier revisions exposed an error return that was always nil; callers had
-// dead error-handling branches.) Malformed URLs are returned with their EXPR
-// segments rewritten on a best-effort basis; absolute URLs without a path are
-// returned unchanged.
+// Never fails: malformed URLs are rewritten best-effort, and an absolute URL with
+// no path comes back unchanged.
 func NormalizeEXPRPath(rawURL string, tokens []string) string {
-	// Split off fragment first (it comes after #).
 	fragment := ""
 	if idx := strings.Index(rawURL, "#"); idx != -1 {
 		fragment = rawURL[idx:]
 		rawURL = rawURL[:idx]
 	}
 
-	// Split off query string.
 	query := ""
 	if idx := strings.Index(rawURL, "?"); idx != -1 {
 		query = rawURL[idx:]
 		rawURL = rawURL[:idx]
 	}
 
-	// For absolute URLs, split scheme+host from path.
 	prefix := ""
 	path := rawURL
 	if i := strings.Index(rawURL, "://"); i != -1 {
-		// Find end of authority (first "/" after "://").
 		rest := rawURL[i+3:]
 		slashIdx := strings.Index(rest, "/")
 		if slashIdx != -1 {
 			prefix = rawURL[:i+3+slashIdx]
 			path = rawURL[i+3+slashIdx:]
 		} else {
-			// No path component — nothing to normalize.
-			return rawURL + query + fragment
+			return rawURL + query + fragment // no path to normalize
 		}
 	}
 
-	// Replace EXPR segments with {paramName}. Source the placeholder value
-	// directly from jsluice (which exports it as a var, not a const, so any
-	// upstream override stays in sync between this file and extractor.go).
+	// Read the placeholder from jsluice, which exports it as a var: an upstream
+	// override then stays in sync with extractor.go.
 	tokenIdx := 0
 	unnamedCount := 0
 	segments := strings.Split(path, "/")
@@ -77,7 +66,6 @@ func NormalizeEXPRPath(rawURL string, tokens []string) string {
 			segments[i] = "{" + tokens[tokenIdx] + "}"
 			tokenIdx++
 		} else {
-			// Fallback naming: first unnamed gets {param}, subsequent get {param1}, {param2}, …
 			if unnamedCount == 0 {
 				segments[i] = "{param}"
 			} else {

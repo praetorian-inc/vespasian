@@ -32,40 +32,28 @@ import (
 	"github.com/praetorian-inc/vespasian/pkg/probe"
 )
 
-// sourceMapDoc is the minimal structure we unmarshal from a .js.map file.
-// We only use sourcesContent (the embedded source strings); we do NOT
-// follow Sources[] URLs (per §7 "Sourcemap Sources[] resolution" deferred).
+// sourceMapDoc uses sourcesContent only; Sources[] URLs are deliberately not
+// followed.
 type sourceMapDoc struct {
 	Sources        []string `json:"sources"`
 	SourcesContent []string `json:"sourcesContent"`
 }
 
-// sourceMappingCommentPrefixes are the two canonical forms of the
-// sourceMappingURL pragma. The //@ form is the original (deprecated) syntax.
+// The //@ form is the original, deprecated pragma syntax.
 var sourceMappingCommentPrefixes = [][]byte{
 	[]byte("//# sourceMappingURL="),
 	[]byte("//@ sourceMappingURL="),
 }
 
-// trailingWindowSize is the number of trailing bytes we scan for the
-// sourceMappingURL comment. Scanning the full bundle is expensive on large
-// files; the pragma is always at the very end so 2 KB is ample.
+// trailingWindowSize: the pragma sits at the very end, so scanning the whole
+// bundle is wasted work.
 const trailingWindowSize = 2048
 
-// maxSourcemapResponseSize is the maximum response body we will read from a
-// remote sourcemap fetch. Responses exceeding this are rejected and counted
-// as failures to prevent memory exhaustion.
+// maxSourcemapResponseSize: larger responses count as failures.
 const maxSourcemapResponseSize = 10 * 1024 * 1024 // 10 MB
 
-// recoverSourcemap scans the trailing window of the bundle for a
-// sourceMappingURL pragma. If found and it points to a data: URI, it decodes
-// and parses the sourcesContent inline. If it points to a remote URL and
-// opts.FetchSourcemaps is true, it fetches the remote sourcemap.
-//
-// ctx is propagated into remote fetch HTTP requests so that cancellation and
-// deadlines from the caller are honored.
-//
-// Returns the recovered source strings and partial Stats for accounting.
+// recoverSourcemap decodes a data: URI pragma inline, or fetches a remote one when
+// opts.FetchSourcemaps. ctx carries into the fetch.
 func recoverSourcemap(ctx context.Context, bundle []byte, bundleURL string, opts Options) ([]string, Stats) {
 	var stats Stats
 
@@ -74,20 +62,18 @@ func recoverSourcemap(ctx context.Context, bundle []byte, bundleURL string, opts
 		return nil, stats
 	}
 
-	// Handle data: URIs inline (no network required).
+	// No network needed.
 	if strings.HasPrefix(mappingURL, "data:") {
 		return decodeDataURISourcemap(mappingURL)
 	}
 
-	// Remote URL: only fetch when FetchSourcemaps is enabled.
 	if !opts.FetchSourcemaps {
 		return nil, stats
 	}
 
 	mappingURL = resolveRelativeMapURL(bundleURL, mappingURL)
 
-	// Cross-host protection: only fetch when the sourcemap URL is on the same
-	// host as the bundle (§7 "Cross-host sourcemap fetch" deferred/refused).
+	// Same host as the bundle only; cross-host fetch is deliberately refused.
 	if !sameHost(bundleURL, mappingURL) {
 		return nil, stats
 	}
@@ -111,12 +97,11 @@ func recoverSourcemap(ctx context.Context, bundle []byte, bundleURL string, opts
 	if client == nil {
 		client = defaultSourcemapClient(opts.AllowPrivate, opts.Proxy)
 	} else {
-		// SEC-BE-004: an injected HTTPClient owns its transport, so a configured
-		// Proxy is silently ignored here — recoverSourcemap overwrites the client's
-		// Transport with ssrfSafeTransport, which would clobber a proxied dialer.
-		// Warn loudly rather than bypass the proxy without a trace. opts.Logger is
-		// nil when recoverSourcemap is called directly (tests) without Analyze's
-		// withDefaults defaulting, so fall back to slog.Default().
+		// An injected HTTPClient owns its transport, so a configured Proxy is ignored
+		// here — the shallow copy below overwrites Transport with ssrfSafeTransport, which
+		// would clobber a proxied dialer. Warn rather than bypass it silently.
+		// opts.Logger is nil when recoverSourcemap is called directly by tests, without
+		// Analyze's withDefaults.
 		if opts.Proxy.Enabled() {
 			logger := opts.Logger
 			if logger == nil {
@@ -124,26 +109,19 @@ func recoverSourcemap(ctx context.Context, bundle []byte, bundleURL string, opts
 			}
 			logger.Warn("jsstatic: Proxy configured but ignored — an injected HTTPClient owns its transport; sourcemap fetches will BYPASS the proxy")
 		}
-		// Caller-supplied client: enforce both httpx.NoFollowRedirects and an
-		// SSRF-safe DialContext on a shallow-copy so neither mutation touches the
-		// caller's original client.
+		// Both mutations are overlaid on a shallow copy, so the caller's client is never
+		// mutated; TestSourcemap_CallerClient_SSRFOverlayEnforced pins that for Transport.
 		//
-		// httpx.NoFollowRedirects: a same-host .js.map URL that 302s to an attacker
-		// host would bypass the sameHost pre-flight check above.
+		// httpx.NoFollowRedirects: a same-host .js.map that 302s to an attacker host would
+		// bypass the sameHost pre-flight above.
 		//
-		// SSRFSafeDialContext (or permissive dialer when AllowPrivate is true):
-		// the caller's Transport may not be SSRF-safe. We overlay it to match the
-		// posture of defaultSourcemapClient, mirroring how the probe stage defends
-		// against DNS-rebinding attacks regardless of how the caller configured the
-		// Transport. We do NOT mutate the caller's Transport — a new *http.Transport
-		// is constructed so that AllowPrivate semantics are respected.
+		// SSRF-safe DialContext: the caller's Transport may not be, so a new one is
+		// built to match defaultSourcemapClient's posture.
 		clientCopy := *client
 		clientCopy.CheckRedirect = httpx.NoFollowRedirects
 		clientCopy.Transport = ssrfSafeTransport(opts.AllowPrivate)
-		// Enforce the same overall deadline as the default client so a slow-drip
-		// body read is bounded even when the caller's client left Timeout unset
-		// (zero == no limit). http.Client.Timeout covers the full exchange,
-		// including the response-body read.
+		// A caller Timeout of zero means no limit, which leaves a slow-drip body
+		// read unbounded. Client.Timeout covers the body read too.
 		clientCopy.Timeout = 10 * time.Second
 		client = &clientCopy
 	}
@@ -159,8 +137,8 @@ func recoverSourcemap(ctx context.Context, bundle []byte, bundleURL string, opts
 	return sources, stats
 }
 
-// findSourceMappingURL scans the trailing window of a JS bundle for a
-// `//# sourceMappingURL=` (or `//@`) pragma and returns the URL portion.
+// findSourceMappingURL returns the URL from a `//#` or `//@` sourceMappingURL
+// pragma in the trailing window.
 func findSourceMappingURL(bundle []byte) string {
 	if len(bundle) == 0 {
 		return ""
@@ -183,8 +161,7 @@ func findSourceMappingURL(bundle []byte) string {
 	return ""
 }
 
-// decodeDataURISourcemap parses an inline data: sourceMappingURL and returns
-// the recovered sources plus accounting stats.
+// decodeDataURISourcemap parses an inline data: pragma.
 func decodeDataURISourcemap(mappingURL string) ([]string, Stats) {
 	var stats Stats
 	sources, err := parseDataURISourcemap(mappingURL)
@@ -198,15 +175,12 @@ func decodeDataURISourcemap(mappingURL string) ([]string, Stats) {
 	return sources, stats
 }
 
-// resolveRelativeMapURL resolves a possibly-relative mapping URL against the
-// bundle URL so that "app.js.map" becomes "https://h/static/js/app.js.map"
-// before the same-host check (which requires a non-empty Host component).
+// resolveRelativeMapURL makes "app.js.map" absolute before the same-host check,
+// which needs a Host.
 //
-// On parse failure, returns mappingURL unchanged. This is safe because the
-// caller (recoverSourcemap) immediately runs the result through sameHost,
-// which rejects URLs with empty Hostname/Scheme — a parse-failed value will
-// not pass that gate. This preserves the "fail closed" property without
-// needing a separate error channel.
+// Parse failure returns mappingURL unchanged, which is safe because the caller
+// runs it through sameHost, and that rejects an empty Hostname or Scheme — fail
+// closed without a separate error channel.
 func resolveRelativeMapURL(bundleURL, mappingURL string) string {
 	if bundleURL == "" {
 		return mappingURL
@@ -222,9 +196,8 @@ func resolveRelativeMapURL(bundleURL, mappingURL string) string {
 	return base.ResolveReference(ref).String()
 }
 
-// sameHost returns true when both rawA and rawB are valid URLs sharing the
-// same hostname, scheme, AND effective port. Default ports are normalised
-// (http -> 80, https -> 443) so https://example.com and https://example.com:443
+// sameHost requires hostname, scheme AND effective port to match. Default ports
+// are normalised so https://example.com and https://example.com:443
 // compare equal, but https://example.com:8443 and https://example.com:443 do
 // NOT — a non-default-port bundle must match a non-default-port sourcemap.
 // Cross-scheme (http vs https) is rejected to prevent mixed-content fetches.

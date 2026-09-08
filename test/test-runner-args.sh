@@ -4104,12 +4104,13 @@ if [[ -f "$WORKFLOW" ]]; then
         fail "the harden-runner lockstep comment disagrees with itself across copies (${hr_word_variants} distinct claims) — at least one was updated and the rest were not"
     fi
 
-    # AGENTS.md states the non-container job count in prose, and prose is what
-    # went stale twice: it said "the six non-container jobs" when seven were
-    # non-container, was corrected to "eight", and was wrong again the moment a
-    # tenth job landed. Derive both numbers and compare, so the third recurrence
-    # is a failing assertion rather than a review finding.
-    agents_md="$SCRIPT_DIR/../AGENTS.md"
+    # docs/agents/ci.md (relocated from AGENTS.md under ENG-6805) states the
+    # non-container job count in prose, and prose is what went stale twice: it
+    # said "the six non-container jobs" when seven were non-container, was
+    # corrected to "eight", and was wrong again the moment a tenth job landed.
+    # Derive both numbers and compare, so the third recurrence is a failing
+    # assertion rather than a review finding.
+    agents_md="$SCRIPT_DIR/../docs/agents/ci.md"
     if [[ -f "$agents_md" ]]; then
         # A job declares `container:` at job level; everything else is non-container.
         nc_actual=$(yq_query '[.jobs[] | select(has("container") | not)] | length' -o=json -I=0)
@@ -4129,11 +4130,11 @@ if [[ -f "$WORKFLOW" ]]; then
                           skip "AGENTS.md harden-runner word (workflow unparseable)" 1 ;;
             *)
                 if [[ -z "$nc_claimed" ]]; then
-                    fail "could not read AGENTS.md's non-container job count claim (the comparison below would be vacuous) — got '${nc_word:-<none>}'"
+                    fail "could not read docs/agents/ci.md's non-container job count claim (the comparison below would be vacuous) — got '${nc_word:-<none>}'"
                 elif [[ "$nc_actual" -eq "$nc_claimed" ]]; then
-                    pass "AGENTS.md's non-container job count ($nc_word) matches live-tests.yml ($nc_actual)"
+                    pass "docs/agents/ci.md's non-container job count ($nc_word) matches live-tests.yml ($nc_actual)"
                 else
-                    fail "AGENTS.md claims ${nc_word} (${nc_claimed}) non-container jobs but live-tests.yml has ${nc_actual} — the prose went stale when a job was added or gained a container:"
+                    fail "docs/agents/ci.md claims ${nc_word} (${nc_claimed}) non-container jobs but live-tests.yml has ${nc_actual} — the prose went stale when a job was added or gained a container:"
                 fi
 
                 # The sentence carries TWO numbers — "<N> of the <M> non-container
@@ -4144,17 +4145,17 @@ if [[ -f "$WORKFLOW" ]]; then
                 hr_agents_claimed=${hr_agents_numbers[${hr_word_agents:-None}]:-}
                 hr_actual_steps=$( { grep -cE '^[[:space:]]*uses:[[:space:]]*step-security/harden-runner@' "$WORKFLOW" || true; } )
                 if [[ -z "$hr_agents_claimed" ]]; then
-                    fail "could not read AGENTS.md's harden-runner job-count claim (the comparison would be vacuous) — got '${hr_word_agents:-<none>}'"
+                    fail "could not read docs/agents/ci.md's harden-runner job-count claim (the comparison would be vacuous) — got '${hr_word_agents:-<none>}'"
                 elif [[ "$hr_actual_steps" -eq "$hr_agents_claimed" ]]; then
-                    pass "AGENTS.md's harden-runner job count ($hr_word_agents) matches live-tests.yml ($hr_actual_steps steps)"
+                    pass "docs/agents/ci.md's harden-runner job count ($hr_word_agents) matches live-tests.yml ($hr_actual_steps steps)"
                 else
-                    fail "AGENTS.md says ${hr_word_agents} (${hr_agents_claimed}) non-container jobs open with harden-runner but live-tests.yml has ${hr_actual_steps} — the prose went stale when a job gained or lost the step"
+                    fail "docs/agents/ci.md says ${hr_word_agents} (${hr_agents_claimed}) non-container jobs open with harden-runner but live-tests.yml has ${hr_actual_steps} — the prose went stale when a job gained or lost the step"
                 fi
                 ;;
         esac
     else
-        fail "AGENTS.md not found — its job-count claim cannot be checked"
-    # The normal arm emits TWO counted outcomes from this one AGENTS.md sentence —
+        fail "docs/agents/ci.md not found — its job-count claim cannot be checked"
+    # The normal arm emits TWO counted outcomes from this one ci.md sentence —
     # the non-container job count and the harden-runner word. MEASURED with the file
     # removed: 234 + 1 = 235 against a pin of 236.
     skip "AGENTS.md harden-runner word (AGENTS.md absent)" 1

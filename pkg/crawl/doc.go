@@ -12,227 +12,120 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package crawl captures HTTP traffic from web applications and exposes it as
-// [ObservedRequest] values. Two crawler backends are available, selected via
-// [CrawlerOptions.Headless]:
+// Package crawl captures HTTP traffic and exposes it as [ObservedRequest] values.
+// Two backends, selected by [CrawlerOptions.Headless]:
 //
-// Headless mode ([RodCrawler], default): uses [go-rod] to drive concurrent
-// Chrome tabs. All outbound requests—XHR, fetch, dynamically constructed
-// JavaScript calls—are intercepted via Chrome DevTools Protocol network
-// listeners. This is the correct choice for single-page applications and any
-// site that requires JavaScript execution. External .js bundles are fetched by
-// the browser itself; this path does not perform separate JS file retrieval.
-// After DOM stability the crawl waits for the network to go quiet (bounded by
-// [DefaultNetworkIdleFloor], [DefaultNetworkQuietPeriod], [DefaultPerRequestTimeout],
-// and the per-page timeout) rather than a fixed settle window, so late and
-// dynamic requests are captured. Passively captured requests are scope-filtered
-// like frontier links, with one exemption: a JavaScript body is retained even when
-// its URL is out of scope, because pkg/analyze/jsstatic reads the capture and has
-// no other input. The frontier treats URLs differing only in query parameters as
-// DISTINCT pages, capped at [maxQueryVariantsPerPath] variants per path — ?page=2
-// and ?tab=billing select a different page, not a different row of the same one.
-// On the headless backend the scope predicate also learns
-// the seed's EFFECTIVE origin from the seed's own navigation, so a seed that
-// redirects cross-origin (http -> https, apex -> www) does not discard every
-// captured request; the widening is one-shot, adds exactly the origin the seed
-// resolved to, still applies the SSRF gate, and is reported on Stderr. Those two
-// cases are the BOUND, not just examples: the learned origin must be the seed's own
-// host or a leading-"www." variant of it, so a redirect to a sibling subdomain or a
-// foreign domain is refused and reported. Admitting a subdomain is what --scope
-// same-domain is for.
+// Headless ([RodCrawler], default) drives concurrent Chrome tabs via [go-rod] and
+// intercepts every outbound request through CDP network listeners. Required for
+// SPAs. The browser fetches .js bundles itself. Each page settles on network quiet
+// rather than a fixed window ([DefaultNetworkIdleFloor], [DefaultNetworkQuietPeriod],
+// [DefaultPerRequestTimeout] and the per-page timeout bound it), so late and dynamic
+// requests are still captured. Captured requests are scope-filtered like frontier
+// links, except that a JavaScript body is retained even out of scope, because
+// pkg/analyze/jsstatic has no other input. URLs differing only in query string are
+// DISTINCT pages, capped at [maxQueryVariantsPerPath] per path: ?page=2 and
+// ?tab=billing select a different page, not a different row of the same one. The
+// scope predicate also learns the seed's EFFECTIVE origin from the seed's own
+// navigation, so a seed that redirects http -> https or apex -> www does not discard
+// every capture; the widening is one-shot, still SSRF-gated, reported on Stderr, and
+// bounded to the seed's own host or a leading-"www." variant — a sibling subdomain or
+// foreign domain is refused, which is what --scope same-domain is for.
 //
 // An opt-in interaction pass ([CrawlerOptions.Interact], headless only, off by
 // default; the net/http backend warns and ignores it) clicks a bounded set of
 // controls per page to surface endpoints that only fire on interaction. It matches
 // form submit buttons too, so it submits forms and can mutate state; destructive,
-// session-ending, and irreversible-commit labels are skipped on a best-effort
-// match, and a click that navigates returns the tab to the assigned page so no
-// surface is attributed to a document the worker was not assigned.
+// session-ending and irreversible-commit labels are skipped on a best-effort match,
+// and a click that navigates returns the tab to its assigned page so no surface is
+// attributed to a document the worker was not assigned.
 //
-// Browser binary (LAB-4999): the headless path pins a local Chrome via
-// [BrowserOptions.ChromePath] when set, otherwise the system browser resolved
-// by go-rod's launcher.LookPath. It does not, by default, let go-rod
-// auto-download a Chromium from third-party mirrors (a supply-chain risk and a
-// source of nondeterministic egress). When no system browser is found it
-// errors, unless downloads are explicitly opted in via
-// [BrowserOptions.AllowBrowserDownload]
-// or the VESPASIAN_ALLOW_BROWSER_DOWNLOAD=true environment variable (intended
-// for local dev on platforms without a system Chrome). The launcher also sets
-// Chrome telemetry/phone-home-disabling flags so crawl egress stays minimal.
+// Non-headless ([HTTPCrawler]) uses net/http with a DFS frontier, a 150 req/s
+// limiter and a 10 MB per-page read cap. goquery parses each page once with the
+// same link selectors as the headless path; jsluice reads inline <script> blocks.
 //
-// Non-headless mode ([HTTPCrawler]): uses the Go stdlib net/http client with a
-// depth-first search frontier, 150 req/s rate limiter, and a 10 MB per-page
-// read cap. HTML pages are parsed with goquery (single parse per page) using
-// the same link selectors as the headless path; inline <script> blocks are
-// analyzed with jsluice to surface additional endpoints. Redirect chains are
-// validated by a scope+SSRF guard (redirectScopeGuard, defense-in-depth) and
-// the authoritative DNS-rebinding control is ssrfSafeDialContext, which
-// re-resolves the host at connect time: redirects and connections that target
-// private/link-local addresses (e.g. 169.254.169.254) are blocked.
+// [FakeCrawler] is the no-network test double for [Crawler].
 //
-// Proxy support (LAB-4011): both backends honor [CrawlerOptions.Proxy]
-// (http/https/socks5), validated by [ValidateProxyAddr]. On the HTTP path the
-// proxy is wired into the transport via http.ProxyURL. Two consequences follow
-// from routing through an intercepting proxy (Burp, mitmproxy):
-//   - TLS certificate verification stays ON by default. For an http/https
-//     intercepting proxy it can be disabled (InsecureSkipVerify) only by the
-//     explicit opt-in [CrawlerOptions.ProxyInsecure] (--proxy-insecure), so the
-//     proxy's own MITM certificate is accepted. This opt-in applies to the HTTP
-//     backend only; on the headless path Chrome validates against the OS trust
-//     store, so the operator must trust the proxy CA out-of-band and
-//     --proxy-insecure has no effect there. For socks5 proxies the Go client
-//     does TLS directly with the target through the tunnel, so verification is
-//     always kept regardless of ProxyInsecure.
-//   - The dial-time SSRF pin (ssrfSafeDialContext) is NOT installed for proxy
-//     connections: the client dials the proxy (commonly loopback), not the
-//     target, so pinning the dialed IP would block the proxy and gives no
-//     target protection. The upfront scopeChecker SSRF check and
-//     redirectScopeGuard still confine targets at the URL level, so crawling a
-//     private target through a proxy still requires AllowPrivate. DNS-rebinding
-//     protection at the target is delegated to the trusted proxy.
+// # Browser binary (LAB-4999)
 //
-// The headless ([RodCrawler]) path relies on Chrome's own networking stack for
-// DNS resolution and does NOT have a Go dial-time IP pin. The upfront
-// scopeChecker SSRF check applies, but Chrome-resolved addresses are not
-// re-validated at dial time (known limitation; see crawlHeadless).
+// The headless path pins [BrowserOptions.ChromePath] or the system browser from
+// launcher.LookPath, and will NOT let go-rod auto-download a Chromium from
+// third-party mirrors — a supply-chain risk and nondeterministic egress. With no
+// system browser it errors unless [BrowserOptions.AllowBrowserDownload] or
+// VESPASIAN_ALLOW_BROWSER_DOWNLOAD=true opts in, for dev platforms with no Chrome
+// build. It also sets telemetry-disabling launch flags.
 //
-// Page budget (LAB-4678): [CrawlerOptions.MaxPages] limits the number of pages
-// (distinct URLs visited), not captured requests — a single SPA page can fire
-// dozens of XHR/fetch calls, so counting requests truncated the crawl far
-// earlier than "max pages" implies. Each worker reserves a page slot under a
-// mutex before navigating, so the cap is exact and the crawl never overshoots
-// MaxPages. Reaching the budget does NOT cancel the shared browser context:
-// workers stop taking new pages, while pages already in flight complete their
-// normal bounded visit and emit all of their captured requests, rather than
-// being killed mid-capture.
+// # SSRF
 //
-// The package also defines the capture file format: a JSON array of
-// ObservedRequest structs that serves as the interchange format between the
-// capture stage (crawl or import) and the generation stage.
+// On the HTTP path ssrfSafeDialContext is authoritative: it re-resolves at connect
+// time, so redirects and connections to private or link-local addresses
+// (169.254.169.254) are blocked. redirectScopeGuard is defense in depth.
 //
-// After the headless crawl, the package runs a post-crawl JS extraction
-// step that scans response bodies of JavaScript bundles for API path
-// strings and probes them with raw HTTP requests. This recovers endpoints
-// that the headless browser cannot exercise (paths gated behind user
-// interactions or built from runtime string concatenations) and bypasses
-// SPA catch-all routing that would otherwise return index.html instead of
-// API responses. The extractor recognizes quoted-string paths, template
-// literals, full URLs, literal+literal `+` service-prefix concatenations,
-// and identifier-bearing concatenations using either String.prototype.concat
-// or the `+` operator (LAB-1368) — the last form reconstructs a path by
-// substituting a numeric sentinel for non-literal operands so the result is
-// probeable and the REST normalizer can parameterize it.
+// The headless path has NO Go dial-time pin — Chrome resolves DNS itself, so only
+// the upfront scopeChecker check applies and Chrome-resolved addresses are never
+// re-validated. Known limitation; see crawlHeadless.
 //
-// Key types:
-//   - [Crawler] is the common interface satisfied by [RodCrawler], [HTTPCrawler],
-//     and [FakeCrawler]. Use [NewCrawler] to obtain the right implementation.
-//   - [RodCrawler] is the headless go-rod backend (Chrome required).
-//   - [HTTPCrawler] is the non-headless stdlib net/http backend (DFS, 150 rps,
-//     10 MB read cap, scope+SSRF redirect guard).
-//   - [FakeCrawler] is a test double that returns a pre-configured slice of
-//     [ObservedRequest] values with no network activity.
-//   - [BrowserManager] manages Chrome process lifecycle, including proxy
-//     configuration and graceful shutdown (headless path only).
-//   - [ValidateProxyAddr] validates a proxy address (http/https/socks5, host
-//     required, no embedded credentials) for both backends.
-//   - [RedactURL] removes userinfo from a URL before it is echoed to an
-//     operator, failing CLOSED to a placeholder whenever it cannot prove the
-//     result is credential-free (opaque forms keep credentials in
-//     url.URL.Opaque with User nil, and a parse error can carry them
-//     verbatim). Exported for internal/pipeline's classification-reason
-//     output.
-//   - [ObservedRequest] and [ObservedResponse] represent captured HTTP traffic.
-//   - [JSReplayConfig] and [ReplayJSExtracted] implement the post-crawl JS
-//     bundle scanning step. The replay step enforces a same-origin gate
-//     (auth headers and probes are restricted to the scan target's origin
-//     by default) and uses [github.com/praetorian-inc/vespasian/pkg/ssrf]
-//     for SSRF protection unless the operator explicitly opts out via
-//     AllowPrivate. When [JSReplayConfig.Proxy] is set (and no Client is
-//     injected) the replay client routes through the intercepting proxy —
-//     LAB-4993 made probe and JS-replay proxy-aware, so --proxy is no longer
-//     crawl-only. socks5 always verifies TLS; --proxy-insecure is http/https only.
-//     Relative to the fully-offline static path, replay is
-//     strictly ADDITIVE: it supersedes an offline static:js-concat mirror only
-//     for a path the probe answered 404 — the sole dispositive refutation — so
-//     a 200 text/html SPA catch-all, a 204, an HTML-bodied 401/403 or a
-//     302 to /login can never remove an endpoint the offline pass recovered
-//     (LAB-4992 QUAL-004). TestReplayJSExtracted_KeepsMirrorForNonDispositiveStatuses
-//     covers each of those statuses.
-//   - [ExtractStaticConcatPaths] is the network-free subset of the concat /
-//     service-prefix reconstruction, shared with pkg/analyze/jsstatic (LAB-4992)
-//     so the fully-offline static analyzer reconstructs these forms identically
-//     to the active replay path. The active path (extractAPIPaths) runs the same
-//     underlying extractors — extractConcatPaths AND servicePrefixPlusPaths — so
-//     both paths recover the concat/+-chain and literal service-prefix forms
-//     identically; the active path additionally probes them and does a
-//     speculative service-prefix fan-out that the offline path omits (that
-//     fan-out is only safe when 404-filtered by probing).
-//   - [ValidateFullURL], [SameOrigin], [CanonicalOrigin], [IsAbsoluteHTTPURL],
-//     [IsPrintableASCIIURL] and [APIIndicatorAlternation] are exported for the
-//     same reason as [ExtractStaticConcatPaths] — they are the shared
-//     definitions that keep other packages from drifting away from this one
-//     (LAB-4992). [ValidateFullURL] is the parse-time URL gate (rejects
-//     embedded credentials, non-http(s) schemes, empty hosts) applied before
-//     probing an absolute reconstruction; [SameOrigin] compares origins with
-//     default-port canonicalization, so the two paths agree on what counts as
-//     the bundle's own origin; [CanonicalOrigin] is the single "scheme://host"
-//     origin definition for both comparison AND display (lower-cased,
-//     default port stripped, IPv6 hosts kept bracketed) — exported so
-//     pkg/generate/rest does not carry a second, subtly different origin
-//     normalization, which previously let a trusted host spelled with an
-//     explicit default port or mixed case lose its own tie-break to an
-//     attacker-controlled origin (SEC-BE-001/QUAL-001). An IPv6 literal host
-//     is re-bracketed when rebuilt from url.URL.Hostname() (which strips the
-//     brackets Host had), both so the result stays a syntactically valid URL
-//     and so two differently-bracketed IPv6 spellings that would otherwise
-//     rebuild to the identical bracket-less string (one with a real port
-//     outside the brackets, one where that same digit sequence is part of
-//     the literal itself) canonicalize differently, as they must; the fix is
-//     in the shared originOf helper so CanonicalOrigin, SameOrigin, and
-//     ResolveTargetOrigin all agree (SEC-BE-001 follow-up);
-//     [IsAbsoluteHTTPURL] answers "does this carry an
-//     http(s) scheme" case-insensitively, because url.Parse lower-cases the
-//     scheme and a case-sensitive prefix test would classify "HTTPS://h/x" as
-//     relative; [IsPrintableASCIIURL] is the byte policy for anything bound
-//     for an operator-facing artifact (no raw non-ASCII or control bytes, and
-//     no percent-escape decoding to them), which pkg/analyze/jsstatic applies
-//     at its synthesis choke point so every producer shares one rule rather
-//     than only the concat reconstruction being filtered; [APIIndicatorAlternation]
-//     is the single source of truth for which path segments signal an API
-//     endpoint, and pkg/classify pins its Rule 3 gate against it so the
-//     classifier cannot silently stop recognizing an indicator this package
-//     still extracts.
+// # Proxy support (LAB-4011)
 //
-// Session-cookie helpers (LAB-2222) let callers bootstrap Chrome's cookie
-// store from a user-supplied Cookie header so subsequent navigations are
-// authenticated. Callers typically extract a Cookie header from their input
-// headers, convert it to CDP cookie parameters for the target origin, and
-// set those on the browser before navigation:
-//   - [ExtractCookieHeader] separates Cookie values (case-insensitively)
-//     from the remaining headers, returning a concatenated cookie string
-//     and a map of the non-cookie headers.
-//   - [ParseCookiesToParams] converts a Cookie header value into CDP
-//     [proto.NetworkCookieParam] entries scoped to the target URL's host
-//     and scheme. Rejects non-http(s) or hostless target URLs.
+// Both backends honor [CrawlerOptions.Proxy] (http/https/socks5, validated by
+// [ValidateProxyAddr]), and since LAB-4993 so do probe and JS replay, so --proxy is
+// no longer crawl-only. Two consequences of routing through an intercepting proxy:
 //
-// Cross-run resume primitives (LAB-4678 Phase 4, vespasian side) let coverage
-// accumulate across separate crawls: [Checkpoint] serializes the frontier's
-// pending queue ([]PendingURL) and seen-set, gated by [ComputeConfigFingerprint]
-// (target/scope/depth/backend/allow-private/interact) and a staleness bound ([Checkpoint.Usable],
-// [DefaultCheckpointMaxAge]); a page whose visit failed transiently is omitted
-// from the persisted seen-set AND returned to the persisted pending queue so a
-// resumed run retries it (omitting it from seen alone loses the page: it was
-// popped before failing, so it is in neither half of the checkpoint);
-// resume is driven through [CrawlerOptions]: set ResumeFrom to continue a prior
-// crawl and OnCheckpoint to receive the state captured when this one stops
-// (including on budget truncation or cancellation, which is the case resume
-// exists for). Restored pending entries are re-validated against depth and scope
-// on load: a checkpoint round-trips through host storage and its fingerprint is
-// derived from non-secret config, so it is parsed input, not trusted in-process
-// state. A checkpoint whose fingerprint or age does not match is reported
-// on Stderr and ignored, so a config change costs a full re-crawl rather than a
-// failed run. Both backends honor it. Storing and passing the checkpoint between
-// runs is the host's (Guard's) concern and is not built here.
+//   - TLS verification stays ON. [CrawlerOptions.ProxyInsecure]
+//     (--proxy-insecure) disables it for an http/https MITM proxy, HTTP backend
+//     only: the headless path validates against the OS trust store, so trust the
+//     proxy CA out of band there. socks5 always verifies, since the Go client does
+//     TLS to the target through the tunnel.
+//   - No dial-time SSRF pin is installed for proxy connections: the client dials
+//     the proxy, usually loopback, so pinning would block the proxy and protect
+//     nothing. URL-level scope still applies, so a private target still needs
+//     AllowPrivate, and rebinding protection is delegated to the proxy.
+//
+// # Page budget (LAB-4678)
+//
+// [CrawlerOptions.MaxPages] counts pages, not captured requests — one SPA page
+// fires dozens of XHR calls. Workers reserve a slot before navigating, so the cap
+// is exact, and reaching it does NOT cancel the browser context: in-flight pages
+// finish their bounded visit and emit everything they captured.
+//
+// # JS replay
+//
+// After a headless crawl, [ReplayJSExtracted] scans captured JS bundles for API
+// path strings and probes them over raw HTTP, recovering endpoints the browser
+// cannot exercise: paths gated behind interaction, paths built by runtime
+// concatenation, and paths a browser can only reach by navigating, where an SPA
+// serves its shell instead. Raw HTTP does not escape a server-side catch-all,
+// though: a wrong path still returns that shell, which is why fetchJSBodyHop
+// filters HTML.
+//
+// Recognized forms are quoted paths, template literals, full URLs,
+// literal+literal `+` prefixes, and identifier-bearing concatenation via
+// String.prototype.concat or `+` (LAB-1368) — the last substitutes a numeric
+// sentinel for non-literal operands so the path stays probeable and
+// parameterizable. Runs under a same-origin gate and pkg/ssrf unless AllowPrivate.
+//
+// # Session cookies (LAB-2222)
+//
+// [ExtractCookieHeader] pulls the Cookie header out, [ParseCookiesToParams]
+// converts it, and the result is set on the browser before navigating. Cookies
+// must go through the CDP Storage domain rather than Network.setExtraHTTPHeaders:
+// only Storage-domain cookies survive redirects, new tabs and page-initiated
+// fetch().
+//
+// The package also defines the capture format: a JSON array of ObservedRequest,
+// the interchange between the capture and generation stages.
+//
+// # Cross-run resume (LAB-4678 Phase 4)
+//
+// [Checkpoint] serializes the frontier's pending queue and seen-set so coverage
+// accumulates across separate crawls, gated by [ComputeConfigFingerprint] and
+// [DefaultCheckpointMaxAge]. Both backends honor it; drive it through
+// [CrawlerOptions.ResumeFrom] and [CrawlerOptions.OnCheckpoint], which also fires on
+// budget truncation and cancellation, the case resume exists for. A checkpoint is
+// parsed input, not trusted in-process state: restored entries are re-validated
+// against depth and scope, and a fingerprint or age mismatch is reported on Stderr
+// and ignored, so a config change costs a re-crawl rather than a failed run. Storing
+// it between runs is the host's concern. See [Checkpoint] for the seen-set lifecycle
+// the host owns and for transient-failure requeue.
 //
 // [go-rod]: https://github.com/go-rod/rod
 package crawl
