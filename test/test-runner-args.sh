@@ -1942,11 +1942,29 @@ else
     # pattern uses [|] rather than \| because `awk -v` processes escapes in the
     # value: `\|` would arrive as a bare `|`, turning the regex into an alternation
     # that matches nearly every line and making this a permanent false FAIL.
+    # Backslash-continued physical lines are joined into one logical line before
+    # the match: a `printf … | grep -q` (or `| head -N`) split on a trailing `\`
+    # puts writer and reader on separate records, so neither half matches, hits
+    # stay empty, and the inversion class is back.
     sigpipe_re='printf.*[|].*(grep([[:space:]]+-[a-zA-Z]+)*[[:space:]]+-[a-zA-Z]*q|head[[:space:]]+-)'
     sigpipe_hits=$(awk -v r="$sigpipe_re" '
-        { line = $0; sub(/^[[:space:]]+/, "", line)
+        {
+          if (cont) { logical = logical $0 }
+          else      { logical = $0; start = NR }
+          if ($0 ~ /\\$/) { sub(/\\$/, "", logical); cont = 1; next }
+          cont = 0
+          line = logical
+          sub(/^[[:space:]]+/, "", line)
           if (line ~ /^#/) next
-          if ($0 ~ r) printf "%d ", NR }' "$WORKFLOW")
+          if (logical ~ r) printf "%d ", start
+        }
+        END {
+          if (cont) {
+            line = logical
+            sub(/^[[:space:]]+/, "", line)
+            if (line !~ /^#/ && logical ~ r) printf "%d ", start
+          }
+        }' "$WORKFLOW")
     if [[ -n "${sigpipe_hits// /}" ]]; then
         fail "live-tests.yml pipes printf into an early-exiting reader (grep -q / head -N) at line(s) ${sigpipe_hits}-- under 'set -o pipefail' the reader exits on its first match, printf takes SIGPIPE, and the pipeline's non-zero status INVERTS the guard's verdict. Measured in run 33405732303: 40 yq-attributed FAILs were read as zero and the step reported the opposite. Use a herestring: grep -q PATTERN <<< \"\$out\""
     else
