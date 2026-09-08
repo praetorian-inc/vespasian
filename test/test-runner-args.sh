@@ -1942,16 +1942,18 @@ else
     # pattern uses [|] rather than \| because `awk -v` processes escapes in the
     # value: `\|` would arrive as a bare `|`, turning the regex into an alternation
     # that matches nearly every line and making this a permanent false FAIL.
-    # Backslash-continued physical lines are joined into one logical line before
-    # the match: a `printf … | grep -q` (or `| head -N`) split on a trailing `\`
-    # puts writer and reader on separate records, so neither half matches, hits
-    # stay empty, and the inversion class is back.
+    # Backslash-continued physical lines, and physical lines that end in a
+    # pipeline operator `|` (optional trailing whitespace), are joined into one
+    # logical line before the match. The `|` is kept; a trailing `\` is stripped.
+    # A `printf … | grep -q` (or `| head -N`) split across records otherwise
+    # matches neither half, hits stay empty, and the inversion class is back.
     sigpipe_re='printf.*[|].*(grep([[:space:]]+-[a-zA-Z]+)*[[:space:]]+-[a-zA-Z]*q|head[[:space:]]+-)'
     sigpipe_hits=$(awk -v r="$sigpipe_re" '
         {
           if (cont) { logical = logical $0 }
           else      { logical = $0; start = NR }
           if ($0 ~ /\\$/) { sub(/\\$/, "", logical); cont = 1; next }
+          if ($0 ~ /[|][[:space:]]*$/) { cont = 1; next }
           cont = 0
           line = logical
           sub(/^[[:space:]]+/, "", line)
