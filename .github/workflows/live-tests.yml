@@ -795,7 +795,9 @@ jobs:
       # release-assets.githubusercontent.com:443 (yq curl follows
       # github.com/releases/download here; NOT objects.githubusercontent.com),
       # proxy.golang.org:443 (go test in the container),
-      # sum.golang.org:443 (Go sumdb on cache miss). No setup-go /
+      # sum.golang.org:443 (Go sumdb on cache miss),
+      # registry-1.docker.io:443 (measured run 34379783876: docker pull of the
+      # MCR FROM still hits Hub at this host; docker.io:443 is not enough). No setup-go /
       # upload-artifact on the host, so no *.blob.core.windows.net. First
       # block-mode CI run is allowed to name missing endpoints (❌ Blocked);
       # add those to THIS job only, then re-pin.
@@ -827,6 +829,7 @@ jobs:
             mcr.microsoft.com:443
             nodejs.org:443
             proxy.golang.org:443
+            registry-1.docker.io:443
             registry.npmjs.org:443
             release-assets.githubusercontent.com:443
             results-receiver.actions.githubusercontent.com:443
@@ -1049,7 +1052,9 @@ jobs:
       # proxy/sum.golang.org stay off. docker/setup-qemu-action and
       # docker/setup-buildx-action fetch GitHub releases (github.com already
       # listed). QEMU pulls the default tonistiigi/binfmt image from
-      # docker.io:443; do not invent docker-auth hosts. nodejs.org:443 (nvm
+      # docker.io:443 plus registry-1.docker.io:443 (measured run 34379783876:
+      # setup-buildx Get https://registry-1.docker.io/v2/ refused; docker.io
+      # alone is not enough). nodejs.org:443 (nvm
       # install 20) and release-assets.githubusercontent.com:443 (yq curl
       # follows github.com/releases/download here; NOT
       # objects.githubusercontent.com) are on this list. Blob storage omitted:
@@ -1092,6 +1097,7 @@ jobs:
             go.dev:443
             mcr.microsoft.com:443
             nodejs.org:443
+            registry-1.docker.io:443
             registry.npmjs.org:443
             release-assets.githubusercontent.com:443
             results-receiver.actions.githubusercontent.com:443
