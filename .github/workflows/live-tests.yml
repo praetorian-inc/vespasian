@@ -37,15 +37,13 @@ permissions:
 # actually happened; `domain resolved` is only a DNS lookup, and the two differ
 # here.
 #
-# LAB-6222 source runs that executed all three remaining jobs:
-#   34280577854 (PR #226, head 9561b27) — jobs 102244066291 / 102244143615 / 102244143724
-#   34235998695 (same PR, earlier green)
-#   33943059457 (push to main)
-# Those logs were not readable from the implementing host (`gh run view <id> --log`
-# and `gh api .../jobs/<id>/logs` redirect to *.blob.core.windows.net, which 403s).
-# The three lists are therefore SOURCE-VERIFIED from committed URLs in this tree;
-# first block-mode CI is allowed to name missing endpoints (❌ Blocked) and those
-# are added to THAT job only, then re-pinned. Three guesses recorded on LAB-4732/LAB-6015 did not survive that check:
+# LAB-6222: only `devcontainer-changes` got a new allowlist. Source-run logs
+# (34280577854 / 34235998695 / 33943059457) were not readable from the
+# implementing host (`gh run view` / job-log blobs 403). That one list is
+# SOURCE-VERIFIED from committed URLs (checkout + git fetch). First block-mode
+# CI is allowed to name missing endpoints (❌ Blocked) for THAT job only, then
+# re-pin. The two image jobs have no `allowed-endpoints` while they stay on
+# `audit` (AC6). Three guesses recorded on LAB-4732/LAB-6015 did not survive that check:
 # objects.githubusercontent.com and nodejs.org are never contacted (setup-go and
 # setup-node fetch from release-assets.githubusercontent.com), and
 # storage.googleapis.com was only ever needed by preflight-selftest's GOTOOLCHAIN

@@ -3177,12 +3177,13 @@ else
       + \" container=\" + ((.jobs.\"${aud_job}\" | has(\"container\")) | tostring)
       + \" services=\" + ((.jobs.\"${aud_job}\" | has(\"services\")) | tostring)
       + \" jobif=\" + ((.jobs.\"${aud_job}\".\"if\" // \"false:\") | tostring)
+      + \" needs=\" + (([.jobs.\"${aud_job}\".needs] | flatten | map(select(. != null)) | sort | join(\",\")))
       + \" \" + ([.jobs.\"${aud_job}\".steps[] | select((.uses // \"\") | test(\"step-security/harden-runner\"))]
         | map(\"sudo=\" + ((.with.\"disable-sudo\" // \"<unset>\") | tostring)
             + \" if=\" + ((has(\"if\")) | tostring)
             + \" coe=\" + ((.\"continue-on-error\" // false) | tostring)
             + \" withkeys=\" + ([.with | keys | .[]] | sort | join(\",\"))) | join(\" ;; \"))" -r)
-    aud_want="policy=audit first=true container=false services=false jobif=${DEVCONTAINER_JOB_IF} sudo=<unset> if=false coe=false withkeys=egress-policy"
+    aud_want="policy=audit first=true container=false services=false jobif=${DEVCONTAINER_JOB_IF} needs=devcontainer-changes sudo=<unset> if=false coe=false withkeys=egress-policy"
     case "$aud_got" in
                     __NO_YQ__)    fail_no_yq "${aud_job}'s harden-runner policy" ;;
                     __YQ_ERROR__) fail_yq_error "${aud_job}'s harden-runner policy" ;;
