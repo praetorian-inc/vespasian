@@ -66,6 +66,6 @@
   //
   // --ignore-scripts matches every other npm call site in this repo (both
   // invocations in .github/workflows/live-tests.yml), keeping package lifecycle
-  // scripts from executing under the non-blocking audit-only egress policy.
+  // scripts from executing even when a job's allowlist includes registry.npmjs.org.
   "onCreateCommand": "bash .devcontainer/on-create.sh"
 }

@@ -15,6 +15,116 @@ concurrency:
 permissions:
   contents: read
 
+# ── ALLOWLIST PROVENANCE (LAB-6015) ───────────────────────────────────────────
+# The harden-runner steps in EXPECTED_HR_JOBS run `egress-policy: block`; the ones
+# in EXPECTED_AUDIT_JOBS run `audit` deliberately, with the reason recorded at each
+# of those jobs and in LAB-6015's AC6 note. Both arrays live in
+# test/test-runner-args.sh and are the authority — this block deliberately does NOT
+# restate which jobs or how many, because every hand-maintained count in this file
+# has gone stale (see the note below). The per-job
+# `allowed-endpoints` lists are DERIVED FROM TELEMETRY, not guessed: the union of
+# the `endpoint called` lines in the harden-runner post-step output of six green
+# `live-tests` push runs on main —
+#
+#   32500986374 (393bf02) 32494976039 (b575e67) 32398237813 (c0bb167)
+#   32395398188 (d2a4e90) 32382787790 (f6c0624) 32297452612 (ff299ba)
+#
+# read back with `gh run view <id> --log`. `endpoint called` is a connect that
+# actually happened; `domain resolved` is only a DNS lookup, and the two differ
+# here. Three guesses recorded on LAB-4732/LAB-6015 did not survive that check:
+# objects.githubusercontent.com and nodejs.org are never contacted (setup-go and
+# setup-node fetch from release-assets.githubusercontent.com), and
+# storage.googleapis.com was only ever needed by preflight-selftest's GOTOOLCHAIN
+# fetch, which that job's `GOTOOLCHAIN: local` now removes — so it appears on no
+# list at all. Do not say "the job with no setup-go": THREE jobs have no setup-go
+# (preflight-selftest, validator-regression, docs-check) and none of them needs it.
+#
+# The lists are per job, not shared. preflight-selftest and docs-check are
+# near-hermetic and a shared list would over-grant them; docs-check needs two
+# endpoints.
+#
+# ONE DELIBERATE SUPERSET, so this is not read as pure observation:
+# sum.golang.org:443 appears in integration-tests and test although the six runs
+# never dialled it there. setup-go restored the module cache in every one of
+# them, so `go mod download` verified nothing against the checksum database. A
+# go.sum change, a new dependency or an evicted cache takes the miss path, which
+# does dial it — and a blocked sumdb fails `go mod download` in a way that reads
+# as a network flake rather than as a policy gap. The endpoint is Go's module
+# checksum database, so allowing it strengthens the supply chain rather than
+# weakening it. preflight-selftest USED to reach it for real, via the GOTOOLCHAIN
+# fetch that this job's `GOTOOLCHAIN: local` now removes — so sum.golang.org is a
+# deliberate superset in integration-tests and test, and appears on no other list,
+# exactly as storage.googleapis.com does above.
+#
+# Deliberately NOT allowed, though observed:
+#   * clients2.google.com:80, www.google.com:443, update.googleapis.com:443 —
+#     Chrome's component updater and connectivity probes. LAB-4999 pinned the
+#     system browser and added telemetry-suppressing flags; these survived it.
+#     Stopping them is the point of the flip, and no assertion reads them.
+#   * example.com:443 — TestDoCrawl_ProxyPortlessWarning crawls it through a
+#     deliberately broken proxy and discards the result, asserting only on a
+#     stderr warning, so a blocked crawl does not change the test's outcome.
+#   * hosted-compute-{watchdog,request-orchestrator}-prod-*.githubapp.com —
+#     GitHub's own host agents (provjobd, hosted-compute-agent). These ARE
+#     subject to the policy and ARE blocked: run 32651870901 logged
+#     "domain not allowed" for them in preflight-selftest, integration-tests and
+#     test, and all three passed. Left off deliberately rather than by oversight
+#     — the region suffix rotates, so listing them means a wildcard over
+#     githubapp.com for traffic no step of ours makes.
+#   * prod.app-api.stepsecurity.io / agent.api.stepsecurity.io — implicitly
+#     allowed by harden-runner in block mode.
+#
+# `*.blob.core.windows.net:443` is wider than what any job needs, and that is a
+# known cost, not an oversight. harden-runner resolves the job's OWN Actions
+# results storage account at start-up and injects it — run 32651870901 shows
+# productionresultssa13 in the effective allow-set of all five jobs, including
+# the two whose lists name no blob endpoint at all — so the injection alone
+# covers a job that only uploads its step results, which is why preflight-selftest
+# and docs-check need no entry. It does NOT cover the ACTIONS CACHE or
+# upload-artifact: in the same run the `test` job used productionresultssa2 AND
+# productionresultssa14, neither of them the injected one. Three accounts in one
+# job in that run is why no tighter form has held. Narrowing it is not left to
+# reviewer attention: the exact-endpoint pin in test/test-runner-args.sh compares
+# the whole set per job, so replacing the wildcard with a named account mismatches
+# the pin and fails that job by name.
+#
+# The rule for a NEW job is "does it touch the Actions cache or upload an
+# artifact", NOT "does it use `cache: npm`". integration-tests carries the
+# wildcard with neither `cache: npm` nor upload-artifact: `actions/setup-go`
+# caches the module cache by DEFAULT, through the same Actions cache. Reasoning
+# from the two actions rather than from the cache gets a Go-only job wrong.
+#
+# TWO jobs carry no harden-runner step, not one. install-chrome-e2e is a
+# CONTAINER job and the action does not support those; its own comment records
+# that. check-label is the other: it is a non-container job whose single step is
+# an inline bash gate with no checkout and no network use, so there is nothing
+# for an egress policy to protect.
+#
+# DO NOT WRITE A JOB COUNT HERE. This sentence has now been wrong three times: it
+# first said "all five non-container jobs"; it was corrected to "seven jobs, six of
+# them non-container, and FIVE carry the policy"; and merging LAB-5766 added three
+# more jobs, which made that wrong too — while every structural pin stayed green,
+# because a census in prose is not something a YAML pin can check. (No corrected
+# figure is given here on purpose; writing one is how the previous two got stale.)
+#
+# The census belongs in EXPECTED_ALL_JOBS / EXPECTED_HR_JOBS /
+# EXPECTED_AUDIT_JOBS in test/test-runner-args.sh, which ARE asserted against the
+# workflow on every run and fail the build naming the job. Name the arrays here, not
+# the numbers.
+#
+# KEEP `allowed-endpoints` A `>` BLOCK SCALAR. `*.blob.core.windows.net:443`
+# starts with `*`, which YAML reads as an ALIAS indicator anywhere it is not
+# inside a block scalar's literal body. Measured with yaml.safe_load: the `>`
+# form parses to the expected list, while the same content as a plain scalar or
+# a flow sequence both raise "while scanning an alias". Rewriting these lists as
+# space-separated one-liners is a natural-looking cleanup that would break the
+# workflow's YAML outright.
+#
+# WHEN A RUN IS BLOCKED: harden-runner's job summary marks the destination
+# "❌ Blocked". Add it to THAT job's list with a note on why the job needs it;
+# do not widen a sibling job's list to match — and update the pinned expectation
+# in test/test-runner-args.sh, which compares the exact set.
+# ──────────────────────────────────────────────────────────────────────────────
 jobs:
   # Fast, un-gated regression net: a syntax check plus all four guard suites —
   # preflight Chrome/Chromium detection (LAB-3893), install-chrome.sh's
@@ -26,21 +136,47 @@ jobs:
   preflight-selftest:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    env:
+      # This job builds nothing. Its only Go contact is the `go version` call in
+      # check_prerequisites (test/setup-live-targets.sh:248), which is a DISPLAY
+      # LABEL — `log_ok "Go $(go version | ...)"` — with no version gate behind
+      # it. Under the default GOTOOLCHAIN=auto that bare call still honours
+      # go.mod's `go` directive and fetches a toolchain, which is the only reason
+      # this job ever reached proxy.golang.org, sum.golang.org and
+      # storage.googleapis.com. Pinning `local` removes the fetch, and with it
+      # three endpoints from the allowlist below — including
+      # storage.googleapis.com, which run-live-tests.sh names in its `dl_markers` list as
+      # a go-rod browser-download marker and fails the build on. Measured: with go.mod
+      # requiring an unavailable toolchain, `GOTOOLCHAIN=auto go version`
+      # downloads while `GOTOOLCHAIN=local go version` prints the local build.
+      GOTOOLCHAIN: local
     steps:
-      # Defense-in-depth (LAB-4732): monitor and record all
-      # outbound network traffic. Audit mode is non-blocking — it logs egress
-      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
-      # 'block' with an allowed-endpoints list once telemetry confirms the set.
+      # Egress allowlist derived from telemetry — see the ALLOWLIST PROVENANCE
+      # block above jobs:. Two entries, the same as docs-check: the GOTOOLCHAIN
+      # pin in this job's env removes the toolchain fetch that used to need
+      # proxy.golang.org, sum.golang.org and storage.googleapis.com. No npm, no
+      # Actions cache and no artifact upload either, so no registry.npmjs.org
+      # and no blob storage.
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
       # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
       # integration-tests / test. harden-runner is a SHA-pinned security control:
-      # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job
-      # on a stale pin.
+      # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job on
+      # a stale pin. test/test-runner-args.sh pins the whole policy for the FIVE that
+      # run under `block` — this SHA, 'block', disable-sudo, no step if:, harden-runner
+      # FIRST, the job shape, the exact `with:` key set and the exact allowlist — plus
+      # which jobs carry the step at all and the full job set, so none of those can move
+      # without the build failing and naming the job. The three devcontainer jobs
+      # (LAB-5766) still run `audit` and are pinned as audit, deliberately: see the
+      # AC6 rationale recorded at each of those jobs (devcontainer-changes / devcontainer-image /
+      # devcontainer-image-arm64), and pinned via EXPECTED_AUDIT_JOBS.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
-          egress-policy: audit
+          egress-policy: block
           disable-sudo: true
+          allowed-endpoints: >
+            github.com:443
+            results-receiver.actions.githubusercontent.com:443
 
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
@@ -52,7 +188,7 @@ jobs:
       # `bash <script>` silently works on a file that lost +x. One style for all
       # four, so there is nothing to keep in sync.
       - name: Syntax check
-        run: bash -n test/setup-live-targets.sh && bash -n test/install-chrome.sh && bash -n test/assert-chrome-install.sh && bash -n test/assert-devcontainer-lookpath.sh && bash -n .devcontainer/on-create.sh
+        run: bash -n test/setup-live-targets.sh && bash -n test/install-chrome.sh && bash -n test/assert-chrome-install.sh && bash -n test/assert-egress-enforced.sh && bash -n test/assert-devcontainer-lookpath.sh && bash -n .devcontainer/on-create.sh
 
       # The guard suites again, on a PATH with yq removed. Every assertion block
       # with a vacuity sentinel has to credit exactly the counted outcomes its
@@ -102,11 +238,11 @@ jobs:
           # subject. It happens not to collide today only because that pin is
           # yq-gated and so does not emit on this run — which is exactly the kind
           # of accident that stops being true after an unrelated edit.
-          if printf '%s\n' "$out" | grep -q '^test-runner-args: FAIL — assertion accounting drift'; then
+          if grep -q '^test-runner-args: FAIL — assertion accounting drift' <<< "$out"; then
             echo "::error::the guard suite reports assertion accounting drift without yq — a vacuity sentinel arm credits the wrong number of outcomes, so a yq-less contributor is told the ledger is stale instead of the real cause" >&2
             exit 1
           fi
-          printf '%s\n' "$out" | grep -q '=== Summary ===' \
+          grep -q '=== Summary ===' <<< "$out" \
             || { echo "::error::the guard suite did not reach its summary without yq — it died before reporting" >&2; exit 1; }
           # The yq-gated arms must actually have been REACHED, or this step passes
           # while proving nothing — a suite that never touched them looks identical
@@ -115,7 +251,7 @@ jobs:
           # filter step's own "yq unavailable or the workflow is unparseable". Match
           # both, or the honest run fails the equality check below by exactly one.
           yqpat='yq is required|yq unavailable'
-          if ! printf '%s\n' "$out" | grep -qE "$yqpat"; then
+          if ! grep -qE "$yqpat" <<< "$out"; then
             echo "::error::the yq-less run produced no 'yq is required' diagnostic, so the yq-gated arms were never reached and this step asserted nothing" >&2
             exit 1
           fi
@@ -124,8 +260,8 @@ jobs:
           # run showed 21 failures instead of the expected yq ones and this step
           # still exited 0. MEASURED. Compare the failure count against the number
           # of yq-attributed diagnostics.
-          fails=$(printf '%s\n' "$out" | sed -n 's/^  \([0-9]*\) passed, \([0-9]*\) failed.*/\2/p' | head -1)
-          yqfails=$(printf '%s\n' "$out" | grep -cE "^  FAIL:.*($yqpat)" || true)
+          fails=$(sed -n 's/^  \([0-9]*\) passed, \([0-9]*\) failed.*/\2/p' <<< "$out" | head -1)
+          yqfails=$(grep -cE "^  FAIL:.*($yqpat)" <<< "$out" || true)
           if [ "${fails:-0}" -ne "${yqfails:-0}" ]; then
             echo "::error::the yq-less run reported ${fails} failure(s) but only ${yqfails} are yq-attributed — the extra failure(s) are a real regression this step must not mask" >&2
             exit 1
@@ -160,6 +296,27 @@ jobs:
       - name: Drift guard (target groups vs dispatch)
         run: ./test/test-runner-args.sh
 
+      # AC3 RUNTIME PROOF (LAB-6015). The only check in the repo that tests whether
+      # `block` ENFORCES, rather than what the YAML says. The probe lives in a
+      # committed script, not inline here: five review rounds of pinning inline shell
+      # from test/test-runner-args.sh each closed the measured bypass and left an
+      # adjacent one, because a text pin over free-form shell cannot be exhaustive.
+      # As a file the pin is one exact invocation string, and the body is covered by
+      # the un-gated `bash -n` step above — the same reasoning AGENTS.md records for
+      # test/assert-chrome-install.sh. Rationale, both verdicts, and the residual are
+      # documented in the script itself.
+      #
+      # RUNS LAST, DELIBERATELY, and its position is pinned. It is the only
+      # network-dependent step in this job; the four guard suites above need no network.
+      # Placed earlier, a transient failure on either host aborted the job before any of
+      # them ran, suppressing every network-free assertion in the four guard suites above
+      # and skipping the `test` job via its `needs:`. Last means a flake costs only this
+      # assertion. (No count is quoted here on purpose — AGENTS.md records that every
+      # hand-maintained count in this repo has been wrong; test-runner-args.sh pins its
+      # own total.)
+      - name: Assert egress policy enforces (AC3)
+        run: ./test/assert-egress-enforced.sh
+
   # Fast, un-gated regression test for the spec validators (PR #187 review,
   # advisory finding). Proves the validators reject malformed specs (no grep
   # false-pass); ~1s runtime, no Go build, no live services. Deliberately
@@ -170,20 +327,35 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      # Defense-in-depth (LAB-4732): monitor and record all
-      # outbound network traffic. Audit mode is non-blocking — it logs egress
-      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
-      # 'block' with an allowed-endpoints list once telemetry confirms the set.
+      # Egress allowlist derived from telemetry — see the ALLOWLIST PROVENANCE
+      # block above jobs:. setup-node fetches Node from release-assets (via
+      # api.github.com), `npm ci` fetches from registry.npmjs.org, and `cache: npm`
+      # reads/writes the Actions cache in blob storage. No Go endpoints: nothing
+      # in this job invokes the toolchain.
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
       # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
       # integration-tests / test. harden-runner is a SHA-pinned security control:
-      # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job
-      # on a stale pin.
+      # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job on
+      # a stale pin. test/test-runner-args.sh pins the whole policy for the FIVE that
+      # run under `block` — this SHA, 'block', disable-sudo, no step if:, harden-runner
+      # FIRST, the job shape, the exact `with:` key set and the exact allowlist — plus
+      # which jobs carry the step at all and the full job set, so none of those can move
+      # without the build failing and naming the job. The three devcontainer jobs
+      # (LAB-5766) still run `audit` and are pinned as audit, deliberately: see the
+      # AC6 rationale recorded at each of those jobs (devcontainer-changes / devcontainer-image /
+      # devcontainer-image-arm64), and pinned via EXPECTED_AUDIT_JOBS.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
-          egress-policy: audit
+          egress-policy: block
           disable-sudo: true
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            registry.npmjs.org:443
+            release-assets.githubusercontent.com:443
+            results-receiver.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
 
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
@@ -199,11 +371,13 @@ jobs:
           cache: npm
           cache-dependency-path: test/spec-validators/package-lock.json
 
-      # --ignore-scripts prevents install/preinstall/postinstall
-      # lifecycle scripts from running under harden-runner's non-blocking
-      # audit-only egress policy. These validators are pure libraries with no
-      # install step, but this protects against a future lockfile refresh
-      # silently introducing one.
+      # --ignore-scripts prevents install/preinstall/postinstall lifecycle
+      # scripts from running at all. Still load-bearing under `block`, not
+      # redundant with it: the egress policy bounds WHERE a lifecycle script can
+      # reach, and registry.npmjs.org is necessarily on this job's allowlist, so
+      # a script running at install time would inherit exactly the endpoint it
+      # would want. These validators are pure libraries with no install step, but
+      # this protects against a future lockfile refresh silently introducing one.
       - name: Install spec validators
         working-directory: test/spec-validators
         run: npm ci --ignore-scripts
@@ -211,6 +385,15 @@ jobs:
       - name: Validator regression test
         run: ./test/validate_test.sh
 
+      # Same AC3 runtime proof as preflight-selftest, LAST for the same reason:
+      # this is the only network-dependent assertion in the job. Dropping the
+      # identical script here extends the proof into a job whose allowlist
+      # carries `*.blob.core.windows.net:443` (the only non-literal entry);
+      # proxy.golang.org is not on this job's list, so the unlisted-host probe
+      # still refuses. test/test-runner-args.sh pins this step the same way it
+      # pins preflight-selftest's.
+      - name: Assert egress policy enforces (AC3)
+        run: ./test/assert-egress-enforced.sh
 
   # Community-health docs guard (LAB-5870). Asserts the required docs exist, every
   # relative markdown link and heading anchor resolves, and the CODEOWNERS '*' roster
@@ -226,20 +409,30 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      # Defense-in-depth (LAB-4732): monitor and record all
-      # outbound network traffic. Audit mode is non-blocking — it logs egress
-      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
-      # 'block' with an allowed-endpoints list once telemetry confirms the set.
+      # Egress allowlist derived from telemetry — see the ALLOWLIST PROVENANCE
+      # block above jobs:. Two entries because that is genuinely all this job does:
+      # checkout, then python3 check-docs.py against the working tree. If a future
+      # docs check reaches the network, this list is where that shows up.
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
       # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
       # integration-tests / test. harden-runner is a SHA-pinned security control:
-      # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job
-      # on a stale pin.
+      # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job on
+      # a stale pin. test/test-runner-args.sh pins the whole policy for the FIVE that
+      # run under `block` — this SHA, 'block', disable-sudo, no step if:, harden-runner
+      # FIRST, the job shape, the exact `with:` key set and the exact allowlist — plus
+      # which jobs carry the step at all and the full job set, so none of those can move
+      # without the build failing and naming the job. The three devcontainer jobs
+      # (LAB-5766) still run `audit` and are pinned as audit, deliberately: see the
+      # AC6 rationale recorded at each of those jobs (devcontainer-changes / devcontainer-image /
+      # devcontainer-image-arm64), and pinned via EXPECTED_AUDIT_JOBS.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
-          egress-policy: audit
+          egress-policy: block
           disable-sudo: true
+          allowed-endpoints: >
+            github.com:443
+            results-receiver.actions.githubusercontent.com:443
 
       # fetch-depth 0 is NOT needed: the checker reads the working tree and uses
       # `git ls-files`, which works on a shallow clone.
@@ -397,7 +590,7 @@ jobs:
             exit 1
           }
           printf '%s\n' "$out"
-          printf '%s' "$out" | grep -q "already present" \
+          grep -q "already present" <<< "$out" \
             || { echo "second run did not take the idempotent path"; exit 1; }
 
   # Decides whether a PULL REQUEST touches the devcontainer image or anything it
@@ -428,13 +621,28 @@ jobs:
       # notice. One producer, two consumers, nothing to keep in step.
       should-run: ${{ steps.gate.outputs.run }}
     steps:
-      # Defense-in-depth (LAB-4732): monitor and record all
-      # outbound network traffic. Audit mode is non-blocking — it logs egress
-      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
-      # 'block' with an allowed-endpoints list once telemetry confirms the set.
-      # DUPLICATED across preflight-selftest / validator-regression / docs-check /
-      # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
-      # integration-tests / test. harden-runner is a SHA-pinned security control:
+      # Defense-in-depth (LAB-4732): monitor and record all outbound network
+      # traffic. Audit mode is non-blocking — it logs egress to the StepSecurity
+      # dashboard without enforcing an allowlist.
+      #
+      # THIS JOB STAYS ON `audit` DELIBERATELY, recorded rather than silent —
+      # LAB-6015 AC6 exists for exactly this case. That ticket flipped the five
+      # older jobs to `block`, but its AC2 requires every allowed-endpoints list to
+      # be DERIVED FROM TELEMETRY of real runs, and the three devcontainer jobs
+      # landed on main (LAB-5766) after those six source runs were captured. A
+      # docker/devcontainer build's egress set is exactly the kind that has to be
+      # measured rather than guessed: flipping blind would either break the build or
+      # ship a folklore allowlist, which is the thing AC2 was written to prevent.
+      # Deriving these three is follow-up work, not LAB-6015's.
+      #
+      # test/test-runner-args.sh pins this job in EXPECTED_AUDIT_JOBS with a per-job
+      # policy assertion, so a silent flip to `block` — or a silent loss of the step
+      # — fails the build and names the job.
+      #
+      # DUPLICATED across all EIGHT harden-runner jobs: the five on `block`
+      # (preflight-selftest / validator-regression / docs-check / integration-tests /
+      # test) and the three on `audit` (devcontainer-changes / devcontainer-image /
+      # devcontainer-image-arm64). harden-runner is a SHA-pinned security control:
       # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job
       # on a stale pin.
       - name: Harden runner
@@ -570,13 +778,28 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Defense-in-depth (LAB-4732): monitor and record all
-      # outbound network traffic. Audit mode is non-blocking — it logs egress
-      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
-      # 'block' with an allowed-endpoints list once telemetry confirms the set.
-      # DUPLICATED across preflight-selftest / validator-regression / docs-check /
-      # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
-      # integration-tests / test. harden-runner is a SHA-pinned security control:
+      # Defense-in-depth (LAB-4732): monitor and record all outbound network
+      # traffic. Audit mode is non-blocking — it logs egress to the StepSecurity
+      # dashboard without enforcing an allowlist.
+      #
+      # THIS JOB STAYS ON `audit` DELIBERATELY, recorded rather than silent —
+      # LAB-6015 AC6 exists for exactly this case. That ticket flipped the five
+      # older jobs to `block`, but its AC2 requires every allowed-endpoints list to
+      # be DERIVED FROM TELEMETRY of real runs, and the three devcontainer jobs
+      # landed on main (LAB-5766) after those six source runs were captured. A
+      # docker/devcontainer build's egress set is exactly the kind that has to be
+      # measured rather than guessed: flipping blind would either break the build or
+      # ship a folklore allowlist, which is the thing AC2 was written to prevent.
+      # Deriving these three is follow-up work, not LAB-6015's.
+      #
+      # test/test-runner-args.sh pins this job in EXPECTED_AUDIT_JOBS with a per-job
+      # policy assertion, so a silent flip to `block` — or a silent loss of the step
+      # — fails the build and names the job.
+      #
+      # DUPLICATED across all EIGHT harden-runner jobs: the five on `block`
+      # (preflight-selftest / validator-regression / docs-check / integration-tests /
+      # test) and the three on `audit` (devcontainer-changes / devcontainer-image /
+      # devcontainer-image-arm64). harden-runner is a SHA-pinned security control:
       # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job
       # on a stale pin.
       #
@@ -671,7 +894,7 @@ jobs:
             want=$(sed -n "s/^go //p" go.mod | head -1)
             have=$(go version | sed -n "s/.*go\([0-9][0-9.]*\).*/\1/p")
             [ -n "$want" ] && [ -n "$have" ] || { echo "could not read go.mod (got: $want) or go version (got: $have)" >&2; exit 1; }
-            oldest=$(printf "%s\n%s\n" "$want" "$have" | sort -V | head -1)
+            oldest=$(printf "%s\n%s\n" "$want" "$have" | sort -V | sed -n 1p)
             [ "$oldest" = "$want" ] || { echo "the image ships Go $have but go.mod requires >= $want; bump the Go layer in .devcontainer/Dockerfile" >&2; exit 1; }
             echo "container matches devcontainer.json: user=vscode, VESPASIAN_NO_SANDBOX=true, /dev/shm=${shm}B, spec-validator deps present, go=${have} (go.mod wants >= ${want})"
           '
@@ -796,13 +1019,28 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Defense-in-depth (LAB-4732): monitor and record all
-      # outbound network traffic. Audit mode is non-blocking — it logs egress
-      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
-      # 'block' with an allowed-endpoints list once telemetry confirms the set.
-      # DUPLICATED across preflight-selftest / validator-regression / docs-check /
-      # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
-      # integration-tests / test. harden-runner is a SHA-pinned security control:
+      # Defense-in-depth (LAB-4732): monitor and record all outbound network
+      # traffic. Audit mode is non-blocking — it logs egress to the StepSecurity
+      # dashboard without enforcing an allowlist.
+      #
+      # THIS JOB STAYS ON `audit` DELIBERATELY, recorded rather than silent —
+      # LAB-6015 AC6 exists for exactly this case. That ticket flipped the five
+      # older jobs to `block`, but its AC2 requires every allowed-endpoints list to
+      # be DERIVED FROM TELEMETRY of real runs, and the three devcontainer jobs
+      # landed on main (LAB-5766) after those six source runs were captured. A
+      # docker/devcontainer build's egress set is exactly the kind that has to be
+      # measured rather than guessed: flipping blind would either break the build or
+      # ship a folklore allowlist, which is the thing AC2 was written to prevent.
+      # Deriving these three is follow-up work, not LAB-6015's.
+      #
+      # test/test-runner-args.sh pins this job in EXPECTED_AUDIT_JOBS with a per-job
+      # policy assertion, so a silent flip to `block` — or a silent loss of the step
+      # — fails the build and names the job.
+      #
+      # DUPLICATED across all EIGHT harden-runner jobs: the five on `block`
+      # (preflight-selftest / validator-regression / docs-check / integration-tests /
+      # test) and the three on `audit` (devcontainer-changes / devcontainer-image /
+      # devcontainer-image-arm64). harden-runner is a SHA-pinned security control:
       # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job
       # on a stale pin.
       #
@@ -813,6 +1051,12 @@ jobs:
       # github.com for the pinned yq binary. Emulated or not, that is the same
       # third-party egress executed as root, so dropping the monitoring here
       # would have left the arch we understand LEAST the one we watch least.
+      #
+      # disable-sudo is NOT set here for the same reason as `devcontainer-image`:
+      # `docker build` on a GitHub runner reaches the daemon through the
+      # docker group, but the base image's own layers and the browser install run
+      # as root inside the build sandbox, and pinning that down is what the build
+      # is for.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -895,18 +1139,40 @@ jobs:
       # would catch that (LAB-4678 review).
       VESPASIAN_REQUIRE_CHROME: "1"
     steps:
-      # Defense-in-depth (LAB-4732): monitor and record all
-      # outbound network traffic. Audit mode is non-blocking.
+      # Egress allowlist derived from telemetry — see the ALLOWLIST PROVENANCE
+      # block above jobs:. setup-go pins the toolchain from go.mod, so there is no
+      # GOTOOLCHAIN fetch and storage.googleapis.com is NOT needed here:
+      # preflight-selftest reaches that same end by a different route, its
+      # GOTOOLCHAIN: local, so the endpoint is on no job's list at all. Chrome's
+      # egress is deliberately absent: this job drives a browser and the observed
+      # clients2.google.com / www.google.com / update.googleapis.com calls are
+      # Chrome phoning home, which no assertion depends on and which this policy
+      # exists to stop.
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
       # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
       # integration-tests / test. harden-runner is a SHA-pinned security control:
-      # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job
-      # on a stale pin.
+      # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job on
+      # a stale pin. test/test-runner-args.sh pins the whole policy for the FIVE that
+      # run under `block` — this SHA, 'block', disable-sudo, no step if:, harden-runner
+      # FIRST, the job shape, the exact `with:` key set and the exact allowlist — plus
+      # which jobs carry the step at all and the full job set, so none of those can move
+      # without the build failing and naming the job. The three devcontainer jobs
+      # (LAB-5766) still run `audit` and are pinned as audit, deliberately: see the
+      # AC6 rationale recorded at each of those jobs (devcontainer-changes / devcontainer-image /
+      # devcontainer-image-arm64), and pinned via EXPECTED_AUDIT_JOBS.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
-          egress-policy: audit
+          egress-policy: block
           disable-sudo: true
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            proxy.golang.org:443
+            release-assets.githubusercontent.com:443
+            results-receiver.actions.githubusercontent.com:443
+            sum.golang.org:443
+            *.blob.core.windows.net:443
 
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
@@ -955,22 +1221,38 @@ jobs:
     env:
       VESPASIAN_NO_SANDBOX: "true"
     steps:
-      # Defense-in-depth (LAB-4732): monitor and record all
-      # outbound network traffic. Audit mode is non-blocking — it logs egress
-      # to the StepSecurity dashboard without enforcing an allowlist. Flip to
-      # 'block' with an allowed-endpoints list once telemetry confirms the set
-      # (expected: github.com, proxy.golang.org, sum.golang.org,
-      # storage.googleapis.com, objects.githubusercontent.com, registry.npmjs.org).
+      # Egress allowlist derived from telemetry — see the ALLOWLIST PROVENANCE
+      # block above jobs:. The widest of the five: Go plus npm plus the Actions
+      # cache plus upload-artifact. The six services are local servers on
+      # loopback ports and contribute nothing here — confirmed in the telemetry,
+      # not assumed. Chrome's phone-home is deliberately absent, same as
+      # integration-tests.
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
       # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
       # integration-tests / test. harden-runner is a SHA-pinned security control:
-      # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job
-      # on a stale pin.
+      # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job on
+      # a stale pin. test/test-runner-args.sh pins the whole policy for the FIVE that
+      # run under `block` — this SHA, 'block', disable-sudo, no step if:, harden-runner
+      # FIRST, the job shape, the exact `with:` key set and the exact allowlist — plus
+      # which jobs carry the step at all and the full job set, so none of those can move
+      # without the build failing and naming the job. The three devcontainer jobs
+      # (LAB-5766) still run `audit` and are pinned as audit, deliberately: see the
+      # AC6 rationale recorded at each of those jobs (devcontainer-changes / devcontainer-image /
+      # devcontainer-image-arm64), and pinned via EXPECTED_AUDIT_JOBS.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
-          egress-policy: audit
+          egress-policy: block
           disable-sudo: true
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            proxy.golang.org:443
+            registry.npmjs.org:443
+            release-assets.githubusercontent.com:443
+            results-receiver.actions.githubusercontent.com:443
+            sum.golang.org:443
+            *.blob.core.windows.net:443
 
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
@@ -992,11 +1274,12 @@ jobs:
 
       # LAB-3890 T1: the offline generate-{rest,graphql,wsdl} targets validate
       # output with real parsers (swagger-parser + graphql-js) instead of grep.
-      # Deps are hermetic once installed; the only egress is registry.npmjs.org
-      # (already in the anticipated harden-runner allowlist above).
-      # --ignore-scripts prevents install/preinstall/postinstall
-      # lifecycle scripts from running under harden-runner's non-blocking
-      # audit-only egress policy.
+      # Deps are hermetic once installed; the only egress is registry.npmjs.org,
+      # which is on this job's harden-runner allowlist above — telemetry-confirmed,
+      # not anticipated.
+      # --ignore-scripts prevents install/preinstall/postinstall lifecycle
+      # scripts from running at all — see the same note in validator-regression
+      # for why `block` does not make it redundant.
       - name: Install spec validators
         working-directory: test/spec-validators
         run: npm ci --ignore-scripts
