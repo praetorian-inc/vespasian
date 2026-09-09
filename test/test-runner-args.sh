@@ -2730,14 +2730,15 @@ echo "=== harden-runner egress policy ==="
 # Changing a job's egress policy therefore means editing this table. That is the
 # point: LAB-6015's AC6 asks for a job leaving `block` to be RECORDED rather than
 # silent, and editing the pin is the recording.
-EXPECTED_HR_JOBS=(preflight-selftest validator-regression docs-check devcontainer-changes devcontainer-image devcontainer-image-arm64 integration-tests test)
+EXPECTED_HR_JOBS=(preflight-selftest validator-regression docs-check devcontainer-changes integration-tests test)
 
-# LAB-6222 flipped the three remaining audit jobs (devcontainer-changes /
-# devcontainer-image / devcontainer-image-arm64) to `block`. LAB-6015 AC6 left
-# them on `audit` because their allowlists had to be derived after those jobs
-# had green runs; that follow-up is this file. There is no EXPECTED_AUDIT_JOBS
-# array: an empty array with leftover "still audit" assertions would fail, and
-# a silent return to `audit` is a per-job hr_expected mismatch (policy=block).
+# LAB-6222 flipped `devcontainer-changes` to `block`. The two image jobs stay
+# on `audit` under LAB-6222 AC6: docker's daemon keeps dialling
+# 54.185.253.63:443 (Hub image-config pull) even after hostname allowlists
+# covering *.docker.io, auth.docker.io, registry-1.docker.io, docker.io and
+# production.cloudflare.docker.com (runs 34379783876, 34388259962,
+# 34389087177, 34394518703, 34395398451). A silent flip either way fails.
+EXPECTED_AUDIT_JOBS=(devcontainer-image devcontainer-image-arm64)
 
 # One entry per job above, and the value is the whole policy: the pinned action,
 # the egress mode, disable-sudo, whether the step carries an `if:`, whether
@@ -2768,8 +2769,6 @@ hr_expected() {
         validator-regression) endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='false:' ; needs='' ; usesset='actions/checkout,actions/setup-node,step-security/harden-runner' ; sudo='true' ; withkeys='allowed-endpoints,disable-sudo,egress-policy' ;;
         docs-check)           endpoints='github.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='false:' ; needs='' ; usesset='actions/checkout,step-security/harden-runner' ; sudo='true' ; withkeys='allowed-endpoints,disable-sudo,egress-policy' ;;
         devcontainer-changes) endpoints='github.com:443,results-receiver.actions.githubusercontent.com:443' ; jobif='false:' ; needs='' ; usesset='actions/checkout,step-security/harden-runner' ; sudo='true' ; withkeys='allowed-endpoints,disable-sudo,egress-policy' ;;
-        devcontainer-image)   endpoints='*.docker.io:443,auth.docker.io:443,deb.debian.org:80,dl.google.com:443,docker.io:443,github.com:443,go.dev:443,mcr.microsoft.com:443,nodejs.org:443,production.cloudflare.docker.com:443,proxy.golang.org:443,registry-1.docker.io:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,security.debian.org:80,sum.golang.org:443' ; jobif="true:$DEVCONTAINER_JOB_IF" ; needs='devcontainer-changes' ; usesset='actions/checkout,step-security/harden-runner' ; sudo='<unset>' ; withkeys='allowed-endpoints,egress-policy' ;;
-        devcontainer-image-arm64) endpoints='*.docker.io:443,auth.docker.io:443,deb.debian.org:80,dl.google.com:443,docker.io:443,github.com:443,go.dev:443,mcr.microsoft.com:443,nodejs.org:443,production.cloudflare.docker.com:443,registry-1.docker.io:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,security.debian.org:80' ; jobif="true:$DEVCONTAINER_JOB_IF" ; needs='devcontainer-changes' ; usesset='actions/checkout,docker/setup-buildx-action,docker/setup-qemu-action,step-security/harden-runner' ; sudo='<unset>' ; withkeys='allowed-endpoints,egress-policy' ;;
         integration-tests)    endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,proxy.golang.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,sum.golang.org:443' ; jobif="true:$GATED_JOB_IF" ; needs='check-label' ; usesset='actions/checkout,actions/setup-go,step-security/harden-runner' ; sudo='true' ; withkeys='allowed-endpoints,disable-sudo,egress-policy' ;;
         test)                 endpoints='*.blob.core.windows.net:443,api.github.com:443,github.com:443,proxy.golang.org:443,registry.npmjs.org:443,release-assets.githubusercontent.com:443,results-receiver.actions.githubusercontent.com:443,sum.golang.org:443' ; jobif="true:$GATED_JOB_IF" ; needs='check-label,preflight-selftest' ; usesset='actions/checkout,actions/setup-go,actions/setup-node,actions/upload-artifact,step-security/harden-runner' ; sudo='true' ; withkeys='allowed-endpoints,disable-sudo,egress-policy' ;;
         *) printf '%s\n' '<no expectation pinned>'; return 0 ;;
@@ -2847,7 +2846,7 @@ if [[ ! -f "$WORKFLOW" ]]; then
     # balanced section for a balanced suite. Those two figures are a measurement, not a pin,
     # and will drift as the suite grows — re-measure rather than trusting them. Only
     # EXPECTED_ASSERTIONS at the bottom of this file is self-enforcing.
-    for hr_pad in "the set of jobs carrying harden-runner" "the full job set" "the AC3 enforcement step and the exemption rationale" "the workflow-shape pin (shell overrides, permissions, env)" "the AC5 stale-comment guard"; do
+     for hr_pad in "the set of jobs carrying harden-runner" "the full job set" "the AC3 enforcement step and the exemption rationale" "the workflow-shape pin (shell overrides, permissions, env)" "the AC5 stale-comment guard" "devcontainer-image's audit policy" "devcontainer-image-arm64's audit policy"; do
         fail "${hr_pad} could not be checked: $WORKFLOW is missing"
     done
 else
@@ -2926,7 +2925,7 @@ else
     esac
     # Every job that carries the step. A silent drop of harden-runner is a set
     # mismatch; a silent audit<-block flip is a per-job hr_expected mismatch.
-    hr_pinned_sorted=$(printf '%s\n' "${EXPECTED_HR_JOBS[@]}" | sort | tr '\n' ' ' | sed 's/ $//')
+    hr_pinned_sorted=$(printf '%s\n' "${EXPECTED_HR_JOBS[@]}" "${EXPECTED_AUDIT_JOBS[@]}" | sort | tr '\n' ' ' | sed 's/ $//')
 
     # The AC3 runtime proof is the only assertion in the repo that tests egress
     # ENFORCEMENT rather than the YAML that describes it, and it shipped unpinned:
@@ -3168,8 +3167,28 @@ else
     if [[ "$stale_hr" == "0" ]]; then
         pass "no stale \"flip to 'block' once telemetry confirms the set\" comment survives in live-tests.yml (LAB-6015 AC5)"
     else
-        fail "${stale_hr} stale \"once telemetry confirms the set\" comment(s) are back in live-tests.yml. LAB-6015 AC5 requires them removed or updated: they tell a reader the allowlist has never been derived, which is false for every block-mode job (all eight carrying jobs after LAB-6222). This most often returns via a merge that adds a job by copying an older harden-runner block."
+        fail "${stale_hr} stale \"once telemetry confirms the set\" comment(s) are back in live-tests.yml. LAB-6015 AC5 requires them removed or updated: they tell a reader the allowlist has never been derived, which is false for the block-mode jobs and misleading for the two image jobs on audit under LAB-6222 AC6. This most often returns via a merge that adds a job by copying an older harden-runner block."
     fi
+
+            for aud_job in "${EXPECTED_AUDIT_JOBS[@]}"; do
+    aud_got=$(yq_query "\"policy=\" + ([.jobs.\"${aud_job}\".steps[] | select((.uses // \"\") | test(\"step-security/harden-runner\")) | (.with.\"egress-policy\" // \"<unset>\")] | join(\",\"))
+      + \" first=\" + ((.jobs.\"${aud_job}\".steps[0].uses // \"\") | test(\"step-security/harden-runner\") | tostring)
+      + \" container=\" + ((.jobs.\"${aud_job}\" | has(\"container\")) | tostring)
+      + \" services=\" + ((.jobs.\"${aud_job}\" | has(\"services\")) | tostring)
+      + \" \" + ([.jobs.\"${aud_job}\".steps[] | select((.uses // \"\") | test(\"step-security/harden-runner\"))]
+        | map(\"sudo=\" + ((.with.\"disable-sudo\" // \"<unset>\") | tostring)
+            + \" if=\" + ((has(\"if\")) | tostring)
+            + \" coe=\" + ((.\"continue-on-error\" // false) | tostring)
+            + \" withkeys=\" + ([.with | keys | .[]] | sort | join(\",\"))) | join(\" ;; \"))" -r)
+    aud_want='policy=audit first=true container=false services=false sudo=<unset> if=false coe=false withkeys=egress-policy'
+    case "$aud_got" in
+                    __NO_YQ__)    fail_no_yq "${aud_job}'s harden-runner policy" ;;
+                    __YQ_ERROR__) fail_yq_error "${aud_job}'s harden-runner policy" ;;
+                    "$aud_want")
+                                  pass "${aud_job} still runs harden-runner in audit as its FIRST step, with no container: or services:, explicitly (LAB-6222 AC6: docker daemon IP outside hostname allowlists)" ;;
+                    *)            fail "${aud_job}'s harden-runner egress-policy is '${aud_got}', expected 'audit'. If this job is being flipped to block, hostname allowlists have already failed (54.185.253.63:443) — record why, or move it to EXPECTED_HR_JOBS with an hr_expected entry." ;;
+                esac
+            done
 fi
 
 echo ""

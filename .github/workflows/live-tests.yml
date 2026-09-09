@@ -17,8 +17,9 @@ permissions:
 
 # ── ALLOWLIST PROVENANCE (LAB-6015, LAB-6222) ─────────────────────────────────
 # The harden-runner steps in EXPECTED_HR_JOBS run `egress-policy: block`.
-# EXPECTED_AUDIT_JOBS has no members after LAB-6222 flipped the three remaining
-# audit jobs (devcontainer-changes / devcontainer-image / devcontainer-image-arm64).
+# EXPECTED_AUDIT_JOBS is the two image jobs (LAB-6222 AC6): docker's daemon
+# still dials 54.185.253.63:443 after hostname allowlists. `devcontainer-changes`
+# is on `block`.
 # The array names live in test/test-runner-args.sh and are the authority — this
 # block deliberately does NOT restate which jobs or how many, because every
 # hand-maintained count in this file has gone stale (see the note below). The
@@ -815,32 +816,16 @@ jobs:
       # full job set, so none of those can move without the build failing and
       # naming the job.
       #
-      # disable-sudo is NOT set here, unlike preflight-selftest: `docker build`
-      # on a GitHub runner reaches the daemon through the docker group, but the
-      # base image's own layers and the browser install run as root inside the
-      # build sandbox, and pinning that down is what the build is for.
+      # THIS JOB STAYS ON `audit` (LAB-6222 AC6). Hostname allowlists (exact
+      # Hub names, *.docker.io:443, production.cloudflare.docker.com:443) still
+      # left docker pulling image config at dial tcp 54.185.253.63:443
+      # (runs 34379783876, 34388259962, 34389087177, 34394518703, 34395398451).
+      # The daemon's Hub hop is outside harden-runner's hostname policy.
+      # disable-sudo is NOT set: `docker build` needs the docker group.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
-          egress-policy: block
-          allowed-endpoints: >
-            *.docker.io:443
-            auth.docker.io:443
-            deb.debian.org:80
-            dl.google.com:443
-            docker.io:443
-            github.com:443
-            go.dev:443
-            mcr.microsoft.com:443
-            nodejs.org:443
-            production.cloudflare.docker.com:443
-            proxy.golang.org:443
-            registry-1.docker.io:443
-            registry.npmjs.org:443
-            release-assets.githubusercontent.com:443
-            results-receiver.actions.githubusercontent.com:443
-            security.debian.org:80
-            sum.golang.org:443
+          egress-policy: audit
 
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
@@ -1086,31 +1071,14 @@ jobs:
       # third-party egress executed as root, so dropping the monitoring here
       # would have left the arch we understand LEAST the one we watch least.
       #
-      # disable-sudo is NOT set here for the same reason as `devcontainer-image`:
-      # `docker build` on a GitHub runner reaches the daemon through the
-      # docker group, but the base image's own layers and the browser install run
-      # as root inside the build sandbox, and pinning that down is what the build
-      # is for.
+      # THIS JOB STAYS ON `audit` (LAB-6222 AC6), same reason as
+      # `devcontainer-image`: docker/setup-buildx image-config pull keeps
+      # dialling 54.185.253.63:443 after hostname allowlists. disable-sudo is
+      # NOT set: `docker build` needs the docker group.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
-          egress-policy: block
-          allowed-endpoints: >
-            *.docker.io:443
-            auth.docker.io:443
-            deb.debian.org:80
-            dl.google.com:443
-            docker.io:443
-            github.com:443
-            go.dev:443
-            mcr.microsoft.com:443
-            nodejs.org:443
-            production.cloudflare.docker.com:443
-            registry-1.docker.io:443
-            registry.npmjs.org:443
-            release-assets.githubusercontent.com:443
-            results-receiver.actions.githubusercontent.com:443
-            security.debian.org:80
+          egress-policy: audit
 
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
