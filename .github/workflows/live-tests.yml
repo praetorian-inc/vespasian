@@ -782,18 +782,23 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Egress allowlist SOURCE-VERIFIED from committed URLs (LAB-6222). Telemetry
-      # of `endpoint called` was not readable from this host: `gh run view` for
+      # Egress allowlist SOURCE-VERIFIED from committed URLs (LAB-6222), then
+      # extended from CONFIRMED RUNTIME block-mode holes. Telemetry of
+      # `endpoint called` was not readable from this host: `gh run view` for
       # source runs 34280577854 (job 102244143615), 34235998695, and 33943059457
       # returned empty (Actions log blobs 403). Committed https hosts this job
       # reaches: github.com (checkout, yq), results-receiver.actions.githubusercontent.com
       # (GHA results), registry.npmjs.org (npx @devcontainers/cli AND onCreateCommand),
       # mcr.microsoft.com (FROM), go.dev (Go layer), dl.google.com (Chrome),
-      # deb.debian.org / security.debian.org :80 (apt python3). nodejs.org was NOT
-      # added — nvm install 20 may hit it, unlike setup-node, but only on proof.
-      # No setup-go / upload-artifact, so no *.blob.core.windows.net and no
-      # proxy/sum.golang.org. First block-mode CI run is allowed to name missing
-      # endpoints (❌ Blocked); add those to THIS job only, then re-pin.
+      # deb.debian.org / security.debian.org :80 (apt python3),
+      # nodejs.org:443 (nvm install 20),
+      # release-assets.githubusercontent.com:443 (yq curl follows
+      # github.com/releases/download here; NOT objects.githubusercontent.com),
+      # proxy.golang.org:443 (go test in the container),
+      # sum.golang.org:443 (Go sumdb on cache miss). No setup-go /
+      # upload-artifact on the host, so no *.blob.core.windows.net. First
+      # block-mode CI run is allowed to name missing endpoints (❌ Blocked);
+      # add those to THIS job only, then re-pin.
       #
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
       # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
@@ -820,9 +825,13 @@ jobs:
             github.com:443
             go.dev:443
             mcr.microsoft.com:443
+            nodejs.org:443
+            proxy.golang.org:443
             registry.npmjs.org:443
+            release-assets.githubusercontent.com:443
             results-receiver.actions.githubusercontent.com:443
             security.debian.org:80
+            sum.golang.org:443
 
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
@@ -1031,16 +1040,21 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Egress allowlist SOURCE-VERIFIED from committed URLs (LAB-6222). Telemetry
-      # of `endpoint called` was not readable from this host: `gh run view` for
+      # Egress allowlist SOURCE-VERIFIED from committed URLs (LAB-6222), then
+      # extended from CONFIRMED RUNTIME block-mode holes. Telemetry of
+      # `endpoint called` was not readable from this host: `gh run view` for
       # source runs 34280577854 (job 102244143724), 34235998695, and 33943059457
       # returned empty (Actions log blobs 403). Same committed hosts as
-      # devcontainer-image; docker/setup-qemu-action and docker/setup-buildx-action
-      # fetch GitHub releases (github.com already listed). QEMU may pull a binfmt
-      # image — do not invent docker.io; let CI ❌ Blocked name it. nodejs.org,
-      # blob storage, and proxy/sum.golang.org omitted for the same reasons as
-      # the amd64 sibling. First block-mode CI run is allowed to name missing
-      # endpoints; add those to THIS job only, then re-pin.
+      # devcontainer-image except this build-only job does not run go test, so
+      # proxy/sum.golang.org stay off. docker/setup-qemu-action and
+      # docker/setup-buildx-action fetch GitHub releases (github.com already
+      # listed). QEMU pulls the default tonistiigi/binfmt image from
+      # docker.io:443; do not invent docker-auth hosts. nodejs.org:443 (nvm
+      # install 20) and release-assets.githubusercontent.com:443 (yq curl
+      # follows github.com/releases/download here; NOT
+      # objects.githubusercontent.com) are on this list. Blob storage omitted:
+      # no setup-go / upload-artifact. First block-mode CI run is allowed to
+      # name missing endpoints; add those to THIS job only, then re-pin.
       #
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
       # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
@@ -1073,10 +1087,13 @@ jobs:
           allowed-endpoints: >
             deb.debian.org:80
             dl.google.com:443
+            docker.io:443
             github.com:443
             go.dev:443
             mcr.microsoft.com:443
+            nodejs.org:443
             registry.npmjs.org:443
+            release-assets.githubusercontent.com:443
             results-receiver.actions.githubusercontent.com:443
             security.debian.org:80
 
