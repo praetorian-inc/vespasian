@@ -2825,13 +2825,14 @@ if [[ ! -f "$WORKFLOW" ]]; then
         fail "harden-runner policy for a pinned job could not be checked: $WORKFLOW is missing"
     done
     # Keep this arm's counted-outcome total equal to the `else` arm's. The else emits FOURTEEN:
-    # eight per-job policy pins, the carrying-jobs set, the full job set, the AC3 step, the
-    # exemption rationale, the workflow-shape (shell / permissions / env) pin, and the AC5
-    # stale-comment guard. This arm emits the "not found" line above plus eight per-job
-    # pads, so it owes five more — which is why the hr_pad loop below has five entries.
-    # Count the loop, not this sentence: it has been wrong when the LAB-5766 merge added
-    # the three audit-job pins and the AC5 guard, and again when LAB-6222 moved those
-    # three from audit pads into EXPECTED_HR_JOBS.
+    # six EXPECTED_HR_JOBS policy pins, two EXPECTED_AUDIT_JOBS pins, the carrying-jobs set,
+    # the full job set, the AC3 step, the exemption rationale, the workflow-shape
+    # (shell / permissions / env) pin, and the AC5 stale-comment guard. This arm emits the
+    # "not found" line above plus six per-job pads, so it owes seven more — which is why
+    # the hr_pad loop below has seven entries. Count the loop, not this sentence: it has
+    # been wrong when the LAB-5766 merge added the three audit-job pins and the AC5 guard,
+    # when LAB-6222 moved only devcontainer-changes into EXPECTED_HR_JOBS, and again when
+    # AC6 left the two image jobs as audit pads.
     #
     # Adding a check to the else without a pad here is what silently unbalanced it in review
     # round 2, and again in round 8 — the second time the count was right and only this
@@ -3175,12 +3176,13 @@ else
       + \" first=\" + ((.jobs.\"${aud_job}\".steps[0].uses // \"\") | test(\"step-security/harden-runner\") | tostring)
       + \" container=\" + ((.jobs.\"${aud_job}\" | has(\"container\")) | tostring)
       + \" services=\" + ((.jobs.\"${aud_job}\" | has(\"services\")) | tostring)
+      + \" jobif=\" + ((.jobs.\"${aud_job}\".\"if\" // \"false:\") | tostring)
       + \" \" + ([.jobs.\"${aud_job}\".steps[] | select((.uses // \"\") | test(\"step-security/harden-runner\"))]
         | map(\"sudo=\" + ((.with.\"disable-sudo\" // \"<unset>\") | tostring)
             + \" if=\" + ((has(\"if\")) | tostring)
             + \" coe=\" + ((.\"continue-on-error\" // false) | tostring)
             + \" withkeys=\" + ([.with | keys | .[]] | sort | join(\",\"))) | join(\" ;; \"))" -r)
-    aud_want='policy=audit first=true container=false services=false sudo=<unset> if=false coe=false withkeys=egress-policy'
+    aud_want="policy=audit first=true container=false services=false jobif=${DEVCONTAINER_JOB_IF} sudo=<unset> if=false coe=false withkeys=egress-policy"
     case "$aud_got" in
                     __NO_YQ__)    fail_no_yq "${aud_job}'s harden-runner policy" ;;
                     __YQ_ERROR__) fail_yq_error "${aud_job}'s harden-runner policy" ;;
@@ -5270,7 +5272,7 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # This branch adds SEVENTEEN counted outcomes on top of main's 236 (main's own base moved
 # from 182 to 236 when LAB-5766 landed), all in the
 # "harden-runner egress policy" section. Measured at each step, never computed:
-#   +5  one per job in EXPECTED_HR_JOBS — each job's WHOLE policy compared against a
+#   +6  one per job in EXPECTED_HR_JOBS — each job's WHOLE policy compared against a
 #       pinned expectation (action SHA, `block`, disable-sudo, no `if:`, harden-runner
 #       first, the job's `runs-on`, the step's `continue-on-error`, allowed-endpoints node
 #       type, exact endpoint set) rather than its shape. `runs-on` and `continue-on-error`
@@ -5330,9 +5332,11 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       run value byte-identical while the runner merely CAT-ed the script and exited 0.
 #   +3  LAB-6015: one per job in the then-EXPECTED_AUDIT_JOBS — the three
 #       devcontainer jobs LAB-5766 added, each pinned as `audit`. LAB-6222 moved
-#       those three into EXPECTED_HR_JOBS (full hr_expected pins) and deleted the
-#       audit loop, net zero counted outcomes. A silent return to `audit` is now
-#       a per-job policy mismatch against policy=block.
+#       only devcontainer-changes into EXPECTED_HR_JOBS (full hr_expected pin).
+#       The two image jobs stay in EXPECTED_AUDIT_JOBS under AC6; the audit loop
+#       remains. Net counted outcomes unchanged: a silent flip of changes back
+#       to audit is a policy=block mismatch; a silent flip of an image job to
+#       block is an audit-loop mismatch.
 #   +1  the AC5 stale-comment guard. AC5 was met by DELETING the four stale
 #       "flip once telemetry confirms the set" comments, and the LAB-5766 merge
 #       reintroduced three of them verbatim while every structural pin stayed green,

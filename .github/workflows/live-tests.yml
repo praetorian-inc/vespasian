@@ -124,7 +124,7 @@ permissions:
 # The census belongs in EXPECTED_ALL_JOBS / EXPECTED_HR_JOBS in
 # test/test-runner-args.sh, which ARE asserted against the workflow on every run
 # and fail the build naming the job. Name the arrays here, not the numbers.
-# EXPECTED_AUDIT_JOBS has no members after LAB-6222.
+# EXPECTED_AUDIT_JOBS lists the two image jobs that stay on audit (LAB-6222 AC6).
 #
 # KEEP `allowed-endpoints` A `>` BLOCK SCALAR. `*.blob.core.windows.net:443`
 # starts with `*`, which YAML reads as an ALIAS indicator anywhere it is not
@@ -175,12 +175,13 @@ jobs:
       # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
       # integration-tests / test. harden-runner is a SHA-pinned security control:
       # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job on
-      # a stale pin. test/test-runner-args.sh pins the whole policy for all EIGHT
-      # carrying jobs under `block` — this SHA, 'block', disable-sudo (where set),
-      # no step if:, harden-runner FIRST, the job shape, the exact `with:` key set
-      # and the exact allowlist — plus which jobs carry the step at all and the
-      # full job set, so none of those can move without the build failing and
-      # naming the job.
+      # a stale pin. test/test-runner-args.sh pins the whole policy for the SIX
+      # jobs in EXPECTED_HR_JOBS under `block` (this SHA, 'block', disable-sudo
+      # where set, no step if:, harden-runner FIRST, the job shape, the exact
+      # `with:` key set and the exact allowlist) and pins the TWO image jobs in
+      # EXPECTED_AUDIT_JOBS as `audit` first-step (LAB-6222 AC6) — plus which
+      # jobs carry the step at all and the full job set, so none of those can
+      # move without the build failing and naming the job.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -348,12 +349,13 @@ jobs:
       # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
       # integration-tests / test. harden-runner is a SHA-pinned security control:
       # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job on
-      # a stale pin. test/test-runner-args.sh pins the whole policy for all EIGHT
-      # carrying jobs under `block` — this SHA, 'block', disable-sudo (where set),
-      # no step if:, harden-runner FIRST, the job shape, the exact `with:` key set
-      # and the exact allowlist — plus which jobs carry the step at all and the
-      # full job set, so none of those can move without the build failing and
-      # naming the job.
+      # a stale pin. test/test-runner-args.sh pins the whole policy for the SIX
+      # jobs in EXPECTED_HR_JOBS under `block` (this SHA, 'block', disable-sudo
+      # where set, no step if:, harden-runner FIRST, the job shape, the exact
+      # `with:` key set and the exact allowlist) and pins the TWO image jobs in
+      # EXPECTED_AUDIT_JOBS as `audit` first-step (LAB-6222 AC6) — plus which
+      # jobs carry the step at all and the full job set, so none of those can
+      # move without the build failing and naming the job.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -427,12 +429,13 @@ jobs:
       # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
       # integration-tests / test. harden-runner is a SHA-pinned security control:
       # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job on
-      # a stale pin. test/test-runner-args.sh pins the whole policy for all EIGHT
-      # carrying jobs under `block` — this SHA, 'block', disable-sudo (where set),
-      # no step if:, harden-runner FIRST, the job shape, the exact `with:` key set
-      # and the exact allowlist — plus which jobs carry the step at all and the
-      # full job set, so none of those can move without the build failing and
-      # naming the job.
+      # a stale pin. test/test-runner-args.sh pins the whole policy for the SIX
+      # jobs in EXPECTED_HR_JOBS under `block` (this SHA, 'block', disable-sudo
+      # where set, no step if:, harden-runner FIRST, the job shape, the exact
+      # `with:` key set and the exact allowlist) and pins the TWO image jobs in
+      # EXPECTED_AUDIT_JOBS as `audit` first-step (LAB-6222 AC6) — plus which
+      # jobs carry the step at all and the full job set, so none of those can
+      # move without the build failing and naming the job.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -641,12 +644,13 @@ jobs:
       # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
       # integration-tests / test. harden-runner is a SHA-pinned security control:
       # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job on
-      # a stale pin. test/test-runner-args.sh pins the whole policy for all EIGHT
-      # carrying jobs under `block` — this SHA, 'block', disable-sudo (where set),
-      # no step if:, harden-runner FIRST, the job shape, the exact `with:` key set
-      # and the exact allowlist — plus which jobs carry the step at all and the
-      # full job set, so none of those can move without the build failing and
-      # naming the job.
+      # a stale pin. test/test-runner-args.sh pins the whole policy for the SIX
+      # jobs in EXPECTED_HR_JOBS under `block` (this SHA, 'block', disable-sudo
+      # where set, no step if:, harden-runner FIRST, the job shape, the exact
+      # `with:` key set and the exact allowlist) and pins the TWO image jobs in
+      # EXPECTED_AUDIT_JOBS as `audit` first-step (LAB-6222 AC6) — plus which
+      # jobs carry the step at all and the full job set, so none of those can
+      # move without the build failing and naming the job.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -783,45 +787,24 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Egress allowlist SOURCE-VERIFIED from committed URLs (LAB-6222), then
-      # extended from CONFIRMED RUNTIME block-mode holes. Telemetry of
-      # `endpoint called` was not readable from this host: `gh run view` for
-      # source runs 34280577854 (job 102244143615), 34235998695, and 33943059457
-      # returned empty (Actions log blobs 403). Committed https hosts this job
-      # reaches: github.com (checkout, yq), results-receiver.actions.githubusercontent.com
-      # (GHA results), registry.npmjs.org (npx @devcontainers/cli AND onCreateCommand),
-      # mcr.microsoft.com (FROM), go.dev (Go layer), dl.google.com (Chrome),
-      # deb.debian.org / security.debian.org :80 (apt python3),
-      # nodejs.org:443 (nvm install 20),
-      # release-assets.githubusercontent.com:443 (yq curl follows
-      # github.com/releases/download here; NOT objects.githubusercontent.com),
-      # proxy.golang.org:443 (go test in the container),
-      # sum.golang.org:443 (Go sumdb on cache miss),
-      # *.docker.io:443 (Hub API/auth/index; exact names rotated across
-      # 34379783876 / 34388259962 / 34389087177) and
-      # production.cloudflare.docker.com:443 (layer blobs after "pulling
-      # image configuration"). No setup-go /
-      # upload-artifact on the host, so no *.blob.core.windows.net. First
-      # block-mode CI run is allowed to name missing endpoints (❌ Blocked);
-      # add those to THIS job only, then re-pin.
-      #
-      # DUPLICATED across preflight-selftest / validator-regression / docs-check /
-      # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
-      # integration-tests / test. harden-runner is a SHA-pinned security control:
-      # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job on
-      # a stale pin. test/test-runner-args.sh pins the whole policy for all EIGHT
-      # carrying jobs under `block` — this SHA, 'block', disable-sudo (where set),
-      # no step if:, harden-runner FIRST, the job shape, the exact `with:` key set
-      # and the exact allowlist — plus which jobs carry the step at all and the
-      # full job set, so none of those can move without the build failing and
-      # naming the job.
-      #
       # THIS JOB STAYS ON `audit` (LAB-6222 AC6). Hostname allowlists (exact
       # Hub names, *.docker.io:443, production.cloudflare.docker.com:443) still
       # left docker pulling image config at dial tcp 54.185.253.63:443
       # (runs 34379783876, 34388259962, 34389087177, 34394518703, 34395398451).
       # The daemon's Hub hop is outside harden-runner's hostname policy.
       # disable-sudo is NOT set: `docker build` needs the docker group.
+      #
+      # DUPLICATED across preflight-selftest / validator-regression / docs-check /
+      # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
+      # integration-tests / test. harden-runner is a SHA-pinned security control:
+      # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job on
+      # a stale pin. test/test-runner-args.sh pins the whole policy for the SIX
+      # jobs in EXPECTED_HR_JOBS under `block` (this SHA, 'block', disable-sudo
+      # where set, no step if:, harden-runner FIRST, the job shape, the exact
+      # `with:` key set and the exact allowlist) and pins the TWO image jobs in
+      # EXPECTED_AUDIT_JOBS as `audit` first-step (LAB-6222 AC6) — plus which
+      # jobs carry the step at all and the full job set, so none of those can
+      # move without the build failing and naming the job.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -1034,47 +1017,26 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Egress allowlist SOURCE-VERIFIED from committed URLs (LAB-6222), then
-      # extended from CONFIRMED RUNTIME block-mode holes. Telemetry of
-      # `endpoint called` was not readable from this host: `gh run view` for
-      # source runs 34280577854 (job 102244143724), 34235998695, and 33943059457
-      # returned empty (Actions log blobs 403). Same committed hosts as
-      # devcontainer-image except this build-only job does not run go test, so
-      # proxy/sum.golang.org stay off. docker/setup-qemu-action and
-      # docker/setup-buildx-action fetch GitHub releases (github.com already
-      # listed). QEMU/buildx pull Hub images via *.docker.io:443 plus
-      # production.cloudflare.docker.com:443 (layer blobs; measured
-      # 34389087177 still refused 54.185.253.63 after exact auth/registry-1
-      # names). nodejs.org:443 (nvm
-      # install 20) and release-assets.githubusercontent.com:443 (yq curl
-      # follows github.com/releases/download here; NOT
-      # objects.githubusercontent.com) are on this list. Blob storage omitted:
-      # no setup-go / upload-artifact. First block-mode CI run is allowed to
-      # name missing endpoints; add those to THIS job only, then re-pin.
+      # THIS JOB STAYS ON `audit` (LAB-6222 AC6), same reason as
+      # `devcontainer-image`: docker/setup-buildx image-config pull keeps
+      # dialling 54.185.253.63:443 after hostname allowlists. disable-sudo is
+      # NOT set: `docker build` needs the docker group.
+      #
+      # This job needs harden-runner for the same reason its amd64 sibling does:
+      # the build COPYs test/install-chrome.sh and RUNs it as root, reaching
+      # dl.google.com for Chrome and github.com for the pinned yq binary.
       #
       # DUPLICATED across preflight-selftest / validator-regression / docs-check /
       # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
       # integration-tests / test. harden-runner is a SHA-pinned security control:
       # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job on
-      # a stale pin. test/test-runner-args.sh pins the whole policy for all EIGHT
-      # carrying jobs under `block` — this SHA, 'block', disable-sudo (where set),
-      # no step if:, harden-runner FIRST, the job shape, the exact `with:` key set
-      # and the exact allowlist — plus which jobs carry the step at all and the
-      # full job set, so none of those can move without the build failing and
-      # naming the job.
-      #
-      # This job needs it for the same reason its amd64 sibling does, and an
-      # earlier revision of this comment claimed the opposite ("it runs no repo
-      # code"), which was simply false: the build COPYs test/install-chrome.sh
-      # and RUNs it as root, reaching dl.google.com for the Chrome package and
-      # github.com for the pinned yq binary. Emulated or not, that is the same
-      # third-party egress executed as root, so dropping the monitoring here
-      # would have left the arch we understand LEAST the one we watch least.
-      #
-      # THIS JOB STAYS ON `audit` (LAB-6222 AC6), same reason as
-      # `devcontainer-image`: docker/setup-buildx image-config pull keeps
-      # dialling 54.185.253.63:443 after hostname allowlists. disable-sudo is
-      # NOT set: `docker build` needs the docker group.
+      # a stale pin. test/test-runner-args.sh pins the whole policy for the SIX
+      # jobs in EXPECTED_HR_JOBS under `block` (this SHA, 'block', disable-sudo
+      # where set, no step if:, harden-runner FIRST, the job shape, the exact
+      # `with:` key set and the exact allowlist) and pins the TWO image jobs in
+      # EXPECTED_AUDIT_JOBS as `audit` first-step (LAB-6222 AC6) — plus which
+      # jobs carry the step at all and the full job set, so none of those can
+      # move without the build failing and naming the job.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -1170,12 +1132,13 @@ jobs:
       # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
       # integration-tests / test. harden-runner is a SHA-pinned security control:
       # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job on
-      # a stale pin. test/test-runner-args.sh pins the whole policy for all EIGHT
-      # carrying jobs under `block` — this SHA, 'block', disable-sudo (where set),
-      # no step if:, harden-runner FIRST, the job shape, the exact `with:` key set
-      # and the exact allowlist — plus which jobs carry the step at all and the
-      # full job set, so none of those can move without the build failing and
-      # naming the job.
+      # a stale pin. test/test-runner-args.sh pins the whole policy for the SIX
+      # jobs in EXPECTED_HR_JOBS under `block` (this SHA, 'block', disable-sudo
+      # where set, no step if:, harden-runner FIRST, the job shape, the exact
+      # `with:` key set and the exact allowlist) and pins the TWO image jobs in
+      # EXPECTED_AUDIT_JOBS as `audit` first-step (LAB-6222 AC6) — plus which
+      # jobs carry the step at all and the full job set, so none of those can
+      # move without the build failing and naming the job.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
@@ -1247,12 +1210,13 @@ jobs:
       # devcontainer-changes / devcontainer-image / devcontainer-image-arm64 /
       # integration-tests / test. harden-runner is a SHA-pinned security control:
       # bump ALL EIGHT copies in lockstep — a missed copy silently leaves a job on
-      # a stale pin. test/test-runner-args.sh pins the whole policy for all EIGHT
-      # carrying jobs under `block` — this SHA, 'block', disable-sudo (where set),
-      # no step if:, harden-runner FIRST, the job shape, the exact `with:` key set
-      # and the exact allowlist — plus which jobs carry the step at all and the
-      # full job set, so none of those can move without the build failing and
-      # naming the job.
+      # a stale pin. test/test-runner-args.sh pins the whole policy for the SIX
+      # jobs in EXPECTED_HR_JOBS under `block` (this SHA, 'block', disable-sudo
+      # where set, no step if:, harden-runner FIRST, the job shape, the exact
+      # `with:` key set and the exact allowlist) and pins the TWO image jobs in
+      # EXPECTED_AUDIT_JOBS as `audit` first-step (LAB-6222 AC6) — plus which
+      # jobs carry the step at all and the full job set, so none of those can
+      # move without the build failing and naming the job.
       - name: Harden runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
         with:
