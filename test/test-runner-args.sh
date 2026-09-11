@@ -2750,18 +2750,20 @@ EXPECTED_AUDIT_JOBS=(devcontainer-image devcontainer-image-arm64)
 # runners: switching a job to `macos-14` leaves every other field byte-identical
 # and the policy simply does not apply — `block` degrades to nothing, job green.
 # `continue-on-error: true` on the harden-runner step was caught for three of the
-# five jobs by the un-gated-job guards further up, but NOT for docs-check or
+# then-five jobs by the un-gated-job guards further up, but NOT for docs-check or
 # integration-tests, which those guards do not cover; folding it in here makes the
-# coverage uniform across all five rather than incidental.
+# coverage uniform across EXPECTED_HR_JOBS rather than incidental.
 # hr_policy() below builds the same string from the workflow with one yq call.
 HR_PIN='step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920'
-# The two gated jobs legitimately carry a job-level `if:`; the three un-gated guard jobs
-# must not. So `jobif` is pinned per job by VALUE rather than as a blanket absence — the
-# same reasoning as the shell-override pin below, where one job's override is required.
+# The two gated jobs legitimately carry a job-level `if:`; the un-gated jobs in
+# EXPECTED_HR_JOBS must not. So `jobif` is pinned per job by VALUE rather than as a
+# blanket absence — the same reasoning as the shell-override pin below, where one
+# job's override is required.
 GATED_JOB_IF="needs.check-label.outputs.should-run == 'true'"
 DEVCONTAINER_JOB_IF="needs.devcontainer-changes.outputs.should-run == 'true'"
-# Image jobs do not set disable-sudo (docker build needs it; recorded at those
-# jobs). Parameterize sudo/withkeys rather than hardcoding the five-job shape.
+# Image jobs omit disable-sudo because the build runs layers and install-chrome.sh
+# as root inside the sandbox (recorded at those jobs). Parameterize sudo/withkeys
+# rather than the single hardcoded shape the five-job version used.
 hr_expected() {
     local endpoints jobif needs usesset sudo withkeys
     case "$1" in
@@ -2951,8 +2953,11 @@ else
     # permanently no-op, job green, suite 144/0. `shell: bash -n {0}` and `shell: python3
     # {0}` are the same bypass in shapes a reviewer might wave through, and both were
     # measured. Nothing else in this file reads `shell:`. `if:` and `continue-on-error:`
-    # need no entry here — the un-gated-job guards above already catch both on this job,
-    # measured at 141/2 each.
+    # ARE pinned here. The un-gated-job guards catch both on preflight-selftest and
+    # validator-regression only (`UNGATED_GUARD_JOBS`); they do not cover
+    # devcontainer-changes. Measured: `if: false` or `continue-on-error: true` on that
+    # job's AC3 step left ac3_got == ac3_want while the proof was skipped or allowed
+    # to fail without failing the job. Pin all three copies, not just the new one.
     #
     # RESIDUAL, narrowed twice. The probe calls and hosts are pinned by grep just below,
     # and the script's BEHAVIOUR is pinned by executing it against a stub `curl` in three
@@ -2966,11 +2971,20 @@ else
     # AGENTS.md records the same reasoning for test/assert-chrome-install.sh.
     ac3_got=$(yq_query '"preflight=" + ("last=" + (((.jobs."preflight-selftest".steps[-1].name) // "") == "Assert egress policy enforces (AC3)" | tostring)
       + " shell=" + ([.jobs."preflight-selftest".steps[] | select(.name == "Assert egress policy enforces (AC3)") | (.shell // "<default>")] | join(""))
-      + " run=" + (([.jobs."preflight-selftest".steps[] | select(.name == "Assert egress policy enforces (AC3)") | .run] | join("")) | sub("\s+$"; "")))
+      + " run=" + (([.jobs."preflight-selftest".steps[] | select(.name == "Assert egress policy enforces (AC3)") | .run] | join("")) | sub("\s+$"; ""))
+      + " if=" + ([.jobs."preflight-selftest".steps[] | select(.name == "Assert egress policy enforces (AC3)") | (has("if") | tostring)] | join(""))
+      + " coe=" + ([.jobs."preflight-selftest".steps[] | select(.name == "Assert egress policy enforces (AC3)") | ((."continue-on-error" // false) | tostring)] | join("")))
       + " validator=" + ("last=" + (((.jobs."validator-regression".steps[-1].name) // "") == "Assert egress policy enforces (AC3)" | tostring)
       + " shell=" + ([.jobs."validator-regression".steps[] | select(.name == "Assert egress policy enforces (AC3)") | (.shell // "<default>")] | join(""))
-      + " run=" + (([.jobs."validator-regression".steps[] | select(.name == "Assert egress policy enforces (AC3)") | .run] | join("")) | sub("\s+$"; "")))' -r)
-    ac3_want='preflight=last=true shell=<default> run=./test/assert-egress-enforced.sh validator=last=true shell=<default> run=./test/assert-egress-enforced.sh'
+      + " run=" + (([.jobs."validator-regression".steps[] | select(.name == "Assert egress policy enforces (AC3)") | .run] | join("")) | sub("\s+$"; ""))
+      + " if=" + ([.jobs."validator-regression".steps[] | select(.name == "Assert egress policy enforces (AC3)") | (has("if") | tostring)] | join(""))
+      + " coe=" + ([.jobs."validator-regression".steps[] | select(.name == "Assert egress policy enforces (AC3)") | ((."continue-on-error" // false) | tostring)] | join("")))
+      + " changes=" + ("last=" + (((.jobs."devcontainer-changes".steps[-1].name) // "") == "Assert egress policy enforces (AC3)" | tostring)
+      + " shell=" + ([.jobs."devcontainer-changes".steps[] | select(.name == "Assert egress policy enforces (AC3)") | (.shell // "<default>")] | join(""))
+      + " run=" + (([.jobs."devcontainer-changes".steps[] | select(.name == "Assert egress policy enforces (AC3)") | .run] | join("")) | sub("\s+$"; ""))
+      + " if=" + ([.jobs."devcontainer-changes".steps[] | select(.name == "Assert egress policy enforces (AC3)") | (has("if") | tostring)] | join(""))
+      + " coe=" + ([.jobs."devcontainer-changes".steps[] | select(.name == "Assert egress policy enforces (AC3)") | ((."continue-on-error" // false) | tostring)] | join("")))' -r)
+    ac3_want='preflight=last=true shell=<default> run=./test/assert-egress-enforced.sh if=false coe=false validator=last=true shell=<default> run=./test/assert-egress-enforced.sh if=false coe=false changes=last=true shell=<default> run=./test/assert-egress-enforced.sh if=false coe=false'
     # The script's BODY is checked too — the two probe calls and the two hostname
     # assignments — the same way and for the same reason install-chrome-e2e's render
     # assertion is checked above: grep the file, comments stripped, for the invocations it
@@ -2992,9 +3006,9 @@ else
         __YQ_ERROR__) fail_yq_error "the AC3 egress-enforcement step" ;;
         *)
             if [[ "$ac3_got" == "$ac3_want" && "$ac3_body" == "yes" ]]; then
-                pass "AC3 enforcement step is last in preflight-selftest and validator-regression, invokes test/assert-egress-enforced.sh, and that script still makes both probe calls against both pinned hosts"
+                pass "AC3 enforcement step is last in preflight-selftest, validator-regression and devcontainer-changes, invokes test/assert-egress-enforced.sh with no step if: or continue-on-error, and that script still makes both probe calls against both pinned hosts"
             else
-                fail "the AC3 egress-enforcement step no longer matches its pin — deleted, renamed, moved off the end of preflight-selftest or validator-regression, or pointed at something other than test/assert-egress-enforced.sh. This is the only runtime check that block mode actually ENFORCES; the policy pin above only checks what the YAML says. Restore it, or record the decision to drop it here deliberately, or the script stopped making both probe calls against both pinned hosts (body=${ac3_body}).
+                fail "the AC3 egress-enforcement step no longer matches its pin — deleted, renamed, moved off the end of preflight-selftest, validator-regression or devcontainer-changes, pointed at something other than test/assert-egress-enforced.sh, given a step-level if: or continue-on-error, or the script stopped making both probe calls against both pinned hosts (body=${ac3_body}). This is the only runtime check that block mode actually ENFORCES; the policy pin above only checks what the YAML says. Restore it, or record the decision to drop it here deliberately.
         want: ${ac3_want}
         got:  ${ac3_got}"
             fi ;;
@@ -3171,6 +3185,14 @@ else
         fail "${stale_hr} stale \"once telemetry confirms the set\" comment(s) are back in live-tests.yml. LAB-6015 AC5 requires them removed or updated: they tell a reader the allowlist has never been derived, which is false for the block-mode jobs and misleading for the two image jobs on audit under LAB-6222 AC6. This most often returns via a merge that adds a job by copying an older harden-runner block."
     fi
 
+    # EXPECTED_AUDIT_JOBS: pins policy=audit, first-step, no container:/services:,
+    # job-level if: by value, needs=devcontainer-changes, disable-sudo unset, no
+    # step if:/continue-on-error, with: key set. The step-level half was measured:
+    # WITHOUT it, `if: false` on an audit job's harden-runner step and a dropped
+    # disable-sudo both survived at 253/0 — the step is skipped, the job records
+    # no telemetry, and the pin still reported "runs audit". Telemetry is the only
+    # documented route off audit under AC2, so a no-op'd step makes the AC6
+    # follow-up unsatisfiable while reporting healthy.
             for aud_job in "${EXPECTED_AUDIT_JOBS[@]}"; do
     aud_got=$(yq_query "\"policy=\" + ([.jobs.\"${aud_job}\".steps[] | select((.uses // \"\") | test(\"step-security/harden-runner\")) | (.with.\"egress-policy\" // \"<unset>\")] | join(\",\"))
       + \" first=\" + ((.jobs.\"${aud_job}\".steps[0].uses // \"\") | test(\"step-security/harden-runner\") | tostring)
@@ -3188,8 +3210,10 @@ else
                     __NO_YQ__)    fail_no_yq "${aud_job}'s harden-runner policy" ;;
                     __YQ_ERROR__) fail_yq_error "${aud_job}'s harden-runner policy" ;;
                     "$aud_want")
-                                  pass "${aud_job} still runs harden-runner in audit as its FIRST step, with no container: or services:, explicitly (LAB-6222 AC6: docker daemon IP outside hostname allowlists)" ;;
-                    *)            fail "${aud_job}'s harden-runner egress-policy is '${aud_got}', expected 'audit'. If this job is being flipped to block, hostname allowlists have already failed (54.185.253.63:443) — record why, or move it to EXPECTED_HR_JOBS with an hr_expected entry." ;;
+                                  pass "${aud_job} still runs harden-runner in audit as its FIRST step, with no container: or services:, job-level if: by value, needs: devcontainer-changes, disable-sudo unset, no step if:/continue-on-error, with: key set egress-policy (LAB-6222 AC6: docker daemon IP outside hostname allowlists)" ;;
+                    *)            fail "${aud_job} harden-runner policy does not match the pin. Any of these lands here: egress-policy leaving 'audit'; harden-runner not first; a container: or services: key; a changed job-level if:; a changed needs:; disable-sudo set; a step-level if: or continue-on-error; a changed with: key set. If this job is being flipped to block, hostname allowlists have already failed (54.185.253.63:443) — record why, or move it to EXPECTED_HR_JOBS with an hr_expected entry.
+        want: ${aud_want}
+        got:  ${aud_got}" ;;
                 esac
             done
 fi
@@ -5285,7 +5309,7 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       `services:` (service containers start before steps[0], so `first=true` does not mean
 #       nothing ran first), job-level `continue-on-error: true` and job-level `if:` on
 #       docs-check or integration-tests (the step-level `coe=` does not see either, and the
-#       text-grep neutering guards cover only three of the five policy jobs), and any FOURTH
+#       text-grep neutering guards do not cover every policy job), and any FOURTH
 #       `with:` input — `use-policy-store: true` moves the enforced allowlist to
 #       StepSecurity's off-repo control plane with every pinned field byte-identical, which
 #       is the widest of the five. `withkeys=` pins the key SET rather than enumerating
@@ -5319,7 +5343,7 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       different policy jobs, the upload-artifact step deleted, and its action name
 #       swapped at the same SHA. Original evidence: `runs-on: macos-14` left the policy byte-identical while
 #       harden-runner silently does not enforce off Linux, and `continue-on-error: true`
-#       on the step was caught for three of the five jobs by the un-gated-job guards
+#       on the step was caught for three of the then-five jobs by the un-gated-job guards
 #       above but not for docs-check or integration-tests. Both measured MISSED first.
 #       A shape check ("is it block, is the list non-empty") let eight mutations through.
 #   +1  the set of jobs that CARRY harden-runner — the only check that catches the step
@@ -5331,13 +5355,14 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 #       invocation of test/assert-egress-enforced.sh. Measured: the step shipped
 #       unpinned and deleting it left the suite green; later, `shell: cat {0}` left the
 #       run value byte-identical while the runner merely CAT-ed the script and exited 0.
-#   +3  LAB-6015: one per job in the then-EXPECTED_AUDIT_JOBS — the three
-#       devcontainer jobs LAB-5766 added, each pinned as `audit`. LAB-6222 moved
-#       only devcontainer-changes into EXPECTED_HR_JOBS (full hr_expected pin).
-#       The two image jobs stay in EXPECTED_AUDIT_JOBS under AC6; the audit loop
-#       remains. Net counted outcomes unchanged: a silent flip of changes back
-#       to audit is a policy=block mismatch; a silent flip of an image job to
-#       block is an audit-loop mismatch.
+#   +2  LAB-6015: one per job in EXPECTED_AUDIT_JOBS — originally +3 for the
+#       three devcontainer jobs LAB-5766 added, each pinned as `audit`. LAB-6222
+#       moved only devcontainer-changes into EXPECTED_HR_JOBS (full hr_expected
+#       pin). The two image jobs stay in EXPECTED_AUDIT_JOBS under AC6; the
+#       audit loop remains and now emits two outcomes. Net counted outcomes
+#       unchanged: a silent flip of changes back to audit is a policy=block
+#       mismatch; a silent flip of an image job to block is an audit-loop
+#       mismatch.
 #   +1  the AC5 stale-comment guard. AC5 was met by DELETING the four stale
 #       "flip once telemetry confirms the set" comments, and the LAB-5766 merge
 #       reintroduced three of them verbatim while every structural pin stayed green,
@@ -5405,8 +5430,11 @@ echo "  $PASS passed, $FAIL failed, $SKIP skipped"
 # edit at all to check-label's job node; the AC3 script's unlisted host retyped, its
 # control probe deleted, its whole body no-op'd, its unlisted condition inverted to
 # `-ne 0`, and its control condition un-negated. The last two are caught only by the
-# behavioural scenarios — every grep count stays identical under both. The first two of the per-job list are the only
-# ones the pre-LAB-6015 shape check also caught.
+# behavioural scenarios — every grep count stays identical under both. Caught by the
+# audit loop's jobif=/needs= fields: `needs: devcontainer-changes` deleted from an
+# image job, that job's job-level `if:` deleted, and `if: false` substituted. Still
+# SURVIVE that loop: runs-on, job-level continue-on-error, an added action. The first
+# two of the per-job list are the only ones the pre-LAB-6015 shape check also caught.
 # ── end merged-from-main history ─────────────────────────────────────────────
 
 EXPECTED_ASSERTIONS=254
