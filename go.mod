@@ -4,7 +4,7 @@ go 1.27.0
 
 require (
 	github.com/BishopFox/jsluice v0.0.0-20240110145140-0ddfab153e06
-	github.com/PuerkitoBio/goquery v1.12.0
+	github.com/PuerkitoBio/goquery v1.13.0
 	github.com/alecthomas/kong v1.16.1
 	github.com/getkin/kin-openapi v0.147.0
 	github.com/go-rod/rod v0.116.2
@@ -21,7 +21,7 @@ require (
 )
 
 require (
-	github.com/andybalholm/cascadia v1.3.3 // indirect
+	github.com/andybalholm/cascadia v1.3.4 // indirect
 	github.com/ditashi/jsbeautifier-go v0.0.0-20141206144643-2520a8026a9c // indirect
 	github.com/dlclark/regexp2 v1.11.5 // indirect
 	github.com/go-openapi/jsonpointer v0.22.5 // indirect
