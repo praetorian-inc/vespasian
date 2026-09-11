@@ -71,15 +71,16 @@ CONTROL_URL="https://github.com/"
 # job red on a correctly-enforcing runner; that is worse than the gap it chased.
 #
 # SCOPE, stated because the assertion is narrower than "block enforces": this script runs
-# in TWO jobs. preflight-selftest has the two-entry wildcard-free allowlist;
-# validator-regression carries `*.blob.core.windows.net:443`, the only entry whose matching
-# is non-trivial. UNLISTED_URL is proxy.golang.org, which neither job allowlists, so the
-# unlisted-host probe refuses in both. The remaining two policy jobs — integration-tests
-# and test — DO allowlist proxy.golang.org, so this script cannot drop in there without a
-# different unlisted host. docs-check also omits it but is not a wildcard job.
+# in THREE jobs. preflight-selftest and devcontainer-changes have the two-entry
+# wildcard-free allowlist; validator-regression carries `*.blob.core.windows.net:443`,
+# the only entry whose matching is non-trivial. UNLISTED_URL is proxy.golang.org, which
+# none of those jobs allowlist, so the unlisted-host probe refuses in all three. The
+# remaining two policy jobs — integration-tests and test — DO allowlist proxy.golang.org,
+# so this script cannot drop in there without a different unlisted host. docs-check also
+# omits it but is not a wildcard job.
 #
-# Read the pass as "block enforces in a literal-allowlist job AND in one wildcard-carrying
-# job", not "block enforces in every policy job".
+# Read the pass as "block enforces in two literal-allowlist jobs AND in one
+# wildcard-carrying job", not "block enforces in every policy job".
 #
 # What actually bounds the risk: the control request below. If the unlisted host were down
 # AND the policy were off, this step would still pass — but that needs two independent
