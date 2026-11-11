@@ -24,3 +24,54 @@ updates:
       interval: weekly
     commit-message:
       prefix: "ci"
+    ignore:
+      # The leaderboard reusables are SHA-pinned, and the pinned SHA is
+      # allow-listed by `job_workflow_ref` in the LeaderboardMetricsRole IAM
+      # trust policy in guard. Bumping the pin therefore does not just change a
+      # version — it presents a `job_workflow_ref` that is NOT on the trust
+      # list, so OIDC AssumeRole is denied and the run fails.
+      #
+      # That failure is SILENT in the only way that matters: nothing alerts on
+      # it, so contribution metrics simply stop being delivered and the loss is
+      # only discoverable by auditing run conclusions after the fact. brutus#229
+      # and augustus#241 were both merged as routine dependabot bumps and each
+      # took its repo's metrics dark until someone went looking (ENG-5687).
+      #
+      # Rolling this pin is a COORDINATED operation, not a dependency update:
+      # add the new SHA to the IAM trust policy and deploy it to prod BEFORE
+      # the pin moves (the ENG-4164 runbook). Dependabot cannot do that half,
+      # so it must not do this half either. Roll it by hand as part of that
+      # runbook.
+      #
+      # The EXACT NAMES are what do the work here, so ADDING A NEW LEADERBOARD
+      # REUSABLE MEANS ADDING ITS EXACT NAME to this list. Only the exact form
+      # has evidence behind it: augustus and brutus both still pin v2.16.3 with
+      # v2.16.13 available, and both took a github-actions bump for
+      # claude-md-drift.yml on 2026-08-02 while the leaderboard pin was
+      # skipped — same pin, same available upgrade, same ecosystem run,
+      # differing only in the ignore rule.
+      #
+      # The two exact entries below are the load-bearing control. The
+      # `leaderboard-*` wildcard is forward coverage for the window between "a
+      # new coupled reusable lands" and "someone remembers to add its exact
+      # name" — which is exactly how this was learned the expensive way.
+      #
+      # The wildcard's behaviour is NOT observable from here, in either
+      # direction. An ignore list is match-ANY, so a quiet dependabot run proves
+      # only that SOMETHING matched and never which entry; watching this rule
+      # work can therefore never confirm the wildcard fires. Its match semantics
+      # against a reusable-workflow dependency name are unverified in this org.
+      #
+      # So do not read the wildcard EITHER way:
+      #   - NOT as "a reusable added later needs no edit here". If it does not
+      #     match, metrics go dark silently. Always add the exact name.
+      #   - NOT as inert. If it DOES match, it equally suppresses a future
+      #     leaderboard-*.yml that has NO IAM coupling and would be safe to
+      #     auto-bump — silently, with no error and nothing to alert on. If you
+      #     add such a reusable and its pin never updates, this line is why, and
+      #     the remedy is to narrow or remove the wildcard.
+      - dependency-name: "praetorian-inc/public-workflows/.github/workflows/leaderboard-metrics.yml"
+      - dependency-name: "praetorian-inc/public-workflows/.github/workflows/leaderboard-backfill.yml"
+      # Forward coverage only. Never a substitute for an exact entry, and see
+      # the over-suppression note above before adding an uncoupled reusable.
+      - dependency-name: "praetorian-inc/public-workflows/.github/workflows/leaderboard-*"
